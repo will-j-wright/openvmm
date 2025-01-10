@@ -3696,6 +3696,7 @@ dependencies = [
  "tracing",
  "widestring",
  "winapi",
+ "windows",
  "zerocopy 0.8.14",
 ]
 

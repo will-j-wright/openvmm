@@ -6,11 +6,14 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 pub(crate) mod api;
+pub(crate) mod fs;
 pub(crate) mod path;
 mod util;
 
 use super::PathExt;
 use super::SetAttributes;
+use ::windows::Wdk::Storage::FileSystem;
+use ::windows::Wdk::System::SystemServices;
 use ntapi::ntioapi;
 use pal::windows;
 use parking_lot::Mutex;
@@ -476,7 +479,7 @@ impl LxVolume {
         )?;
 
         // Query file attributes to check if it matches what AT_REMOVEDIR wants.
-        let info: ntioapi::FILE_BASIC_INFORMATION = util::query_information_file(&handle)?;
+        let info: FileSystem::FILE_BASIC_INFORMATION = util::query_information_file(&handle)?;
         if flags & lx::AT_REMOVEDIR != 0 {
             // Must be a directory and not a reparse point (NT directory symlinks are treated
             // as files).
@@ -781,8 +784,9 @@ impl LxVolume {
             // If the file system supports case sensitive directories, and this is a directory,
             // include the "system.wsl_case_sensitive" attribute in the list.
             if self.supports_case_sensitive_dir() {
-                let result =
-                    util::query_information_file::<ntioapi::FILE_ATTRIBUTE_TAG_INFORMATION>(&file);
+                let result = util::query_information_file::<
+                    SystemServices::FILE_ATTRIBUTE_TAG_INFORMATION,
+                >(&file);
 
                 if let Ok(info) = result {
                     if info.FileAttributes & winnt::FILE_ATTRIBUTE_DIRECTORY != 0
@@ -873,7 +877,7 @@ impl LxVolume {
                 api::LxUtilFsDeleteFile(handle.as_raw_handle(), &self.state.fs_context);
             });
 
-            let info = ntioapi::FILE_CASE_SENSITIVE_INFORMATION {
+            let info = FileSystem::FILE_CASE_SENSITIVE_INFORMATION {
                 Flags: api::FILE_CS_FLAG_CASE_SENSITIVE_DIR,
             };
 
@@ -1168,7 +1172,7 @@ impl LxVolume {
                 // - The file system didn't support FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE.
                 // - The file system's permission check for that flag failed.
                 if status != ntstatus::STATUS_CANNOT_DELETE {
-                    return Err(util::nt_status_to_lx(status));
+                    return Err(util::nt_status_to_lx_ntdef(status));
                 }
 
                 // Reopen with the correct permissions to query and clear the read-only attribute,
@@ -1178,7 +1182,7 @@ impl LxVolume {
                     winnt::DELETE | winnt::FILE_READ_ATTRIBUTES | winnt::FILE_WRITE_ATTRIBUTES,
                 )?;
 
-                util::check_status(api::LxUtilFsDeleteReadOnlyFile(
+                util::check_status_ntdef(api::LxUtilFsDeleteReadOnlyFile(
                     &self.state.fs_context,
                     handle.as_raw_handle(),
                 ))?;
@@ -1500,7 +1504,7 @@ impl LxFile {
 
         unsafe {
             let mut iosb = mem::zeroed();
-            util::check_status(ntioapi::NtFlushBuffersFileEx(
+            util::check_status_ntdef(ntioapi::NtFlushBuffersFileEx(
                 handle.as_raw_handle(),
                 flags,
                 ptr::null_mut(),

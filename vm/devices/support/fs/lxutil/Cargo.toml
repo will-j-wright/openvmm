@@ -43,6 +43,17 @@ features = [
     "winsock2",
 ]
 
+[target.'cfg(windows)'.dependencies.windows]
+package = "windows_rs"
+workspace = true
+features = [ 
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation", 
+    "Win32_Storage_FileSystem", 
+    "Win32_System_IO",
+]
+
 [dev-dependencies]
 tempfile.workspace = true
 
