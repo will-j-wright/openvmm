@@ -4,6 +4,9 @@
 use super::api;
 use crate::SetAttributes;
 use crate::SetTime;
+use ::windows::Wdk::Storage::FileSystem;
+use ::windows::Wdk::System::SystemServices;
+use ::windows::Win32::Foundation;
 use ntapi::ntioapi;
 use ntapi::ntrtl::RtlIsDosDeviceName_U;
 use pal::windows;
@@ -51,8 +54,8 @@ impl Drop for LxUtilDirEnum {
 /// A trait that maps a file information struct for calling into `NtSetInformationFile`, `NtQueryInformationFile` and
 /// other methods that accept a `FileInformationClass`.
 pub trait FileInformationClass: Default {
-    /// The [`ntioapi::FILE_INFORMATION_CLASS`] passed to `FileInformationClass` in different NT methods.
-    fn file_information_class(&self) -> ntioapi::FILE_INFORMATION_CLASS;
+    /// The [`FileSystem::FILE_INFORMATION_CLASS`] passed to `FileInformationClass` in different NT methods.
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS;
 
     /// A ptr and len describing this struct to be used for `FileInformation` in different NT methods.
     ///
@@ -69,9 +72,9 @@ pub trait FileInformationClass: Default {
     fn as_ptr_len_mut(&mut self) -> (*mut u8, usize);
 }
 
-impl FileInformationClass for ntioapi::FILE_BASIC_INFORMATION {
-    fn file_information_class(&self) -> ntioapi::FILE_INFORMATION_CLASS {
-        ntioapi::FileBasicInformation
+impl FileInformationClass for FileSystem::FILE_BASIC_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileBasicInformation
     }
 
     fn as_ptr_len(&self) -> (*const u8, usize) {
@@ -83,9 +86,9 @@ impl FileInformationClass for ntioapi::FILE_BASIC_INFORMATION {
     }
 }
 
-impl FileInformationClass for ntioapi::FILE_CASE_SENSITIVE_INFORMATION {
-    fn file_information_class(&self) -> ntioapi::FILE_INFORMATION_CLASS {
-        ntioapi::FileCaseSensitiveInformation
+impl FileInformationClass for FileSystem::FILE_CASE_SENSITIVE_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileCaseSensitiveInformation
     }
 
     fn as_ptr_len(&self) -> (*const u8, usize) {
@@ -97,9 +100,23 @@ impl FileInformationClass for ntioapi::FILE_CASE_SENSITIVE_INFORMATION {
     }
 }
 
-impl FileInformationClass for ntioapi::FILE_ATTRIBUTE_TAG_INFORMATION {
-    fn file_information_class(&self) -> ntioapi::FILE_INFORMATION_CLASS {
-        ntioapi::FileAttributeTagInformation
+impl FileInformationClass for SystemServices::FILE_ATTRIBUTE_TAG_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileAttributeTagInformation
+    }
+
+    fn as_ptr_len(&self) -> (*const u8, usize) {
+        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+
+    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+}
+
+impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileDispositionInformation
     }
 
     fn as_ptr_len(&self) -> (*const u8, usize) {
@@ -152,7 +169,7 @@ pub fn open_relative_file(
             ea_len,
         );
 
-        check_status(status)?;
+        check_status_ntdef(status)?;
         Ok((OwnedHandle::from_raw_handle(handle), iosb.Information))
     }
 }
@@ -324,8 +341,18 @@ pub fn is_symlink(attributes: ntdef::ULONG, reparse_tag: ntdef::ULONG) -> bool {
 
 // Convert an NTSTATUS into an lx::Result.
 // Returns the status value on success in case it held a non-error value.
-pub fn check_status(status: ntdef::NTSTATUS) -> lx::Result<ntdef::NTSTATUS> {
+pub fn check_status_ntdef(status: ntdef::NTSTATUS) -> lx::Result<ntdef::NTSTATUS> {
     if status < 0 {
+        Err(nt_status_to_lx_ntdef(status))
+    } else {
+        Ok(status)
+    }
+}
+
+// Convert an NTSTATUS into an lx::Result.
+// Returns the status value on success in case it held a non-error value.
+pub fn check_status(status: Foundation::NTSTATUS) -> lx::Result<Foundation::NTSTATUS> {
+    if status.0 < 0 {
         Err(nt_status_to_lx(status))
     } else {
         Ok(status)
@@ -338,7 +365,7 @@ pub fn check_status_rw(status: ntdef::NTSTATUS) -> lx::Result<ntdef::NTSTATUS> {
         match status {
             ntstatus::STATUS_ACCESS_DENIED => Err(lx::Error::EBADF),
             ntstatus::STATUS_END_OF_FILE => Ok(0),
-            _ => Err(nt_status_to_lx(status)),
+            _ => Err(nt_status_to_lx_ntdef(status)),
         }
     } else {
         Ok(status)
@@ -524,7 +551,7 @@ pub fn create_nt_link_reparse_buffer(target: &ffi::OsStr) -> lx::Result<windows:
 pub fn set_reparse_point(handle: &OwnedHandle, reparse_buffer: &[u8]) -> lx::Result<()> {
     unsafe {
         let mut iosb = mem::zeroed();
-        check_status(ntioapi::NtFsControlFile(
+        check_status_ntdef(ntioapi::NtFsControlFile(
             handle.as_raw_handle(),
             ptr::null_mut(),
             None,
@@ -550,10 +577,10 @@ pub fn query_information_file<T: FileInformationClass>(handle: &OwnedHandle) -> 
     let mut info: T = Default::default();
     let (buf, len) = info.as_ptr_len_mut();
 
-    // SAFETY: Calling NtSetInformationFile as documented.
+    // SAFETY: Calling NtQueryInformationFile as documented.
     unsafe {
-        check_status(ntioapi::NtQueryInformationFile(
-            handle.as_raw_handle(),
+        let _ = check_status(FileSystem::NtQueryInformationFile(
+            Foundation::HANDLE(handle.as_raw_handle()),
             &mut iosb,
             buf as ntdef::PVOID,
             len.try_into().unwrap(),
@@ -574,8 +601,8 @@ pub fn set_information_file<T: FileInformationClass>(
 
     // SAFETY: Calling NtSetInformationFile as documented.
     unsafe {
-        check_status(ntioapi::NtSetInformationFile(
-            handle.as_raw_handle(),
+        let _ = check_status(FileSystem::NtSetInformationFile(
+            Foundation::HANDLE(handle.as_raw_handle()),
             &mut iosb,
             buf as ntdef::PVOID,
             len.try_into().unwrap(),
@@ -587,9 +614,16 @@ pub fn set_information_file<T: FileInformationClass>(
 }
 
 // Convert an NTSTATUS to a Linux error code.
-pub fn nt_status_to_lx(status: ntdef::NTSTATUS) -> lx::Error {
+pub fn nt_status_to_lx_ntdef(status: ntdef::NTSTATUS) -> lx::Error {
     let mut error = -lx::EINVAL;
     unsafe { api::LxUtilNtStatusToLxError(status, &mut error) };
+    lx::Error::from_lx(-error)
+}
+
+// Convert an NTSTATUS to a Linux error code.
+pub fn nt_status_to_lx(status: Foundation::NTSTATUS) -> lx::Error {
+    let mut error = -lx::EINVAL;
+    unsafe { api::LxUtilNtStatusToLxError(status.0, &mut error) };
     lx::Error::from_lx(-error)
 }
 
@@ -831,8 +865,8 @@ pub fn create_link(
     };
 
     impl FileInformationClass for HeaderVec<FILE_LINK_INFORMATION, [u16; 1]> {
-        fn file_information_class(&self) -> ntioapi::FILE_INFORMATION_CLASS {
-            ntioapi::FileLinkInformation
+        fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+            FileSystem::FileLinkInformation
         }
 
         fn as_ptr_len(&self) -> (*const u8, usize) {
