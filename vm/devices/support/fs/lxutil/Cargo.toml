@@ -45,7 +45,6 @@ features = [
 ]
 
 [target.'cfg(windows)'.dependencies.windows]
-package = "windows_rs"
 workspace = true
 features = [ 
     "Wdk_Storage_FileSystem",
