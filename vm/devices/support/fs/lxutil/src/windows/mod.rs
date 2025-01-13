@@ -32,7 +32,6 @@ use std::sync::Arc;
 use widestring::U16CString;
 use winapi::shared::basetsd;
 use winapi::shared::ntdef;
-use winapi::shared::ntstatus;
 use winapi::um::winnt;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -873,8 +872,8 @@ impl LxVolume {
 
         if self.state.options.create_case_sensitive_dirs {
             // If setting case sensitive info fails, the file should be deleted.
-            let delete_on_failure = pal::ScopeExit::new(|| unsafe {
-                api::LxUtilFsDeleteFile(handle.as_raw_handle(), &self.state.fs_context);
+            let delete_on_failure = pal::ScopeExit::new(|| {
+                let _ = fs::delete_file(&mut fs::FsContext::new(&self.state.fs_context), &handle);
             });
 
             let info = FileSystem::FILE_CASE_SENSITIVE_INFORMATION {
@@ -935,8 +934,8 @@ impl LxVolume {
         )?;
 
         // If setting the reparse point fails, the file should be deleted.
-        let delete_on_failure = pal::ScopeExit::new(|| unsafe {
-            api::LxUtilFsDeleteFile(handle.as_raw_handle(), &self.state.fs_context);
+        let delete_on_failure = pal::ScopeExit::new(|| {
+            let _ = fs::delete_file(&mut fs::FsContext::new(&self.state.fs_context), &handle);
         });
 
         // Try to set the reparse point.
@@ -1035,8 +1034,8 @@ impl LxVolume {
 
         if !lx::s_isreg(mode) {
             // If setting the reparse point fails, the file should be deleted.
-            let delete_on_failure = pal::ScopeExit::new(|| unsafe {
-                api::LxUtilFsDeleteFile(handle.as_raw_handle(), &self.state.fs_context);
+            let delete_on_failure = pal::ScopeExit::new(|| {
+                let _ = fs::delete_file(&mut fs::FsContext::new(&self.state.fs_context), &handle);
             });
 
             /// Only the required header for FSCTL_SET_REPARSE_POINT, with data length of zero.
@@ -1163,33 +1162,29 @@ impl LxVolume {
 
     /// Deletes a file, clearing the read-only attribute if necessary.
     fn delete_file(&self, handle: &OwnedHandle) -> lx::Result<()> {
-        unsafe {
-            let status =
-                api::LxUtilFsDeleteFileCore(&self.state.fs_context, handle.as_raw_handle());
+        let mut fs_context = fs::FsContext::new(&self.state.fs_context);
+        let result = fs::delete_file_core(&mut fs_context, handle);
 
-            if status < 0 {
-                // Read-only files can fail to be deleted with STATUS_CANNOT_DELETE if:
+        match result {
+            Ok(_) => result,
+            Err(e) => {
+                // Read-only files can fail to be deleted with EIO if:
                 // - The file system didn't support FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE.
                 // - The file system's permission check for that flag failed.
-                if status != ntstatus::STATUS_CANNOT_DELETE {
-                    return Err(util::nt_status_to_lx_ntdef(status));
+                if e.value() == lx::EIO {
+                    result
+                } else {
+                    // Reopen with the correct permissions to query and clear the read-only attribute,
+                    // and try again.
+                    let handle = util::reopen_file(
+                        handle,
+                        winnt::DELETE | winnt::FILE_READ_ATTRIBUTES | winnt::FILE_WRITE_ATTRIBUTES,
+                    )?;
+
+                    fs::delete_read_only_file(&mut fs_context, &handle)
                 }
-
-                // Reopen with the correct permissions to query and clear the read-only attribute,
-                // and try again.
-                let handle = util::reopen_file(
-                    handle,
-                    winnt::DELETE | winnt::FILE_READ_ATTRIBUTES | winnt::FILE_WRITE_ATTRIBUTES,
-                )?;
-
-                util::check_status_ntdef(api::LxUtilFsDeleteReadOnlyFile(
-                    &self.state.fs_context,
-                    handle.as_raw_handle(),
-                ))?;
             }
         }
-
-        Ok(())
     }
 
     // Determines whether the mode and gid must be changed based on the parent's set-group-id bit.

@@ -130,6 +130,20 @@ impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION {
     }
 }
 
+impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION_EX {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileDispositionInformationEx
+    }
+
+    fn as_ptr_len(&self) -> (*const u8, usize) {
+        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+
+    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+}
+
 // Open a file using NtCreateFile.
 // Returns the create result from the IO_STATUS_BLOCK along with the handle.
 pub fn open_relative_file(
