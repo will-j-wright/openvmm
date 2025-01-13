@@ -147,18 +147,6 @@ pal::delayload!("lxutil.dll" {
         size: &mut ntdef::USHORT,
     ) -> ntioapi::PREPARSE_DATA_BUFFER;
 
-    pub fn LxUtilFsDeleteFile(handle: RawHandle, fs_context: &LX_UTIL_FS_CONTEXT) -> i32;
-
-    pub fn LxUtilFsDeleteFileCore(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        handle: RawHandle,
-    ) -> ntdef::NTSTATUS;
-
-    pub fn LxUtilFsDeleteReadOnlyFile(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        handle: RawHandle,
-    ) -> ntdef::NTSTATUS;
-
     pub fn LxUtilFsDetermineCreationInfo(
         parent_mode: lx::mode_t,
         parent_gid: lx::gid_t,
