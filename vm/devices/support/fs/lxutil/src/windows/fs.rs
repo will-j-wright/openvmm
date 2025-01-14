@@ -64,6 +64,43 @@ impl FsContext {
     }
 }
 
+// Implements the chmod operation.
+
+// N.B. Linux permission bits are not fully supported. Only the read-only
+// attribute can be modified by altering the write bits of the file.
+
+// N.B. For unsupported changes this function returns success even though it
+// did nothing.
+pub fn chmod(file_handle: &OwnedHandle, mode: lx::mode_t) -> lx::Result<()> {
+    let info: FileSystem::FILE_BASIC_INFORMATION = util::query_information_file(file_handle)?;
+
+    if info.FileAttributes & W32Fs::FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        Ok(())
+    } else if mode & 0o222 == 0 {
+        util::set_readonly_attribute(file_handle, info.FileAttributes, true)
+    } else {
+        util::set_readonly_attribute(file_handle, info.FileAttributes, false)
+    }
+}
+
+// Determines the correct owner and mode of an item based on
+// the parent's properties.
+// mode and owner gid will be updated only if the parent has the setgit bit set.
+pub fn determine_creation_info(
+    parent_mode: lx::mode_t,
+    parent_gid: lx::gid_t,
+    mode: &mut lx::mode_t,
+    owner_gid: &mut lx::gid_t,
+) {
+    if parent_mode & lx::S_ISGID != 0 {
+        if lx::s_isdir(*mode) {
+            *mode |= lx::S_ISGID;
+        }
+
+        *owner_gid = parent_gid;
+    }
+}
+
 pub fn delete_file(fs_context: &mut FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
     let result = delete_file_core(fs_context, file_handle);
 
