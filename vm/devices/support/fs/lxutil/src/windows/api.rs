@@ -126,8 +126,6 @@ pub fn delay_load_lxutil() -> std::io::Result<()> {
 pal::delayload!("lxutil.dll" {
     pub fn LxUtilDirectoryEnumeratorCleanup(enumerator: &mut LX_UTIL_DIRECTORY_ENUMERATOR) -> ();
 
-    pub fn LxUtilFsChmod(handle: RawHandle, mode: lx::mode_t) -> i32;
-
     pub fn LxUtilFsCreateLinkReparseBuffer(
         link_target: &ntdef::ANSI_STRING,
         size: &mut ntdef::USHORT,
@@ -146,13 +144,6 @@ pal::delayload!("lxutil.dll" {
         flags: ntdef::ULONG,
         size: &mut ntdef::USHORT,
     ) -> ntioapi::PREPARSE_DATA_BUFFER;
-
-    pub fn LxUtilFsDetermineCreationInfo(
-        parent_mode: lx::mode_t,
-        parent_gid: lx::gid_t,
-        mode: &mut lx::mode_t,
-        owner_gid: &mut lx::mode_t,
-    ) -> ();
 
     pub fn LxUtilFsFileModeToReparseTag(mode: lx::mode_t) -> ntdef::ULONG;
 

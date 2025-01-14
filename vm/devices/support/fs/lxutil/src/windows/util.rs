@@ -2,11 +2,13 @@
 // Licensed under the MIT License.
 
 use super::api;
+use super::fs;
 use crate::SetAttributes;
 use crate::SetTime;
 use ::windows::Wdk::Storage::FileSystem;
 use ::windows::Wdk::System::SystemServices;
 use ::windows::Win32::Foundation;
+use ::windows::Win32::Storage::FileSystem as W32Fs;
 use ntapi::ntioapi;
 use ntapi::ntrtl::RtlIsDosDeviceName_U;
 use pal::windows;
@@ -629,6 +631,26 @@ pub fn set_information_file<T: FileInformationClass>(
     }
 }
 
+// Sets the read-only attribute on a file
+pub fn set_readonly_attribute(
+    handle: &OwnedHandle,
+    attributes: u32,
+    readonly: bool,
+) -> lx::Result<()> {
+    let info = FileSystem::FILE_BASIC_INFORMATION {
+        FileAttributes: if readonly {
+            attributes | W32Fs::FILE_ATTRIBUTE_READONLY.0
+        } else {
+            // FILE_ATTRIBUTE_NORMAL is ignored when other attributes are set,
+            // so adding it here is safe and ensures the value won't be zero.
+            (attributes & !(W32Fs::FILE_ATTRIBUTE_READONLY.0)) | W32Fs::FILE_ATTRIBUTE_NORMAL.0
+        },
+        ..Default::default()
+    };
+
+    set_information_file(handle, &info)
+}
+
 // Convert an NTSTATUS to a Linux error code.
 pub fn nt_status_to_lx_ntdef(status: ntdef::NTSTATUS) -> lx::Error {
     let mut error = -lx::EINVAL;
@@ -788,7 +810,7 @@ pub fn set_attr_core(
 
         // Read-only flag update is done with or without metadata.
         if let Some(mode) = attr.mode {
-            check_lx_error(api::LxUtilFsChmod(handle.as_raw_handle(), mode))?;
+            fs::chmod(handle, mode)?;
         }
 
         if !attr.atime.is_omit() || !attr.mtime.is_omit() || !attr.ctime.is_omit() {

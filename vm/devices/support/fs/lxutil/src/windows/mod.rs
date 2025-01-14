@@ -1203,14 +1203,12 @@ impl LxVolume {
         };
 
         let info = self.state.get_attributes(Some(&self.root), dir, None)?;
-        unsafe {
-            // If the parent doesn't have explicit mode metadata, it can't have the set-group-id bit.
-            if info.stat.LxFlags & api::LX_FILE_METADATA_HAS_MODE != 0 {
-                api::LxUtilFsDetermineCreationInfo(info.stat.LxMode, info.stat.LxGid, mode, gid);
-            }
-
-            Ok(())
+        // If the parent doesn't have explicit mode metadata, it can't have the set-group-id bit.
+        if info.stat.LxFlags & api::LX_FILE_METADATA_HAS_MODE != 0 {
+            fs::determine_creation_info(info.stat.LxMode, info.stat.LxGid, mode, gid);
         }
+
+        Ok(())
     }
 
     // Determines what kind of symlink to create for a given target.
