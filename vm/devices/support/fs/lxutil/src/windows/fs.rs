@@ -5,6 +5,7 @@ use super::api::LX_UTIL_FS_CONTEXT;
 use super::util;
 use bitfield_struct::bitfield;
 use std::os::windows::io::OwnedHandle;
+use std::path::Path;
 use windows::Wdk::Storage::FileSystem;
 use windows::Win32::Storage::FileSystem as W32Fs;
 
@@ -62,6 +63,31 @@ impl FsContext {
             compatibility_flags: fs_context.CompatibilityFlags.into(),
         }
     }
+}
+
+#[bitfield(u8)]
+pub struct RenameFlags {
+    pub escape_name: bool,
+    pub posix_semantics: bool,
+    #[bits(6)]
+    _reserved: u8,
+}
+
+pub fn rename(
+    file_handle: &OwnedHandle,
+    target_parent: &OwnedHandle,
+    target_path: &Path,
+    fs_context: &mut FsContext,
+    flags: RenameFlags,
+) -> lx::Result<()> {
+    // Set the POSIX semantics flag if the FS supports POSIX unlink rename
+    let new_flags = flags.with_posix_semantics(
+        fs_context
+            .compatibility_flags
+            .supports_posix_unlink_rename(),
+    );
+
+    util::rename(file_handle, target_parent, target_path, new_flags)
 }
 
 // Implements the chmod operation.

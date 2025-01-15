@@ -216,14 +216,6 @@ pal::delayload!("lxutil.dll" {
         target_path: *mut ntdef::UNICODE_STRING,
     ) -> i32;
 
-    pub fn LxUtilFsRename(
-        current: RawHandle,
-        target_parent: RawHandle,
-        target_name: *const ntdef::UNICODE_STRING,
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        flags: ntdef::ULONG,
-    ) -> i32;
-
     pub fn LxUtilFsSetTimes(
         handle: RawHandle,
         accessed_time: &lx::Timespec,

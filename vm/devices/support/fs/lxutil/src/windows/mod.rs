@@ -533,12 +533,11 @@ impl LxVolume {
         }
 
         let handle = self.open_file(path, winnt::FILE_READ_ATTRIBUTES | winnt::DELETE, 0)?;
-        let target: windows::UnicodeString = new_path
-            .as_os_str()
-            .try_into()
-            .map_err(|_| lx::Error::EINVAL)?;
 
-        let error = match util::rename(&handle, &self.root, &target, &self.state.fs_context) {
+        // TODO: Remove this conversion
+        let mut fs_context = fs::FsContext::new(&self.state.fs_context);
+        let flags = fs::RenameFlags::default();
+        let error = match fs::rename(&handle, &self.root, &new_path, &mut fs_context, flags) {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
@@ -566,7 +565,7 @@ impl LxVolume {
             }
 
             // Retry the rename.
-            util::rename(&handle, &self.root, &target, &self.state.fs_context)?;
+            fs::rename(&handle, &self.root, &new_path, &mut fs_context, flags)?;
         } else {
             return Err(error);
         }
