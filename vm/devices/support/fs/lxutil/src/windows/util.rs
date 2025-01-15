@@ -620,7 +620,7 @@ pub fn set_information_file<T: FileInformationClass>(
         let _ = check_status(FileSystem::NtSetInformationFile(
             Foundation::HANDLE(handle.as_raw_handle()),
             &mut iosb,
-            buf as ntdef::PVOID,
+            buf as *const ffi::c_void,
             len.try_into().unwrap(),
             info.file_information_class(),
         ))?;
@@ -930,21 +930,136 @@ pub fn create_ansi_string(value: &lx::LxStr) -> lx::Result<windows::AnsiStringRe
     windows::AnsiStringRef::new(value.as_bytes()).ok_or(lx::Error::EINVAL)
 }
 
-/// Safe wrapper around LxUtilFsRename.
+// Renames a source file/directory/stream to a different target
+// name.
+
+// N.B. The source file handle must be opened for synchronous access.
+
+// N.B. The target name will be escaped if it contains characters that aren't
+//      supported by NTFS.
 pub fn rename(
     current: &OwnedHandle,
     target_parent: &OwnedHandle,
-    target_name: &windows::UnicodeString,
-    fs_context: &api::LX_UTIL_FS_CONTEXT,
+    target_path: &Path,
+    flags: fs::RenameFlags,
 ) -> lx::Result<()> {
-    unsafe {
-        check_lx_error(api::LxUtilFsRename(
-            current.as_raw_handle(),
-            target_parent.as_raw_handle(),
-            target_name.as_ptr(),
-            fs_context,
-            0,
-        ))
+    // If necessary, escape the path, then convert it into a Vec<u16>
+    let target_name: Vec<u16> = if flags.escape_name() {
+        super::path::path_from_lx(target_path.as_os_str().as_encoded_bytes())?
+            .as_os_str()
+            .encode_wide()
+            .collect()
+    } else {
+        target_path.as_os_str().encode_wide().collect()
+    };
+
+    // Create the union field of FILE_RENAME_INFORMATION--if POSIX semantics are enabled,
+    // we will use the flags field from FILE_RENAME_INFORMATION_EX
+    let rename_info_inner = if flags.posix_semantics() {
+        // To match POSIX semantics, both POSIX rename and ignoring read-only
+        // are required.
+        //
+        // N.B. It is assumed that if the file system supports POSIX rename, it
+        //      supports the ignore read-only attribute flag. Currently, only
+        //      NTFS supports either flag.
+        FileSystem::FILE_RENAME_INFORMATION_0 {
+            Flags: FileSystem::FILE_RENAME_REPLACE_IF_EXISTS
+                | FileSystem::FILE_RENAME_POSIX_SEMANTICS
+                | FileSystem::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE,
+        }
+    } else {
+        FileSystem::FILE_RENAME_INFORMATION_0 {
+            ReplaceIfExists: true.into(),
+        }
+    };
+
+    // Create our own FILE_RENAME_INFORMATION struct with the FileName field
+    // removed so we can use HeaderVec
+    //
+    // TODO: Figure out a way of partially automating this process for Windows
+    // structures, as a lot of this code is copied from create_link
+    #[allow(non_camel_case_types)]
+    #[derive(Default, Clone, Copy)]
+    #[repr(C)]
+    struct FILE_RENAME_INFORMATION {
+        anonymous: FileSystem::FILE_RENAME_INFORMATION_0,
+        pad: [u8; 4],
+        root_directory: zerocopy::U64<zerocopy::NativeEndian>, // HANDLE
+        file_name_length: zerocopy::U32<zerocopy::NativeEndian>,
+        // FileName
+    }
+
+    // Wrapper around FILE_RENAME_INFORMATION to allow compatibility with FileInformationClass trait
+    #[allow(non_camel_case_types)]
+    #[derive(Default, Clone, Copy)]
+    #[repr(transparent)]
+    struct FILE_RENAME_INFORMATION_EX(FILE_RENAME_INFORMATION);
+
+    impl FileInformationClass for HeaderVec<FILE_RENAME_INFORMATION, [u16; 1]> {
+        fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+            FileSystem::FileRenameInformation
+        }
+
+        fn as_ptr_len(&self) -> (*const u8, usize) {
+            // NOTE: HeaderVec guarantees the header and tail are right after another in memory. The number of valid
+            //         bytes is described by HeaderVec::total_byte_len().
+            (self.as_ptr().cast::<u8>(), self.total_byte_len())
+        }
+
+        fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+            (self.as_mut_ptr().cast::<u8>(), self.total_byte_len())
+        }
+    }
+
+    impl FileInformationClass for HeaderVec<FILE_RENAME_INFORMATION_EX, [u16; 1]> {
+        fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+            FileSystem::FileRenameInformationEx
+        }
+
+        fn as_ptr_len(&self) -> (*const u8, usize) {
+            // NOTE: HeaderVec guarantees the header and tail are right after another in memory. The number of valid
+            //         bytes is described by HeaderVec::total_byte_len().
+            (self.as_ptr().cast::<u8>(), self.total_byte_len())
+        }
+
+        fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+            (self.as_mut_ptr().cast::<u8>(), self.total_byte_len())
+        }
+    }
+
+    assert_eq!(
+        std::mem::offset_of!(FileSystem::FILE_RENAME_INFORMATION, FileName),
+        size_of::<FILE_RENAME_INFORMATION>()
+    );
+
+    let file_name_length: u32 = target_name
+        .as_bytes()
+        .len()
+        .try_into()
+        .map_err(|_| lx::Error::EINVAL)?;
+
+    let info = FILE_RENAME_INFORMATION {
+        anonymous: rename_info_inner,
+        root_directory: (target_parent.as_raw_handle() as u64).into(),
+        file_name_length: file_name_length.into(),
+        ..Default::default()
+    };
+
+    // If POSIX semantics are enabled, we need to wrap the struct in
+    // FILE_RENAME_INFORMATION_EX to pass the correct FileInformationClass to
+    // set_information_file
+    if flags.posix_semantics() {
+        let mut buffer = HeaderVec::<FILE_RENAME_INFORMATION_EX, [u16; 1]>::with_capacity(
+            FILE_RENAME_INFORMATION_EX(info),
+            target_name.len(),
+        );
+        buffer.extend_from_slice(target_name.as_slice());
+        set_information_file(current, &buffer)
+    } else {
+        let mut buffer =
+            HeaderVec::<FILE_RENAME_INFORMATION, [u16; 1]>::with_capacity(info, target_name.len());
+        buffer.extend_from_slice(target_name.as_slice());
+        set_information_file(current, &buffer)
     }
 }
 
