@@ -14,6 +14,7 @@ use super::PathExt;
 use super::SetAttributes;
 use ::windows::Wdk::Storage::FileSystem;
 use ::windows::Wdk::System::SystemServices;
+use ::windows::Win32::Foundation;
 use ntapi::ntioapi;
 use pal::windows;
 use parking_lot::Mutex;
@@ -1495,13 +1496,13 @@ impl LxFile {
 
         unsafe {
             let mut iosb = mem::zeroed();
-            util::check_status_ntdef(ntioapi::NtFlushBuffersFileEx(
+            let _ = util::check_status(Foundation::NTSTATUS(ntioapi::NtFlushBuffersFileEx(
                 handle.as_raw_handle(),
                 flags,
                 ptr::null_mut(),
                 0,
                 &mut iosb,
-            ))?;
+            )))?;
         }
 
         Ok(())

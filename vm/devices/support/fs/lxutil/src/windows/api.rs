@@ -232,8 +232,6 @@ pal::delayload!("lxutil.dll" {
         mode: lx::mode_t,
     ) -> i32;
 
-    pub fn LxUtilNtStatusToLxError(status: ntdef::NTSTATUS, lx_error: &mut i32) -> ntdef::BOOLEAN;
-
     pub fn LxUtilSymlinkRead(link_file: RawHandle, link_target: *mut ntdef::UNICODE_STRING) -> i32;
 
     pub fn LxUtilXattrGet(
