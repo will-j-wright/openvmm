@@ -187,7 +187,7 @@ pub fn open_relative_file(
             ea_len,
         );
 
-        check_status_ntdef(status)?;
+        let _ = check_status(Foundation::NTSTATUS(status))?;
         Ok((OwnedHandle::from_raw_handle(handle), iosb.Information))
     }
 }
@@ -359,16 +359,6 @@ pub fn is_symlink(attributes: ntdef::ULONG, reparse_tag: ntdef::ULONG) -> bool {
 
 // Convert an NTSTATUS into an lx::Result.
 // Returns the status value on success in case it held a non-error value.
-pub fn check_status_ntdef(status: ntdef::NTSTATUS) -> lx::Result<ntdef::NTSTATUS> {
-    if status < 0 {
-        Err(nt_status_to_lx_ntdef(status))
-    } else {
-        Ok(status)
-    }
-}
-
-// Convert an NTSTATUS into an lx::Result.
-// Returns the status value on success in case it held a non-error value.
 pub fn check_status(status: Foundation::NTSTATUS) -> lx::Result<Foundation::NTSTATUS> {
     if status.0 < 0 {
         Err(nt_status_to_lx(status))
@@ -383,7 +373,7 @@ pub fn check_status_rw(status: ntdef::NTSTATUS) -> lx::Result<ntdef::NTSTATUS> {
         match status {
             ntstatus::STATUS_ACCESS_DENIED => Err(lx::Error::EBADF),
             ntstatus::STATUS_END_OF_FILE => Ok(0),
-            _ => Err(nt_status_to_lx_ntdef(status)),
+            _ => Err(nt_status_to_lx(Foundation::NTSTATUS(status))),
         }
     } else {
         Ok(status)
@@ -569,7 +559,7 @@ pub fn create_nt_link_reparse_buffer(target: &ffi::OsStr) -> lx::Result<windows:
 pub fn set_reparse_point(handle: &OwnedHandle, reparse_buffer: &[u8]) -> lx::Result<()> {
     unsafe {
         let mut iosb = mem::zeroed();
-        check_status_ntdef(ntioapi::NtFsControlFile(
+        let _ = check_status(Foundation::NTSTATUS(ntioapi::NtFsControlFile(
             handle.as_raw_handle(),
             ptr::null_mut(),
             None,
@@ -583,7 +573,7 @@ pub fn set_reparse_point(handle: &OwnedHandle, reparse_buffer: &[u8]) -> lx::Res
                 .map_err(|_| lx::Error::EINVAL)?,
             ptr::null_mut(),
             0,
-        ))?;
+        )))?;
     }
 
     Ok(())
@@ -652,17 +642,106 @@ pub fn set_readonly_attribute(
 }
 
 // Convert an NTSTATUS to a Linux error code.
-pub fn nt_status_to_lx_ntdef(status: ntdef::NTSTATUS) -> lx::Error {
-    let mut error = -lx::EINVAL;
-    unsafe { api::LxUtilNtStatusToLxError(status, &mut error) };
-    lx::Error::from_lx(-error)
-}
-
-// Convert an NTSTATUS to a Linux error code.
 pub fn nt_status_to_lx(status: Foundation::NTSTATUS) -> lx::Error {
-    let mut error = -lx::EINVAL;
-    unsafe { api::LxUtilNtStatusToLxError(status.0, &mut error) };
-    lx::Error::from_lx(-error)
+    lx::Error::from_lx(match status {
+        Foundation::STATUS_SUCCESS => 0,
+        Foundation::STATUS_OBJECTID_NOT_FOUND => lx::ESRCH,
+        Foundation::STATUS_DIRECTORY_NOT_EMPTY => lx::ENOTEMPTY,
+        Foundation::STATUS_OBJECT_NAME_EXISTS
+        | Foundation::STATUS_OBJECT_NAME_COLLISION
+        | Foundation::STATUS_OBJECTID_EXISTS
+        | Foundation::STATUS_DUPLICATE_OBJECTID => lx::EEXIST,
+        Foundation::STATUS_ADDRESS_ALREADY_EXISTS => lx::EADDRINUSE,
+        Foundation::STATUS_ACCESS_VIOLATION => lx::EFAULT,
+        Foundation::STATUS_INSUFFICIENT_RESOURCES
+        | Foundation::STATUS_NO_MEMORY
+        | Foundation::STATUS_COMMITMENT_LIMIT
+        | Foundation::STATUS_GRAPHICS_NO_VIDEO_MEMORY
+        | Foundation::STATUS_PAGEFILE_QUOTA => lx::ENOMEM,
+        Foundation::STATUS_IN_PAGE_ERROR => lx::EIO,
+        Foundation::STATUS_ILLEGAL_CHARACTER
+        | Foundation::STATUS_INVALID_PARAMETER
+        | Foundation::STATUS_INVALID_PARAMETER_1
+        | Foundation::STATUS_INVALID_PARAMETER_2
+        | Foundation::STATUS_INVALID_PARAMETER_3
+        | Foundation::STATUS_INVALID_PARAMETER_4
+        | Foundation::STATUS_INVALID_PARAMETER_5
+        | Foundation::STATUS_INVALID_PARAMETER_6
+        | Foundation::STATUS_INVALID_PARAMETER_7
+        | Foundation::STATUS_INVALID_PARAMETER_8
+        | Foundation::STATUS_INVALID_PARAMETER_9
+        | Foundation::STATUS_INVALID_PARAMETER_10
+        | Foundation::STATUS_INVALID_PARAMETER_11
+        | Foundation::STATUS_INVALID_PARAMETER_12
+        | Foundation::STATUS_OBJECT_PATH_INVALID
+        | Foundation::STATUS_INVALID_INFO_CLASS => lx::EINVAL,
+        Foundation::STATUS_OBJECT_NAME_INVALID
+        | Foundation::STATUS_OBJECT_NAME_NOT_FOUND
+        | Foundation::STATUS_OBJECT_PATH_NOT_FOUND
+        | Foundation::STATUS_NOT_FOUND
+        | Foundation::STATUS_DELETE_PENDING
+        | Foundation::STATUS_BAD_NETWORK_NAME
+        | Foundation::STATUS_NO_SUCH_FILE => lx::ENOENT,
+        Foundation::STATUS_CANNOT_DELETE
+        | Foundation::STATUS_INTERNAL_ERROR
+        | Foundation::STATUS_WRONG_VOLUME => lx::EIO,
+        Foundation::STATUS_TIMEOUT | Foundation::STATUS_IO_TIMEOUT | Foundation::STATUS_RETRY => {
+            lx::EAGAIN
+        }
+        Foundation::STATUS_CANCELLED => lx::EINTR,
+        Foundation::STATUS_CONNECTION_DISCONNECTED => lx::EPIPE,
+        Foundation::STATUS_CONNECTION_RESET => lx::ECONNRESET,
+        Foundation::STATUS_CONNECTION_REFUSED => lx::ECONNREFUSED,
+        Foundation::STATUS_BUFFER_TOO_SMALL
+        | Foundation::STATUS_BUFFER_OVERFLOW
+        | Foundation::STATUS_INFO_LENGTH_MISMATCH => lx::EOVERFLOW,
+        Foundation::STATUS_MEDIA_WRITE_PROTECTED => lx::EROFS,
+        Foundation::STATUS_EXTERNAL_BACKING_PROVIDER_UNKNOWN
+        | Foundation::STATUS_GRAPHICS_ALLOCATION_CONTENT_LOST
+        | Foundation::STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE
+        | Foundation::STATUS_DEVICE_REMOVED
+        | Foundation::STATUS_GRAPHICS_DRIVER_MISMATCH
+        | Foundation::STATUS_NO_SUCH_DEVICE => lx::ENODEV,
+        Foundation::STATUS_ACCESS_DENIED
+        | Foundation::STATUS_SHARING_VIOLATION
+        | Foundation::STATUS_FVE_LOCKED_VOLUME => lx::EACCES,
+        Foundation::STATUS_CONNECTION_ABORTED => lx::ECONNABORTED,
+        Foundation::STATUS_INTEGER_OVERFLOW => lx::EOVERFLOW,
+        Foundation::STATUS_NETWORK_UNREACHABLE => lx::ENETUNREACH,
+        Foundation::STATUS_HOST_UNREACHABLE => lx::EHOSTUNREACH,
+        Foundation::STATUS_NOT_SUPPORTED
+        | Foundation::STATUS_PRIVILEGE_NOT_HELD
+        | Foundation::STATUS_PRIVILEGED_INSTRUCTION => lx::EPERM,
+        Foundation::STATUS_IO_REPARSE_TAG_NOT_HANDLED => lx::ENXIO,
+        Foundation::STATUS_MAPPED_FILE_SIZE_ZERO => lx::ENOEXEC,
+        Foundation::STATUS_DISK_FULL => lx::ENOSPC,
+        Foundation::STATUS_NOT_IMPLEMENTED => lx::ENOSYS,
+        Foundation::STATUS_UNEXPECTED_NETWORK_ERROR => lx::ENOTCONN,
+        Foundation::STATUS_BAD_NETWORK_PATH => lx::EHOSTDOWN,
+        Foundation::STATUS_NO_MEDIA_IN_DEVICE => lx::ENOMEDIUM,
+        Foundation::STATUS_UNRECOGNIZED_MEDIA => lx::EMEDIUMTYPE,
+        Foundation::STATUS_NO_EAS_ON_FILE | Foundation::STATUS_NO_MORE_EAS => lx::ENOATTR,
+        Foundation::STATUS_NOT_A_DIRECTORY => lx::ENOTDIR,
+        Foundation::STATUS_FILE_IS_A_DIRECTORY => lx::EISDIR,
+        Foundation::STATUS_ILLEGAL_INSTRUCTION
+        | Foundation::STATUS_INVALID_DEVICE_REQUEST
+        | Foundation::STATUS_EAS_NOT_SUPPORTED => lx::EOPNOTSUPP,
+        Foundation::STATUS_INVALID_HANDLE
+        | Foundation::STATUS_GRAPHICS_ALLOCATION_CLOSED
+        | Foundation::STATUS_GRAPHICS_INVALID_ALLOCATION_INSTANCE
+        | Foundation::STATUS_GRAPHICS_INVALID_ALLOCATION_HANDLE
+        | Foundation::STATUS_GRAPHICS_WRONG_ALLOCATION_DEVICE
+        | Foundation::STATUS_OBJECT_PATH_SYNTAX_BAD => lx::EBADF,
+        Foundation::STATUS_GRAPHICS_ALLOCATION_BUSY => lx::EINPROGRESS,
+        Foundation::STATUS_OBJECT_TYPE_MISMATCH => lx::EPROTOTYPE,
+        s => {
+            if s.0 >= 0 {
+                0
+            } else {
+                lx::EINVAL
+            }
+        }
+    })
 }
 
 fn are_any_attributes_set(attr: &SetAttributes) -> bool {
