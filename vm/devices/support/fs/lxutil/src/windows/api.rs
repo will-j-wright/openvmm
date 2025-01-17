@@ -13,6 +13,7 @@ use std::ffi;
 use std::os::windows::prelude::*;
 use winapi::shared::basetsd;
 use winapi::shared::ntdef;
+use windows::Wdk::Storage::FileSystem;
 
 // Maximum size needed for an EA buffer containing all metadata fields.
 pub const LX_UTIL_FS_METADATA_EA_BUFFER_SIZE: usize = 84;
@@ -149,19 +150,6 @@ pal::delayload!("lxutil.dll" {
 
     pub fn LxUtilFsGetFileSystemBlockSize(handle: RawHandle) -> ntdef::ULONG;
 
-    pub fn LxUtilFsGetLxAttributes(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        information: &mut ntioapi::FILE_STAT_LX_INFORMATION,
-        flags: ntdef::ULONG,
-        block_size: ntdef::ULONG,
-        default_uid: lx::uid_t,
-        default_gid: lx::gid_t,
-        umask: u32,
-        dmask: u32,
-        fmask: u32,
-        stat: &mut lx::Stat,
-    ) -> i32;
-
     pub fn LxUtilFsGetLxFileSystemAttributes(
         handle: RawHandle,
         fs_type: usize,
@@ -174,7 +162,7 @@ pal::delayload!("lxutil.dll" {
         asynchronous_mode: ntdef::BOOLEAN,
         callbacks: &LX_UTIL_FS_CALLBACKS,
         fs_context: &mut LX_UTIL_FS_CONTEXT,
-        information: &mut ntioapi::FILE_STAT_INFORMATION,
+        information: &mut FileSystem::FILE_STAT_INFORMATION,
     ) -> i32;
 
     pub fn LxUtilFsIsAppExecLink(attributes: ntdef::ULONG, reparse_tag: ntdef::ULONG) -> ntdef::BOOLEAN;
@@ -182,14 +170,14 @@ pal::delayload!("lxutil.dll" {
     pub fn LxUtilFsQueryStatLxInformation(
         handle: RawHandle,
         fs_context: &LX_UTIL_FS_CONTEXT,
-        information: &mut ntioapi::FILE_STAT_LX_INFORMATION,
+        information: &mut FileSystem::FILE_STAT_LX_INFORMATION,
     ) -> i32;
 
     pub fn LxUtilFsQueryStatLxInformationByName(
         fs_context: &LX_UTIL_FS_CONTEXT,
         parent_handle: RawHandle,
         path: *const ntdef::UNICODE_STRING,
-        information: &mut ntioapi::FILE_STAT_LX_INFORMATION,
+        information: &mut FileSystem::FILE_STAT_LX_INFORMATION,
     ) -> i32;
 
     pub fn LxUtilFsReadDir(

@@ -9,6 +9,7 @@ use ::windows::Wdk::Storage::FileSystem;
 use ::windows::Wdk::System::SystemServices;
 use ::windows::Win32::Foundation;
 use ::windows::Win32::Storage::FileSystem as W32Fs;
+use ::windows::Win32::System::SystemServices as W32Ss;
 use ntapi::ntioapi;
 use ntapi::ntrtl::RtlIsDosDeviceName_U;
 use pal::windows;
@@ -30,6 +31,14 @@ use zerocopy::FromZeroes;
 // Minimum permissions needed to access a file's metadata.
 pub const MINIMUM_PERMISSIONS: u32 =
     winnt::FILE_READ_ATTRIBUTES | winnt::FILE_READ_EA | winnt::READ_CONTROL;
+
+// The following constant is a bias that offsets the NT time to the
+// POSIX time origin. From C:
+// static CONST LARGE_INTEGER LxPosixEpochOffset = {0xd53e8000, 0x019db1de};
+const LX_POSIX_EPOCH_OFFSET: i64 = 0xd53e8000 + (0x019db1de << 32);
+
+const LX_UTIL_NT_UNIT_PER_SEC: i64 = 10000000;
+const LX_UTIL_NANO_SEC_PER_NT_UNIT: i64 = 100;
 
 // RAII wrapper around LX_UTIL_DIRECTORY_ENUMERATOR.
 pub struct LxUtilDirEnum {
@@ -209,7 +218,7 @@ pub fn reopen_file(
 }
 
 pub struct LxStatInformation {
-    pub stat: ntioapi::FILE_STAT_LX_INFORMATION,
+    pub stat: FileSystem::FILE_STAT_LX_INFORMATION,
     pub symlink_len: Option<u32>,
     pub is_app_execution_alias: bool,
 }
@@ -230,8 +239,7 @@ pub fn get_attributes_by_handle(
 
         // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
         // determined based on the reparse data.
-        let symlink_len = if is_symlink(stat.FileAttributes, stat.ReparseTag)
-            && *stat.EndOfFile.QuadPart() == 0
+        let symlink_len = if is_symlink(stat.FileAttributes, stat.ReparseTag) && stat.EndOfFile == 0
         {
             let mut symlink_len: ntdef::ULONG = 0;
             api::LxUtilFsReadLinkLength(
@@ -244,7 +252,7 @@ pub fn get_attributes_by_handle(
         } else {
             None
         };
-        let is_app_execution_alias = stat.EndOfFile.QuadPart().eq(&0)
+        let is_app_execution_alias = stat.EndOfFile.eq(&0)
             && api::LxUtilFsIsAppExecLink(stat.FileAttributes, stat.ReparseTag) != 0;
 
         Ok(LxStatInformation {
@@ -288,31 +296,30 @@ pub fn get_attributes(
 
             // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
             // determined based on the reparse data, which requires opening the file.
-            let symlink_len = if is_symlink(stat.FileAttributes, stat.ReparseTag)
-                && *stat.EndOfFile.QuadPart() == 0
-            {
-                let mut symlink_len: ntdef::ULONG = 0;
-                if let Ok((handle, _)) = open_relative_file(
-                    root_handle,
-                    path,
-                    MINIMUM_PERMISSIONS,
-                    ntioapi::FILE_OPEN,
-                    0,
-                    ntioapi::FILE_OPEN_REPARSE_POINT,
-                    None,
-                ) {
-                    api::LxUtilFsReadLinkLength(
-                        fs_context,
-                        handle.as_raw_handle(),
-                        fs_context_ptr,
-                        &mut symlink_len,
-                    );
-                }
-                Some(symlink_len)
-            } else {
-                None
-            };
-            let is_app_execution_alias = stat.EndOfFile.QuadPart().eq(&0)
+            let symlink_len =
+                if is_symlink(stat.FileAttributes, stat.ReparseTag) && stat.EndOfFile == 0 {
+                    let mut symlink_len: ntdef::ULONG = 0;
+                    if let Ok((handle, _)) = open_relative_file(
+                        root_handle,
+                        path,
+                        MINIMUM_PERMISSIONS,
+                        ntioapi::FILE_OPEN,
+                        0,
+                        ntioapi::FILE_OPEN_REPARSE_POINT,
+                        None,
+                    ) {
+                        api::LxUtilFsReadLinkLength(
+                            fs_context,
+                            handle.as_raw_handle(),
+                            fs_context_ptr,
+                            &mut symlink_len,
+                        );
+                    }
+                    Some(symlink_len)
+                } else {
+                    None
+                };
+            let is_app_execution_alias = stat.EndOfFile.eq(&0)
                 && api::LxUtilFsIsAppExecLink(stat.FileAttributes, stat.ReparseTag) != 0;
 
             Ok(LxStatInformation {
@@ -491,38 +498,35 @@ pub fn file_info_to_stat(
     options: &crate::LxVolumeOptions,
     block_size: ntdef::ULONG,
 ) -> lx::Result<lx::Stat> {
-    unsafe {
-        let mut stat = mem::zeroed();
-        check_lx_error(api::LxUtilFsGetLxAttributes(
-            fs_context,
-            &mut information.stat,
-            api::LX_UTIL_FS_CALLER_HAS_TRAVERSE_PRIVILEGE,
-            block_size,
-            options.default_uid,
-            options.default_gid,
-            options.umask,
-            options.dmask,
-            options.fmask,
-            &mut stat,
-        ))?;
+    let fs_context = fs::FsContext::new(fs_context);
+    let mut stat = fs::get_lx_attr(
+        &fs_context,
+        &mut information.stat,
+        api::LX_UTIL_FS_CALLER_HAS_TRAVERSE_PRIVILEGE,
+        block_size,
+        options.default_uid,
+        options.default_gid,
+        options.umask,
+        options.dmask,
+        options.fmask,
+    )?;
 
-        // The uid, gid and mode options are applied to all files, even if they have metadata.
-        if let Some(uid) = options.uid {
-            stat.uid = uid;
-        }
-        if let Some(gid) = options.gid {
-            stat.gid = gid;
-        }
-        if let Some(mode) = options.mode {
-            stat.mode = override_mode(stat.mode, mode);
-        }
-        if let Some(symlink_len) = information.symlink_len {
-            stat.file_size = symlink_len as u64;
-        } else if information.is_app_execution_alias {
-            stat.file_size = api::LX_UTIL_PE_HEADER_SIZE as u64;
-        }
-        Ok(stat)
+    // The uid, gid and mode options are applied to all files, even if they have metadata.
+    if let Some(uid) = options.uid {
+        stat.uid = uid;
     }
+    if let Some(gid) = options.gid {
+        stat.gid = gid;
+    }
+    if let Some(mode) = options.mode {
+        stat.mode = override_mode(stat.mode, mode);
+    }
+    if let Some(symlink_len) = information.symlink_len {
+        stat.file_size = symlink_len as u64;
+    } else if information.is_app_execution_alias {
+        stat.file_size = api::LX_UTIL_PE_HEADER_SIZE as u64;
+    }
+    Ok(stat)
 }
 
 // Create the reparse buffer for an LX symlink.
@@ -1148,5 +1152,62 @@ fn set_time_to_timespec(time: &SetTime) -> lx::Timespec {
         SetTime::Omit => lx::Timespec::omit(),
         SetTime::Set(duration) => duration.into(),
         SetTime::Now => lx::Timespec::now(),
+    }
+}
+
+/// Convert an i64 (LARGE_INTEGER) NTTIME to an lx::Timespec.
+pub fn nt_time_to_timespec(nt_time: i64, absolute_time: bool) -> lx::Timespec {
+    let nt_time = if absolute_time {
+        if nt_time > LX_POSIX_EPOCH_OFFSET {
+            nt_time - LX_POSIX_EPOCH_OFFSET
+        } else {
+            0
+        }
+    } else {
+        nt_time
+    };
+
+    lx::Timespec {
+        seconds: (nt_time / LX_UTIL_NT_UNIT_PER_SEC) as usize,
+        nanoseconds: ((nt_time % LX_UTIL_NT_UNIT_PER_SEC) * LX_UTIL_NANO_SEC_PER_NT_UNIT) as usize,
+    }
+}
+
+// Determines the correct owner and mode of an item based on
+// the parent's properties.
+// mode and owner gid will be updated only if the parent has the setgit bit set.
+pub fn determine_creation_info(
+    parent_mode: lx::mode_t,
+    parent_gid: lx::gid_t,
+    mode: &mut lx::mode_t,
+    owner_gid: &mut lx::gid_t,
+) {
+    if parent_mode & lx::S_ISGID != 0 {
+        if lx::s_isdir(*mode) {
+            *mode |= lx::S_ISGID;
+        }
+
+        *owner_gid = parent_gid;
+    }
+}
+
+/// Convert a reparse tag into the appropriate file mode
+pub fn reparse_tag_to_file_mode(reparse_tag: u32) -> lx::mode_t {
+    // We need to redefine some of the tags, in the windows crate they're defined as i32s
+    // instead of u32s. In the headers themselves they're just #define directives
+    const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
+    const IO_REPARSE_TAG_LX_FIFO: u32 = FileSystem::IO_REPARSE_TAG_LX_FIFO as u32;
+    const IO_REPARSE_TAG_LX_CHR: u32 = FileSystem::IO_REPARSE_TAG_LX_CHR as u32;
+    const IO_REPARSE_TAG_LX_BLK: u32 = FileSystem::IO_REPARSE_TAG_LX_BLK as u32;
+
+    match reparse_tag {
+        W32Ss::IO_REPARSE_TAG_SYMLINK
+        | W32Ss::IO_REPARSE_TAG_MOUNT_POINT
+        | IO_REPARSE_TAG_LX_SYMLINK => lx::S_IFLNK,
+        W32Ss::IO_REPARSE_TAG_AF_UNIX => lx::S_IFSOCK,
+        IO_REPARSE_TAG_LX_FIFO => lx::S_IFIFO,
+        IO_REPARSE_TAG_LX_CHR => lx::S_IFCHR,
+        IO_REPARSE_TAG_LX_BLK => lx::S_IFBLK,
+        _ => 0,
     }
 }
