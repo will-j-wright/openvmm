@@ -24,6 +24,7 @@ libc.workspace = true
 bitfield-struct.workspace = true
 ntapi.workspace = true
 parking_lot.workspace = true
+static_assertions.workspace = true
 widestring.workspace = true
 zerocopy.workspace = true
 [target.'cfg(windows)'.dependencies.winapi]
@@ -52,6 +53,7 @@ features = [
     "Win32_Foundation", 
     "Win32_Storage_FileSystem", 
     "Win32_System_IO",
+    "Win32_System_SystemServices",
 ]
 
 [dev-dependencies]

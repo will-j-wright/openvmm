@@ -27,6 +27,7 @@ pub type off_t = i64;
 pub type dev_t = usize;
 
 pub const MODE_INVALID: mode_t = mode_t::MAX;
+pub const MODE_VALID_BITS: mode_t = S_IFMT | 0o7777;
 pub const UID_INVALID: uid_t = uid_t::MAX;
 pub const GID_INVALID: gid_t = gid_t::MAX;
 

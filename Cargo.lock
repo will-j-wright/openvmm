@@ -3693,6 +3693,7 @@ dependencies = [
  "ntapi",
  "pal",
  "parking_lot",
+ "static_assertions",
  "tempfile",
  "tracing",
  "widestring",

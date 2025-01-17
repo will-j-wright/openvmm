@@ -1205,7 +1205,7 @@ impl LxVolume {
         let info = self.state.get_attributes(Some(&self.root), dir, None)?;
         // If the parent doesn't have explicit mode metadata, it can't have the set-group-id bit.
         if info.stat.LxFlags & api::LX_FILE_METADATA_HAS_MODE != 0 {
-            fs::determine_creation_info(info.stat.LxMode, info.stat.LxGid, mode, gid);
+            util::determine_creation_info(info.stat.LxMode, info.stat.LxGid, mode, gid);
         }
 
         Ok(())
