@@ -5,11 +5,16 @@ use super::api;
 use super::fs;
 use crate::SetAttributes;
 use crate::SetTime;
+use ::windows::Wdk;
 use ::windows::Wdk::Storage::FileSystem;
 use ::windows::Wdk::System::SystemServices;
 use ::windows::Win32::Foundation;
+use ::windows::Win32::Security;
+use ::windows::Win32::Security as W32Sec;
 use ::windows::Win32::Storage::FileSystem as W32Fs;
+use ::windows::Win32::System::Kernel;
 use ::windows::Win32::System::SystemServices as W32Ss;
+use ::windows::Win32::System::Threading;
 use ntapi::ntioapi;
 use ntapi::ntrtl::RtlIsDosDeviceName_U;
 use pal::windows;
@@ -19,6 +24,8 @@ use std::mem;
 use std::os::windows::prelude::*;
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use winapi::shared::basetsd;
 use winapi::shared::ntdef;
 use winapi::shared::ntstatus;
@@ -27,6 +34,11 @@ use winapi::um::winnt;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 use zerocopy::FromZeroes;
+
+// Largest security descriptor seen across all threads.
+//
+// N.B. This is the same base value used for ObGetObjectSecurity.
+static LX_UTIL_FS_SECURITY_DESCRIPTOR_SIZE: AtomicUsize = AtomicUsize::new(256);
 
 // Minimum permissions needed to access a file's metadata.
 pub const MINIMUM_PERMISSIONS: u32 =
@@ -62,6 +74,7 @@ impl Drop for LxUtilDirEnum {
     }
 }
 
+// TODO: Create a macro that implements this
 /// A trait that maps a file information struct for calling into `NtSetInformationFile`, `NtQueryInformationFile` and
 /// other methods that accept a `FileInformationClass`.
 pub trait FileInformationClass: Default {
@@ -86,20 +99,6 @@ pub trait FileInformationClass: Default {
 impl FileInformationClass for FileSystem::FILE_BASIC_INFORMATION {
     fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
         FileSystem::FileBasicInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_CASE_SENSITIVE_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileCaseSensitiveInformation
     }
 
     fn as_ptr_len(&self) -> (*const u8, usize) {
@@ -142,6 +141,62 @@ impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION {
 impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION_EX {
     fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
         FileSystem::FileDispositionInformationEx
+    }
+
+    fn as_ptr_len(&self) -> (*const u8, usize) {
+        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+
+    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+}
+
+impl FileInformationClass for FileSystem::FILE_STAT_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileStatInformation
+    }
+
+    fn as_ptr_len(&self) -> (*const u8, usize) {
+        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+
+    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+}
+
+impl FileInformationClass for FileSystem::FILE_STAT_LX_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileStatLxInformation
+    }
+
+    fn as_ptr_len(&self) -> (*const u8, usize) {
+        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+
+    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+}
+
+impl FileInformationClass for FileSystem::FILE_ALL_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileAllInformation
+    }
+
+    fn as_ptr_len(&self) -> (*const u8, usize) {
+        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+
+    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
+        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
+    }
+}
+
+impl FileInformationClass for FileSystem::FILE_CASE_SENSITIVE_INFORMATION {
+    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
+        FileSystem::FileCaseSensitiveInformation
     }
 
     fn as_ptr_len(&self) -> (*const u8, usize) {
@@ -217,6 +272,162 @@ pub fn reopen_file(
     Ok(handle)
 }
 
+// Get a token that can be used for a user-mode access check.
+fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
+    let mut client_token_raw = Foundation::HANDLE::default();
+    let mut duplicate_token_raw = Foundation::HANDLE::default();
+    let client_token: OwnedHandle;
+    // safety: Calling Win32 API as documented.
+    let result = unsafe {
+        check_status(FileSystem::NtOpenThreadToken(
+            Threading::GetCurrentThread(),
+            Security::TOKEN_QUERY.0 | Security::TOKEN_DUPLICATE.0,
+            true,
+            &mut client_token_raw,
+        ))
+    };
+
+    if let Err(e) = result {
+        // Use the process token if there's no token.
+        if e.value() == Foundation::STATUS_NO_TOKEN.0 {
+            // safety: Calling Win32 API as documented.
+            unsafe {
+                let _ = check_status(FileSystem::NtOpenProcessToken(
+                    Threading::GetCurrentProcess(),
+                    Security::TOKEN_QUERY.0 | Security::TOKEN_DUPLICATE.0,
+                    &mut client_token_raw,
+                ))?;
+            }
+        } else {
+            return Err(e);
+        }
+    }
+
+    // Create the RAII handle now so it gets closed on drop if we need
+    // to create a duplicate token.
+    //
+    // safety: The validity of the handle has been checked by verifying
+    // the success of the previous Win32 calls.
+    client_token = unsafe { OwnedHandle::from_raw_handle(client_token_raw.0) };
+
+    let mut token_statistics = Security::TOKEN_STATISTICS::default();
+    let mut bytes_written: u32 = 0;
+    // Make sure that it's an impersonation token (NtAccessCheck requires one).
+    // safety: Calling Win32 API as documented.
+    unsafe {
+        let _ = check_status(FileSystem::NtQueryInformationToken(
+            client_token_raw,
+            Security::TokenStatistics,
+            Some(&mut token_statistics as *mut Security::TOKEN_STATISTICS as *mut ffi::c_void),
+            size_of::<Security::TOKEN_STATISTICS>() as u32,
+            &mut bytes_written,
+        ))?;
+    }
+
+    // If it's not an impersonation token, create one.
+    if token_statistics.TokenType != W32Sec::TokenImpersonation {
+        let security_qos = W32Sec::SECURITY_QUALITY_OF_SERVICE {
+            Length: size_of::<W32Sec::SECURITY_QUALITY_OF_SERVICE> as u32,
+            ImpersonationLevel: W32Sec::SecurityImpersonation,
+            ContextTrackingMode: W32Sec::SECURITY_DYNAMIC_TRACKING.0 as u8,
+            EffectiveOnly: false.into(),
+        };
+        let mut object_attributes = Wdk::Foundation::OBJECT_ATTRIBUTES::default();
+        object_attributes.SecurityQualityOfService =
+            &security_qos as *const W32Sec::SECURITY_QUALITY_OF_SERVICE as *const ffi::c_void;
+
+        // safety: Calling Win32 API as documented.
+        unsafe {
+            let _ = check_status(FileSystem::NtDuplicateToken(
+                client_token_raw,
+                W32Sec::TOKEN_QUERY.0,
+                Some(&mut object_attributes),
+                Foundation::BOOLEAN(0),
+                W32Sec::TokenImpersonation,
+                &mut duplicate_token_raw,
+            ))?;
+            return Ok(OwnedHandle::from_raw_handle(duplicate_token_raw.0));
+        }
+    }
+
+    Ok(client_token)
+}
+
+// Check if the user has the requested permissions on a file and
+// return the granted access.
+pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32> {
+    let initial_size = LX_UTIL_FS_SECURITY_DESCRIPTOR_SIZE.load(Ordering::Relaxed);
+
+    // NtQuerySecurityObject returns a SECURITY_DESCRIPTOR in self-relative form, so allocate a buffer
+    // with the SECURITY_DESCRIPTOR at the head and a byte buffer at the end. We don't actually use
+    // the rest of the bytes, but we need to allocate the buffer to pass to NtQuerySecurityObject.
+    let mut sd = HeaderVec::<Security::SECURITY_DESCRIPTOR, [u8; 1]>::with_capacity(
+        Security::SECURITY_DESCRIPTOR::default(),
+        initial_size - size_of::<Security::SECURITY_DESCRIPTOR>(),
+    );
+    let mut length_needed: u32 = 0;
+
+    // Call NtQuerySecurityObject until we pass a big enough buffer.
+    while let Err(e) =
+        // unsafe: calling Win32 API as documented.
+        unsafe {
+            // If the buffer was too small, try again and remember the size
+            // for future calls. This is the same strategy used by
+            // ObGetObjectSecurity.
+            check_status(FileSystem::NtQuerySecurityObject(
+                Foundation::HANDLE(file.as_raw_handle()),
+                (Security::OWNER_SECURITY_INFORMATION
+                    | Security::GROUP_SECURITY_INFORMATION
+                    | Security::DACL_SECURITY_INFORMATION)
+                    .0,
+                Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut ffi::c_void),
+                initial_size as u32,
+                &mut length_needed,
+            ))
+        }
+    {
+        if e.value() == Foundation::STATUS_BUFFER_TOO_SMALL.0 {
+            LX_UTIL_FS_SECURITY_DESCRIPTOR_SIZE.store(length_needed as usize, Ordering::Relaxed);
+            sd.reserve(length_needed as usize);
+        } else {
+            return Err(e);
+        }
+    }
+
+    let client_token = get_token_for_access_check()?;
+    let generic_mapping = W32Sec::GENERIC_MAPPING {
+        GenericRead: W32Fs::FILE_GENERIC_READ.0,
+        GenericWrite: W32Fs::FILE_GENERIC_WRITE.0,
+        GenericExecute: W32Fs::FILE_GENERIC_EXECUTE.0,
+        GenericAll: W32Fs::FILE_ALL_ACCESS.0,
+    };
+    let mut privilege_set = W32Sec::PRIVILEGE_SET::default();
+    let mut privilege_set_length = size_of::<W32Sec::PRIVILEGE_SET>() as u32;
+    let mut granted_access = 0;
+    let mut access_status = Foundation::BOOL::default();
+
+    // safety: calling Win32 API as documented.
+    unsafe {
+        W32Sec::AccessCheck(
+            Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut ffi::c_void),
+            Foundation::HANDLE(client_token.as_raw_handle()),
+            desired_access,
+            &generic_mapping,
+            Some(&mut privilege_set as *mut W32Sec::PRIVILEGE_SET),
+            &mut privilege_set_length,
+            &mut granted_access,
+            &mut access_status,
+        )
+        .map_err(|_| lx::Error::EACCES)?
+    };
+
+    if access_status == Foundation::FALSE {
+        Err(lx::Error::EACCES)
+    } else {
+        Ok(granted_access)
+    }
+}
+
 pub struct LxStatInformation {
     pub stat: FileSystem::FILE_STAT_LX_INFORMATION,
     pub symlink_len: Option<u32>,
@@ -230,12 +441,8 @@ pub fn get_attributes_by_handle(
     handle: &OwnedHandle,
 ) -> lx::Result<LxStatInformation> {
     unsafe {
-        let mut stat = mem::zeroed();
-        check_lx_error(api::LxUtilFsQueryStatLxInformation(
-            handle.as_raw_handle(),
-            fs_context,
-            &mut stat,
-        ))?;
+        let fs_context_new = fs::FsContext::new(fs_context);
+        let stat = fs::query_stat_lx_information(handle, &fs_context_new)?;
 
         // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
         // determined based on the reparse data.
@@ -279,20 +486,10 @@ pub fn get_attributes(
     // If NtQueryInformationByName is supported, use it.
     if fs_context.CompatibilityFlags & api::FS_CONTEXT_SUPPORTS_QUERY_BY_NAME != 0 {
         let pathu = dos_to_nt_path(root_handle, path)?;
-        let root_raw_handle = if let Some(handle) = root_handle {
-            handle.as_raw_handle()
-        } else {
-            ptr::null_mut()
-        };
 
         unsafe {
-            let mut stat = mem::zeroed();
-            check_lx_error(api::LxUtilFsQueryStatLxInformationByName(
-                fs_context,
-                root_raw_handle,
-                pathu.as_ptr(),
-                &mut stat,
-            ))?;
+            let fs_context_new = fs::FsContext::new(fs_context);
+            let stat = fs::query_stat_lx_information_by_name(&fs_context_new, root_handle, &pathu)?;
 
             // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
             // determined based on the reparse data, which requires opening the file.
@@ -592,7 +789,46 @@ pub fn query_information_file<T: FileInformationClass>(handle: &OwnedHandle) -> 
         let _ = check_status(FileSystem::NtQueryInformationFile(
             Foundation::HANDLE(handle.as_raw_handle()),
             &mut iosb,
-            buf as ntdef::PVOID,
+            buf as *mut ffi::c_void,
+            len.try_into().unwrap(),
+            info.file_information_class(),
+        ))?;
+
+        Ok(info)
+    }
+}
+
+// Gets file information from a handle.
+pub fn query_information_file_by_name<T: FileInformationClass>(
+    parent_handle: Option<&OwnedHandle>,
+    path: &windows::UnicodeString,
+) -> lx::Result<T> {
+    let mut iosb = Default::default();
+    let mut info: T = Default::default();
+    let root_handle = if let Some(ptr) = parent_handle {
+        Foundation::HANDLE(ptr.as_raw_handle())
+    } else {
+        Foundation::HANDLE(ptr::null_mut())
+    };
+
+    // windows-rs does not include the InitializeObjectAttributes macro; this is the
+    // recommended method of initialization. https://github.com/microsoft/windows-rs/issues/3183
+    let obj_attr = Wdk::Foundation::OBJECT_ATTRIBUTES {
+        Length: size_of::<Wdk::Foundation::OBJECT_ATTRIBUTES>() as _,
+        RootDirectory: root_handle,
+        ObjectName: path.as_ptr() as *const _,
+        Attributes: Kernel::OBJ_FORCE_ACCESS_CHECK as _,
+        SecurityDescriptor: ptr::null_mut(),
+        SecurityQualityOfService: ptr::null_mut(),
+    };
+    let (buf, len) = info.as_ptr_len_mut();
+
+    // SAFETY: Calling NtQueryInformationFile as documented.
+    unsafe {
+        let _ = check_status(FileSystem::NtQueryInformationByName(
+            &obj_attr,
+            &mut iosb,
+            buf as *mut ffi::c_void,
             len.try_into().unwrap(),
             info.file_information_class(),
         ))?;
