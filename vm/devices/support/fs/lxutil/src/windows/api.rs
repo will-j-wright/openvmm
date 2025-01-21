@@ -167,19 +167,6 @@ pal::delayload!("lxutil.dll" {
 
     pub fn LxUtilFsIsAppExecLink(attributes: ntdef::ULONG, reparse_tag: ntdef::ULONG) -> ntdef::BOOLEAN;
 
-    pub fn LxUtilFsQueryStatLxInformation(
-        handle: RawHandle,
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        information: &mut FileSystem::FILE_STAT_LX_INFORMATION,
-    ) -> i32;
-
-    pub fn LxUtilFsQueryStatLxInformationByName(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        parent_handle: RawHandle,
-        path: *const ntdef::UNICODE_STRING,
-        information: &mut FileSystem::FILE_STAT_LX_INFORMATION,
-    ) -> i32;
-
     pub fn LxUtilFsReadDir(
         fs_context: &LX_UTIL_FS_CONTEXT,
         directory: RawHandle,

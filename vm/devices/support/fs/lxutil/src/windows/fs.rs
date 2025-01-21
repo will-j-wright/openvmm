@@ -3,12 +3,13 @@
 
 use super::api::LX_UTIL_FS_CONTEXT;
 use super::util;
+use ::windows::Wdk::Storage::FileSystem;
+use ::windows::Wdk::System::SystemServices;
+use ::windows::Win32::Storage::FileSystem as W32Fs;
+use ::windows::Win32::System::SystemServices as W32Ss;
 use bitfield_struct::bitfield;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
-use windows::Wdk::Storage::FileSystem;
-use windows::Win32::Storage::FileSystem as W32Fs;
-use windows::Win32::System::SystemServices;
 
 const LX_UTIL_DEFAULT_PERMISSIONS: u32 = 0o777;
 
@@ -232,8 +233,8 @@ pub fn convert_mode(
     let mut local_mode: lx::mode_t;
     if info.FileAttributes & W32Fs::FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
         && (info.ReparseTag == FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32
-            || info.ReparseTag == SystemServices::IO_REPARSE_TAG_SYMLINK
-            || info.ReparseTag == SystemServices::IO_REPARSE_TAG_MOUNT_POINT)
+            || info.ReparseTag == W32Ss::IO_REPARSE_TAG_SYMLINK
+            || info.ReparseTag == W32Ss::IO_REPARSE_TAG_MOUNT_POINT)
     {
         return Ok(lx::S_IFLNK | 0o777);
     }
@@ -468,4 +469,133 @@ pub fn get_lx_attr(
     };
 
     Ok(stat)
+}
+
+/// Query the stat information for a handle. If the filesystem does not support FILE_STAT_INFORMATION,
+/// one will be constructed using different queries.
+pub fn query_stat_information(
+    file_handle: &OwnedHandle,
+    fs_context: &FsContext,
+) -> lx::Result<FileSystem::FILE_STAT_INFORMATION> {
+    if fs_context.compatibility_flags.supports_stat_info() {
+        util::query_information_file(file_handle)
+    } else {
+        debug_assert!(!fs_context.compatibility_flags.supports_query_by_name());
+
+        let granted_access = if fs_context.compatibility_flags.supports_permission_mapping() {
+            util::check_security(file_handle, W32Ss::MAXIMUM_ALLOWED)?
+        } else {
+            0
+        };
+
+        // TODO: Can this overflow the buffer and still be valid?
+        let all_information: FileSystem::FILE_ALL_INFORMATION =
+            util::query_information_file(file_handle)?;
+        let reparse_tag = if all_information.BasicInformation.FileAttributes
+            & W32Fs::FILE_ATTRIBUTE_REPARSE_POINT.0
+            != 0
+        {
+            let tag_information: SystemServices::FILE_ATTRIBUTE_TAG_INFORMATION =
+                util::query_information_file(file_handle)?;
+
+            debug_assert!(
+                tag_information.FileAttributes & W32Fs::FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            );
+            tag_information.ReparseTag
+        } else {
+            0
+        };
+
+        Ok(FileSystem::FILE_STAT_INFORMATION {
+            FileId: all_information.InternalInformation.IndexNumber,
+            CreationTime: all_information.BasicInformation.CreationTime,
+            LastAccessTime: all_information.BasicInformation.LastAccessTime,
+            LastWriteTime: all_information.BasicInformation.LastWriteTime,
+            ChangeTime: all_information.BasicInformation.ChangeTime,
+            AllocationSize: all_information.StandardInformation.AllocationSize,
+            EndOfFile: all_information.StandardInformation.EndOfFile,
+            FileAttributes: all_information.BasicInformation.FileAttributes,
+            ReparseTag: reparse_tag,
+            NumberOfLinks: all_information.StandardInformation.NumberOfLinks,
+            EffectiveAccess: granted_access,
+        })
+    }
+}
+
+// TODO?: FILE_STAT_LX_INFORMATION is a superset of FILE_STAT_INFORMATION, so it'd be
+// possible to do this by creating a buffer large enough for FILE_STAT_LX_INFORMATION
+// and casting unsafely a couple of times
+fn stat_info_to_stat_lx_info(
+    stat_info: FileSystem::FILE_STAT_INFORMATION,
+) -> FileSystem::FILE_STAT_LX_INFORMATION {
+    FileSystem::FILE_STAT_LX_INFORMATION {
+        FileId: stat_info.FileId,
+        CreationTime: stat_info.CreationTime,
+        LastAccessTime: stat_info.LastAccessTime,
+        LastWriteTime: stat_info.LastWriteTime,
+        ChangeTime: stat_info.ChangeTime,
+        AllocationSize: stat_info.AllocationSize,
+        EndOfFile: stat_info.EndOfFile,
+        FileAttributes: stat_info.FileAttributes,
+        ReparseTag: stat_info.ReparseTag,
+        NumberOfLinks: stat_info.NumberOfLinks,
+        EffectiveAccess: stat_info.EffectiveAccess,
+        ..Default::default()
+    }
+}
+
+/// Query the stat information with metadata for a handle. If the filesystem does not support FILE_STAT_INFORMATION,
+/// one will be constructed using different queries.
+pub fn query_stat_lx_information(
+    file_handle: &OwnedHandle,
+    fs_context: &FsContext,
+) -> lx::Result<FileSystem::FILE_STAT_LX_INFORMATION> {
+    if fs_context.compatibility_flags.supports_stat_lx_info() {
+        util::query_information_file(file_handle)
+    } else {
+        let stat_info = query_stat_information(file_handle, fs_context)?;
+        let mut info = stat_info_to_stat_lx_info(stat_info);
+
+        if fs_context.compatibility_flags.supports_case_sensitive_dir()
+            && stat_info.FileAttributes & W32Fs::FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        {
+            let case_sensitive_info: FileSystem::FILE_CASE_SENSITIVE_INFORMATION =
+                util::query_information_file(file_handle)?;
+
+            if case_sensitive_info.Flags & W32Ss::FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
+                info.LxFlags |= FileSystem::LX_FILE_CASE_SENSITIVE_DIR;
+            }
+        }
+
+        Ok(info)
+    }
+}
+
+/// Query the stat information with metadata for a file based on its name. If the filesystem does not
+/// support FILE_STAT_INFORMATION, one will be constructed using different queries.
+pub fn query_stat_lx_information_by_name(
+    fs_context: &FsContext,
+    parent_handle: Option<&OwnedHandle>,
+    path: &pal::windows::UnicodeString,
+) -> lx::Result<FileSystem::FILE_STAT_LX_INFORMATION> {
+    if fs_context.compatibility_flags.supports_stat_lx_info() {
+        util::query_information_file_by_name(parent_handle, path)
+    } else {
+        let stat_info: FileSystem::FILE_STAT_INFORMATION =
+            util::query_information_file_by_name(parent_handle, path)?;
+        let mut info = stat_info_to_stat_lx_info(stat_info);
+
+        if fs_context.compatibility_flags.supports_case_sensitive_dir()
+            && stat_info.FileAttributes & W32Fs::FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        {
+            let case_sensitive_info: FileSystem::FILE_CASE_SENSITIVE_INFORMATION =
+                util::query_information_file_by_name(parent_handle, path)?;
+
+            if case_sensitive_info.Flags & W32Ss::FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
+                info.LxFlags |= FileSystem::LX_FILE_CASE_SENSITIVE_DIR;
+            }
+        }
+
+        Ok(info)
+    }
 }
