@@ -8,6 +8,7 @@
 pub(crate) mod api;
 pub(crate) mod fs;
 pub(crate) mod path;
+mod symlink;
 mod util;
 
 use super::PathExt;
@@ -95,16 +96,8 @@ impl VolumeState {
     pub fn read_reparse_link(
         &self,
         handle: &OwnedHandle,
-        target: &mut windows::UnicodeString,
-    ) -> lx::Result<()> {
-        util::check_lx_error(unsafe {
-            api::LxUtilFsReadReparseLink(
-                &self.fs_context,
-                handle.as_raw_handle(),
-                ptr::from_ref(self) as ntdef::PVOID,
-                target.as_mut_ptr(),
-            )
-        })
+    ) -> lx::Result<Option<windows::UnicodeString>> {
+        fs::read_reparse_link(handle, self)
     }
 
     // Callback for LxUtilFsReadReparseLink when a Windows symlink/junction is encountered.
@@ -432,7 +425,11 @@ impl LxVolume {
         let mut target = windows::UnicodeString::empty();
         unsafe {
             // Try to read the link target from the reparse data.
-            self.state.read_reparse_link(&handle, &mut target)?;
+            let target_string = self.state.read_reparse_link(&handle)?;
+            // TODO: Remove this once LxUtilSymlinkRead is implemented and re-work to just use the Option
+            if target_string.is_some() {
+                target = target_string.unwrap();
+            }
 
             // If the function succeeded but returned a NULL buffer, this is a V1 LX symlink which must be
             // opened for read to read the target.

@@ -2,12 +2,20 @@
 // Licensed under the MIT License.
 
 use super::api::LX_UTIL_FS_CONTEXT;
+use super::symlink;
 use super::util;
+use super::VolumeState;
 use ::windows::Wdk::Storage::FileSystem;
 use ::windows::Wdk::System::SystemServices;
+use ::windows::Win32::Foundation;
 use ::windows::Win32::Storage::FileSystem as W32Fs;
+use ::windows::Win32::System::Ioctl;
 use ::windows::Win32::System::SystemServices as W32Ss;
 use bitfield_struct::bitfield;
+use pal::windows::UnicodeString;
+use pal::HeaderVec;
+use std::mem::offset_of;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 
@@ -20,23 +28,46 @@ const LX_UTIL_FS_CALLER_HAS_TRAVERSE_PRIVILEGE: u32 = 0x1;
 
 const LX_UTIL_FS_ALLOCATION_BLOCK_SIZE: u64 = 512;
 
-pub type WriteDirentryFn = fn(
-    context: super::DirEnumContext<'_>,
-    file_id: u64,
-    name: &pal::windows::UnicodeStringRef<'_>,
-    entry_type: i32,
-    buffer_full: &mut bool,
-) -> i32;
+const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
 
-pub type TranslateAbsoluteSymlinkFn = fn(
-    context: *const super::VolumeState,
-    substitute_name: pal::windows::UnicodeStringRef<'_>,
-    link_target: pal::windows::UnicodeStringRef<'_>,
-) -> i32;
+const LX_PATH_MAX: u16 = 4096;
 
-pub struct FsCallbacks {
-    pub write_direntry_method: Option<WriteDirentryFn>,
-    pub translate_absolute_symlink_method: Option<TranslateAbsoluteSymlinkFn>,
+const LX_UTIL_SYMLINK_DATA_VERSION_1: u32 = 1;
+const LX_UTIL_SYMLINK_DATA_VERSION_2: u32 = 2;
+const LX_UTIL_SYMLINK_DATA_VERSION: u32 = LX_UTIL_SYMLINK_DATA_VERSION_2;
+
+const LX_UTIL_SYMLINK_TARGET_OFFSET: u32 = offset_of!(SymlinkData, target) as u32;
+const LX_UTIL_SYMLINK_REPARSE_BASE_SIZE: u32 =
+    REPARSE_DATA_BUFFER_HEADER_SIZE as u32 + LX_UTIL_SYMLINK_TARGET_OFFSET;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SymlinkData {
+    version: u32,
+    // 12 bytes to make this struct the same size as REPARSE_DATA_BUFFER
+    target: [u8; 12],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SymlinkReparseData {
+    buffer: [u8; REPARSE_DATA_BUFFER_HEADER_SIZE],
+    symlink: SymlinkData,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union SymlinkReparse {
+    pub header: FileSystem::REPARSE_DATA_BUFFER,
+    pub data: SymlinkReparseData,
+}
+
+impl SymlinkReparse {
+    fn default() -> SymlinkReparse {
+        SymlinkReparse {
+            header: FileSystem::REPARSE_DATA_BUFFER::default(),
+        }
+    }
 }
 
 #[bitfield(u32)]
@@ -62,7 +93,6 @@ pub struct FsCompatibilityFlags {
 }
 
 pub struct FsContext {
-    pub callbacks: *const FsCallbacks,
     pub compatibility_flags: FsCompatibilityFlags,
 }
 
@@ -70,7 +100,6 @@ pub struct FsContext {
 impl FsContext {
     pub fn new(fs_context: &LX_UTIL_FS_CONTEXT) -> Self {
         FsContext {
-            callbacks: fs_context.Callbacks as *const FsCallbacks,
             compatibility_flags: fs_context.CompatibilityFlags.into(),
         }
     }
@@ -576,7 +605,7 @@ pub fn query_stat_lx_information(
 pub fn query_stat_lx_information_by_name(
     fs_context: &FsContext,
     parent_handle: Option<&OwnedHandle>,
-    path: &pal::windows::UnicodeString,
+    path: &UnicodeString,
 ) -> lx::Result<FileSystem::FILE_STAT_LX_INFORMATION> {
     if fs_context.compatibility_flags.supports_stat_lx_info() {
         util::query_information_file_by_name(parent_handle, path)
@@ -597,5 +626,98 @@ pub fn query_stat_lx_information_by_name(
         }
 
         Ok(info)
+    }
+}
+
+/// Reads the target of a symbolic link. If this function returns None, this is a V1 symlink whose
+/// target is stored in the file data.
+pub fn read_reparse_link(
+    file_handle: &OwnedHandle,
+    state: &VolumeState,
+) -> lx::Result<Option<UnicodeString>> {
+    let tail_size = W32Fs::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize - size_of::<SymlinkReparse>();
+    let mut reparse_buffer =
+        HeaderVec::<SymlinkReparse, [u8; 1]>::with_capacity(SymlinkReparse::default(), tail_size);
+    let mut iosb = Default::default();
+
+    // safety: calling Win32 API as documented.
+    unsafe {
+        let _ = util::check_status(FileSystem::NtFsControlFile(
+            Foundation::HANDLE(file_handle.as_raw_handle()),
+            Foundation::HANDLE::default(),
+            None,
+            None,
+            &mut iosb,
+            Ioctl::FSCTL_GET_REPARSE_POINT,
+            None,
+            0,
+            Some(reparse_buffer.as_mut_ptr() as *mut _),
+            reparse_buffer.capacity() as u32,
+        ))?;
+        reparse_buffer.set_len(tail_size);
+    };
+
+    if iosb.Information < REPARSE_DATA_BUFFER_HEADER_SIZE {
+        return Err(lx::Error::EIO);
+    }
+
+    // safety: Accessing union field of type returned from Win32 API
+    let reparse_tag = unsafe { (*reparse_buffer).header.ReparseTag };
+    const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
+
+    match reparse_tag {
+        IO_REPARSE_TAG_LX_SYMLINK => {
+            // safety: Accessing union field of type returned from Win32 API
+            let version = unsafe { (*reparse_buffer).data.symlink.version };
+            match version {
+                LX_UTIL_SYMLINK_DATA_VERSION_1 => {
+                    if iosb.Information != LX_UTIL_SYMLINK_REPARSE_BASE_SIZE as usize {
+                        Err(lx::Error::EIO)
+                    } else {
+                        Ok(None)
+                    }
+                }
+                LX_UTIL_SYMLINK_DATA_VERSION_2 => {
+                    // safety: Accessing union field of type returned from Win32 API
+                    let data_length = unsafe { (*reparse_buffer).header.ReparseDataLength };
+                    let path_length = data_length - LX_UTIL_SYMLINK_TARGET_OFFSET as u16;
+                    if iosb.Information < LX_UTIL_SYMLINK_REPARSE_BASE_SIZE as usize
+                        || iosb.Information
+                            != REPARSE_DATA_BUFFER_HEADER_SIZE + data_length as usize
+                    {
+                        Err(lx::Error::EIO)
+                    } else {
+                        if path_length as u16 > LX_PATH_MAX {
+                            Err(lx::Error::EIO)
+                        } else {
+                            // Construct a UnicodeString from the u8 buffer
+                            // safety: The section of memory used to construct the string is guaranteed to
+                            // be valid by the Win32 API due to the previous checks
+                            let wide_bytes: Vec<u16> = std::str::from_utf8(unsafe {
+                                std::slice::from_raw_parts(
+                                    (*reparse_buffer).data.symlink.target.as_ptr(),
+                                    path_length as usize,
+                                )
+                            })
+                            .map_err(|_| lx::Error::EIO)?
+                            .encode_utf16()
+                            .collect();
+
+                            Ok(Some(
+                                UnicodeString::new(wide_bytes.as_slice())
+                                    .map_err(|_| lx::Error::EIO)?,
+                            ))
+                        }
+                    }
+                }
+                _ => Err(lx::Error::EIO),
+            }
+        }
+        W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
+            // safety: Accessing union field of type returned from Win32 API)
+            let header = unsafe { &(*reparse_buffer).header };
+            symlink::read_nt_symlink(header, state).map(|s| Some(s))
+        }
+        _ => Err(lx::Error::EIO),
     }
 }

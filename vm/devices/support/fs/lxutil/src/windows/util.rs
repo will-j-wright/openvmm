@@ -394,6 +394,10 @@ pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32
         }
     }
 
+    // safety: The tail elements are guaranteed to be initialized.
+    unsafe {
+        sd.set_len(length_needed as usize - size_of::<Security::SECURITY_DESCRIPTOR>());
+    }
     let client_token = get_token_for_access_check()?;
     let generic_mapping = W32Sec::GENERIC_MAPPING {
         GenericRead: W32Fs::FILE_GENERIC_READ.0,

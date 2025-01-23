@@ -1,12 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use pal::windows::UnicodeString;
 use std::borrow::Cow;
 use std::path::Path;
 use std::str;
 
 // The utf-8 sequence for code point 0xf000
 const ESCAPE_CHAR_BASE: [u8; 3] = [0xef, 0x80, 0x80];
+
+const PATH_ESCAPE_MIN: u16 = 0xf000;
+const PATH_ESCAPE_MAX: u16 = 0xf0ff;
 
 // Convert a Unix-style path to a Windows one.
 pub fn path_from_lx(path: &[u8]) -> lx::Result<Cow<'_, Path>> {
@@ -72,6 +76,58 @@ fn escape_path_len(path: &[u8]) -> (usize, bool) {
 fn char_needs_escape(c: u8) -> bool {
     let index = c as usize;
     index < NTFS_LEGAL_ANSI_CHARACTERS.len() && !NTFS_LEGAL_ANSI_CHARACTERS[index]
+}
+
+// Check if a character needs to be unescaped.
+fn char_needs_unescape(c: u16) -> bool {
+    // Not all characters within the range correspond to escaped characters,
+    // so  make sure that the original character needed to be escaped.
+    return c >= PATH_ESCAPE_MIN
+        && c <= PATH_ESCAPE_MAX
+        && char_needs_escape((c - PATH_ESCAPE_MIN) as u8);
+}
+
+// Convert the path seperators in-place from NT to LX.
+pub fn nt_path_to_lx_path(path: &UnicodeString) -> lx::Result<UnicodeString> {
+    // Copy the path into a new UnicodeString
+    let new_path = UnicodeString::new(path.as_slice()).map_err(|_| lx::Error::EINVAL)?;
+    let path_slice = new_path.as_mut_slice();
+    for c in path_slice {
+        if *c == '\\' as u16 {
+            *c = '/' as u16;
+        }
+    }
+
+    Ok(new_path)
+}
+
+// Unescape a path. This function is only used in the lxutil implementation,
+// so the parameter and return types are `UnicodeString`s rather than `Path`s.
+// This also makes the conversion a lot simpler, as the conversions use a
+// single u16 value to represent the escape codepoint.
+// If the path doesn't need unescaping, return None.
+pub fn unescape_path(path: &UnicodeString) -> lx::Result<Option<UnicodeString>> {
+    // Convert from UTF-16 UNICODE_STRING to String
+    let path_slice = path.as_slice();
+    let needs_unescape = path_slice.iter().any(|c| char_needs_unescape(*c));
+
+    // If the path doesn't need to be unescaped, return the original path.
+    if !needs_unescape {
+        Ok(None)
+    } else {
+        // Copy the path into a new UnicodeString
+        let new_path = UnicodeString::new(path_slice).map_err(|_| lx::Error::EINVAL)?;
+        let path_slice = new_path.as_mut_slice();
+        for c in path_slice {
+            if char_needs_unescape(*c) {
+                *c -= PATH_ESCAPE_MIN;
+            } else if *c == '/' as u16 {
+                *c = '\\' as u16;
+            }
+        }
+
+        Ok(Some(new_path))
+    }
 }
 
 // List indicating which characters are legal in NTFS. This was adapted from
