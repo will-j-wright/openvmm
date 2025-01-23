@@ -23,7 +23,6 @@ pub const LX_FILE_METADATA_HAS_UID: ntdef::ULONG = 0x1;
 pub const LX_FILE_METADATA_HAS_GID: ntdef::ULONG = 0x2;
 pub const LX_FILE_METADATA_HAS_MODE: ntdef::ULONG = 0x4;
 pub const IO_REPARSE_TAG_LX_SYMLINK: ntdef::ULONG = 0xA000001D;
-pub const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
 pub const FILE_CS_FLAG_CASE_SENSITIVE_DIR: ntdef::ULONG = 0x1;
 
 // Fallback modes.
@@ -182,13 +181,6 @@ pal::delayload!("lxutil.dll" {
         handle: RawHandle,
         callback_context: ntdef::PVOID,
         length: &mut ntdef::ULONG,
-    ) -> i32;
-
-    pub fn LxUtilFsReadReparseLink(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        handle: RawHandle,
-        callback_context: ntdef::PVOID,
-        target_path: *mut ntdef::UNICODE_STRING,
     ) -> i32;
 
     pub fn LxUtilFsSetTimes(
