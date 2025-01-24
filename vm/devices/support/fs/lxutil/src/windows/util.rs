@@ -443,7 +443,7 @@ pub struct LxStatInformation {
 // Get file attributes from a file handle.
 pub fn get_attributes_by_handle(
     fs_context: &api::LX_UTIL_FS_CONTEXT,
-    fs_context_ptr: ntdef::PVOID,
+    state: &super::VolumeState,
     handle: &OwnedHandle,
 ) -> lx::Result<LxStatInformation> {
     unsafe {
@@ -454,14 +454,8 @@ pub fn get_attributes_by_handle(
         // determined based on the reparse data.
         let symlink_len = if is_symlink(stat.FileAttributes, stat.ReparseTag) && stat.EndOfFile == 0
         {
-            let mut symlink_len: ntdef::ULONG = 0;
-            api::LxUtilFsReadLinkLength(
-                fs_context,
-                handle.as_raw_handle(),
-                fs_context_ptr,
-                &mut symlink_len,
-            );
-            Some(symlink_len)
+            // Return 0 here on failure to duplicate LxUtil behavior
+            Some(fs::read_link_length(handle, state).unwrap_or(0))
         } else {
             None
         };
@@ -480,13 +474,13 @@ pub fn get_attributes_by_handle(
 // This may open the file if NtQueryInformationByName is not supported.
 pub fn get_attributes(
     fs_context: &api::LX_UTIL_FS_CONTEXT,
-    fs_context_ptr: ntdef::PVOID,
+    state: &super::VolumeState,
     root_handle: Option<&OwnedHandle>,
     path: &Path,
     existing_handle: Option<&OwnedHandle>,
 ) -> lx::Result<LxStatInformation> {
     if let Some(existing_handle) = existing_handle {
-        return get_attributes_by_handle(fs_context, fs_context_ptr, existing_handle);
+        return get_attributes_by_handle(fs_context, state, existing_handle);
     }
 
     // If NtQueryInformationByName is supported, use it.
@@ -501,8 +495,7 @@ pub fn get_attributes(
             // determined based on the reparse data, which requires opening the file.
             let symlink_len =
                 if is_symlink(stat.FileAttributes, stat.ReparseTag) && stat.EndOfFile == 0 {
-                    let mut symlink_len: ntdef::ULONG = 0;
-                    if let Ok((handle, _)) = open_relative_file(
+                    let symlink_len = if let Ok((handle, _)) = open_relative_file(
                         root_handle,
                         path,
                         MINIMUM_PERMISSIONS,
@@ -511,13 +504,11 @@ pub fn get_attributes(
                         ntioapi::FILE_OPEN_REPARSE_POINT,
                         None,
                     ) {
-                        api::LxUtilFsReadLinkLength(
-                            fs_context,
-                            handle.as_raw_handle(),
-                            fs_context_ptr,
-                            &mut symlink_len,
-                        );
-                    }
+                        // Return 0 here on failure to duplicate LxUtil behavior
+                        fs::read_link_length(&handle, state).unwrap_or(0)
+                    } else {
+                        0
+                    };
                     Some(symlink_len)
                 } else {
                     None
@@ -543,7 +534,7 @@ pub fn get_attributes(
             None,
         )?;
 
-        get_attributes_by_handle(fs_context, fs_context_ptr, &handle)
+        get_attributes_by_handle(fs_context, state, &handle)
     }
 }
 

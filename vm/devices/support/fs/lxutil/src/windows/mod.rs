@@ -72,11 +72,7 @@ impl VolumeState {
         &self,
         handle: &OwnedHandle,
     ) -> lx::Result<util::LxStatInformation> {
-        util::get_attributes_by_handle(
-            &self.fs_context,
-            ptr::from_ref(self) as ntdef::PVOID,
-            handle,
-        )
+        util::get_attributes_by_handle(&self.fs_context, &self, handle)
     }
 
     pub fn get_attributes(
@@ -85,13 +81,7 @@ impl VolumeState {
         path: &Path,
         existing_handle: Option<&OwnedHandle>,
     ) -> lx::Result<util::LxStatInformation> {
-        util::get_attributes(
-            &self.fs_context,
-            ptr::from_ref(self) as ntdef::PVOID,
-            root_handle,
-            path,
-            existing_handle,
-        )
+        util::get_attributes(&self.fs_context, &self, root_handle, path, existing_handle)
     }
 
     pub fn read_reparse_link(

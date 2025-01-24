@@ -133,3 +133,15 @@ pub fn read_nt_symlink(
         }
     }
 }
+
+/// Determine the length of an NT symlink.
+pub fn read_nt_symlink_length(
+    reparse: &FileSystem::REPARSE_DATA_BUFFER,
+    state: &super::VolumeState,
+) -> lx::Result<u32> {
+    // The length is just the target's UTF-8 length.
+    let target = read_nt_symlink(reparse, state)?;
+    Ok(String::from_utf16(target.as_slice())
+        .map_err(|_| lx::Error::EIO)?
+        .len() as u32)
+}

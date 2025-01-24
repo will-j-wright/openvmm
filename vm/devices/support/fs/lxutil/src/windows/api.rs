@@ -176,13 +176,6 @@ pal::delayload!("lxutil.dll" {
 
     pub fn LxUtilFsReadAppExecLink(offset:u64, buffer: ntdef::PVOID, buffer_size: basetsd::SIZE_T) -> basetsd::SIZE_T;
 
-    pub fn LxUtilFsReadLinkLength(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        handle: RawHandle,
-        callback_context: ntdef::PVOID,
-        length: &mut ntdef::ULONG,
-    ) -> i32;
-
     pub fn LxUtilFsSetTimes(
         handle: RawHandle,
         accessed_time: &lx::Timespec,
