@@ -18,6 +18,7 @@ use std::mem::offset_of;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
+use windows::Win32::System;
 
 const LX_UTIL_DEFAULT_PERMISSIONS: u32 = 0o777;
 
@@ -629,12 +630,12 @@ pub fn query_stat_lx_information_by_name(
     }
 }
 
-/// Reads the target of a symbolic link. If this function returns None, this is a V1 symlink whose
-/// target is stored in the file data.
-pub fn read_reparse_link(
+fn query_reparse_data(
     file_handle: &OwnedHandle,
-    state: &VolumeState,
-) -> lx::Result<Option<UnicodeString>> {
+) -> lx::Result<(
+    System::IO::IO_STATUS_BLOCK,
+    HeaderVec<SymlinkReparse, [u8; 1]>,
+)> {
     let tail_size = W32Fs::MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize - size_of::<SymlinkReparse>();
     let mut reparse_buffer =
         HeaderVec::<SymlinkReparse, [u8; 1]>::with_capacity(SymlinkReparse::default(), tail_size);
@@ -658,8 +659,50 @@ pub fn read_reparse_link(
     };
 
     if iosb.Information < REPARSE_DATA_BUFFER_HEADER_SIZE {
-        return Err(lx::Error::EIO);
+        Err(lx::Error::EIO)
+    } else {
+        Ok((iosb, reparse_buffer))
     }
+}
+
+/// Determines the length of a symbolic link. This function should not be called for version 1
+/// links since their length can be determined from the file size.
+pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::Result<u32> {
+    let (_, reparse_buffer) = query_reparse_data(file_handle)?;
+
+    // safety: Accessing union field of type returned from Win32 API
+    let reparse_tag = unsafe { (*reparse_buffer).header.ReparseTag };
+    const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
+
+    match reparse_tag {
+        IO_REPARSE_TAG_LX_SYMLINK => {
+            // safety: Accessing union field of type returned from Win32 API
+            let version = unsafe { (*reparse_buffer).data.symlink.version };
+            match version {
+                LX_UTIL_SYMLINK_DATA_VERSION_2 => {
+                    // safety: Accessing union field of type returned from Win32 API
+                    let data_length = unsafe { (*reparse_buffer).header.ReparseDataLength };
+                    Ok(data_length as u32 - LX_UTIL_SYMLINK_TARGET_OFFSET)
+                }
+                _ => Err(lx::Error::EIO),
+            }
+        }
+        W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
+            // safety: Accessing union field of type returned from Win32 API)
+            let header = unsafe { &(*reparse_buffer).header };
+            symlink::read_nt_symlink_length(header, state)
+        }
+        _ => Err(lx::Error::EIO),
+    }
+}
+
+/// Reads the target of a symbolic link. If this function returns None, this is a V1 symlink whose
+/// target is stored in the file data.
+pub fn read_reparse_link(
+    file_handle: &OwnedHandle,
+    state: &VolumeState,
+) -> lx::Result<Option<UnicodeString>> {
+    let (iosb, reparse_buffer) = query_reparse_data(file_handle)?;
 
     // safety: Accessing union field of type returned from Win32 API
     let reparse_tag = unsafe { (*reparse_buffer).header.ReparseTag };
