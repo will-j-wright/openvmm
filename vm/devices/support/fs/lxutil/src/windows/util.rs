@@ -54,28 +54,6 @@ const LX_POSIX_EPOCH_OFFSET: i64 = 0xd53e8000 + (0x019db1de << 32);
 const LX_UTIL_NT_UNIT_PER_SEC: i64 = 10000000;
 const LX_UTIL_NANO_SEC_PER_NT_UNIT: i64 = 100;
 
-// RAII wrapper around LX_UTIL_DIRECTORY_ENUMERATOR.
-pub struct LxUtilDirEnum {
-    pub enumerator: api::LX_UTIL_DIRECTORY_ENUMERATOR,
-}
-
-impl LxUtilDirEnum {
-    // Creates a zeroed-out enumerator.
-    pub fn new() -> Self {
-        Self {
-            enumerator: unsafe { mem::zeroed() },
-        }
-    }
-}
-
-impl Drop for LxUtilDirEnum {
-    fn drop(&mut self) {
-        unsafe {
-            api::LxUtilDirectoryEnumeratorCleanup(&mut self.enumerator);
-        }
-    }
-}
-
 // TODO: Create a macro that implements this
 /// A trait that maps a file information struct for calling into `NtSetInformationFile`, `NtQueryInformationFile` and
 /// other methods that accept a `FileInformationClass`.
@@ -1442,5 +1420,39 @@ pub fn reparse_tag_to_file_mode(reparse_tag: u32) -> lx::mode_t {
         IO_REPARSE_TAG_LX_CHR => lx::S_IFCHR,
         IO_REPARSE_TAG_LX_BLK => lx::S_IFBLK,
         _ => 0,
+    }
+}
+
+/// Convert a reparse tag to the appropriate DT_* file type.
+pub fn reparse_tag_to_file_type(reparse_tag: u32) -> u8 {
+    // We need to redefine some of the tags, in the windows crate they're defined as i32s
+    // instead of u32s. In the headers themselves they're just #define directives
+    const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
+    const IO_REPARSE_TAG_LX_FIFO: u32 = FileSystem::IO_REPARSE_TAG_LX_FIFO as u32;
+    const IO_REPARSE_TAG_LX_CHR: u32 = FileSystem::IO_REPARSE_TAG_LX_CHR as u32;
+    const IO_REPARSE_TAG_LX_BLK: u32 = FileSystem::IO_REPARSE_TAG_LX_BLK as u32;
+
+    match reparse_tag {
+        W32Ss::IO_REPARSE_TAG_SYMLINK
+        | W32Ss::IO_REPARSE_TAG_MOUNT_POINT
+        | IO_REPARSE_TAG_LX_SYMLINK => lx::DT_LNK,
+        W32Ss::IO_REPARSE_TAG_AF_UNIX => lx::DT_SOCK,
+        IO_REPARSE_TAG_LX_FIFO => lx::DT_FIFO,
+        IO_REPARSE_TAG_LX_CHR => lx::DT_CHR,
+        IO_REPARSE_TAG_LX_BLK => lx::DT_BLK,
+        _ => lx::DT_UNK,
+    }
+}
+
+/// Check if a UnicodeString is "." or ".."
+pub fn is_self_relative_unicode_path(path: &windows::UnicodeString) -> bool {
+    let slice = path.as_slice();
+    let dot = '.' as u16;
+    if slice.len() == 1 {
+        slice.starts_with(&[dot])
+    } else if slice.len() == 2 {
+        slice.starts_with(&[dot, dot])
+    } else {
+        false
     }
 }

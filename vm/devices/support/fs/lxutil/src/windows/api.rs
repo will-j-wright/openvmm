@@ -124,8 +124,6 @@ pub fn delay_load_lxutil() -> std::io::Result<()> {
 }
 
 pal::delayload!("lxutil.dll" {
-    pub fn LxUtilDirectoryEnumeratorCleanup(enumerator: &mut LX_UTIL_DIRECTORY_ENUMERATOR) -> ();
-
     pub fn LxUtilFsCreateLinkReparseBuffer(
         link_target: &ntdef::ANSI_STRING,
         size: &mut ntdef::USHORT,
@@ -165,14 +163,6 @@ pal::delayload!("lxutil.dll" {
     ) -> i32;
 
     pub fn LxUtilFsIsAppExecLink(attributes: ntdef::ULONG, reparse_tag: ntdef::ULONG) -> ntdef::BOOLEAN;
-
-    pub fn LxUtilFsReadDir(
-        fs_context: &LX_UTIL_FS_CONTEXT,
-        directory: RawHandle,
-        enumerator: &mut LX_UTIL_DIRECTORY_ENUMERATOR,
-        offset: &mut lx::off_t,
-        context: ntdef::PVOID,
-    ) -> i32;
 
     pub fn LxUtilFsReadAppExecLink(offset:u64, buffer: ntdef::PVOID, buffer_size: basetsd::SIZE_T) -> basetsd::SIZE_T;
 
