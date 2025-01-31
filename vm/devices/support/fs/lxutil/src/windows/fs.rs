@@ -35,7 +35,6 @@ const LX_PATH_MAX: u16 = 4096;
 
 const LX_UTIL_SYMLINK_DATA_VERSION_1: u32 = 1;
 const LX_UTIL_SYMLINK_DATA_VERSION_2: u32 = 2;
-const LX_UTIL_SYMLINK_DATA_VERSION: u32 = LX_UTIL_SYMLINK_DATA_VERSION_2;
 
 const LX_UTIL_SYMLINK_TARGET_OFFSET: u32 = offset_of!(SymlinkData, target) as u32;
 const LX_UTIL_SYMLINK_REPARSE_BASE_SIZE: u32 =
@@ -73,22 +72,22 @@ impl SymlinkReparse {
 
 #[bitfield(u32)]
 pub struct FsCompatibilityFlags {
-    supports_query_by_name: bool,
-    supports_stat_info: bool,
-    supports_stable_file_id: bool,
-    supports_case_sensitive_search: bool,
-    supports_reparse_points: bool,
-    supports_hard_links: bool,
-    supports_permission_mapping: bool,
-    supports_posix_unlink_rename: bool,
-    custom_fallback_mode: bool,
-    server_reparse_points: bool,
-    asynchronous_mode: bool,
-    supports_stat_lx_info: bool,
-    supports_metadata: bool,
-    supports_case_sensitive_dir: bool,
-    supports_xattr: bool,
-    supports_ignore_read_only_disposition: bool,
+    pub supports_query_by_name: bool,
+    pub supports_stat_info: bool,
+    pub supports_stable_file_id: bool,
+    pub supports_case_sensitive_search: bool,
+    pub supports_reparse_points: bool,
+    pub supports_hard_links: bool,
+    pub supports_permission_mapping: bool,
+    pub supports_posix_unlink_rename: bool,
+    pub custom_fallback_mode: bool,
+    pub server_reparse_points: bool,
+    pub asynchronous_mode: bool,
+    pub supports_stat_lx_info: bool,
+    pub supports_metadata: bool,
+    pub supports_case_sensitive_dir: bool,
+    pub supports_xattr: bool,
+    pub supports_ignore_read_only_disposition: bool,
     #[bits(16)]
     _reserved: u16,
 }

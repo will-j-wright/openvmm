@@ -8,6 +8,7 @@
 pub(crate) mod api;
 pub(crate) mod fs;
 pub(crate) mod path;
+mod readdir;
 mod symlink;
 mod util;
 
@@ -1260,7 +1261,7 @@ impl LxVolume {
 pub struct LxFile {
     handle: OwnedHandle,
     state: Arc<VolumeState>,
-    enumerator: Option<util::LxUtilDirEnum>,
+    enumerator: Option<readdir::DirectoryEnumerator>,
     access: winnt::ACCESS_MASK,
     kill_priv: AtomicBool,
     is_app_exec_alias: Mutex<bool>,
@@ -1405,43 +1406,22 @@ impl LxFile {
         F: FnMut(lx::DirEntry) -> lx::Result<bool>,
     {
         if self.enumerator.is_none() {
-            self.enumerator = Some(util::LxUtilDirEnum::new());
+            self.enumerator = Some(readdir::DirectoryEnumerator::new(false)?);
         }
 
         let enumerator = self.enumerator.as_mut().unwrap();
-        let mut context = DirEnumContext {
-            offset,
-            callback: &mut callback,
-            panic: None,
-        };
+        let mut local_offset = offset;
 
         // Write the . and .. entries, since lxutil doesn't return them.
-        if !Self::process_dot_entries(&mut context)? {
+        if !Self::process_dot_entries(&mut local_offset, &mut callback)? {
             return Ok(());
         }
 
-        assert!(context.offset >= DOT_ENTRY_COUNT);
+        assert!(local_offset >= DOT_ENTRY_COUNT);
 
-        let mut offset = context.offset - DOT_ENTRY_COUNT;
-        let result = unsafe {
-            util::check_lx_error(api::LxUtilFsReadDir(
-                &self.state.fs_context,
-                self.handle.as_raw_handle(),
-                &mut enumerator.enumerator,
-                &mut offset,
-                ptr::from_mut::<DirEnumContext<'_>>(&mut context).cast::<ffi::c_void>(),
-            ))
-        };
-
-        // If the closure panicked, resume it now.
-        if let Some(payload) = context.panic {
-            panic::resume_unwind(payload);
-        }
-
-        // Check the return value only after checking for a panic.
-        result?;
-
-        assert!(context.offset == offset + DOT_ENTRY_COUNT);
+        let mut offset = local_offset - DOT_ENTRY_COUNT;
+        let new_fs = fs::FsContext::new(&self.state.fs_context);
+        enumerator.read_dir(&self.handle, &new_fs, &mut offset, &mut callback)?;
 
         Ok(())
     }
@@ -1515,7 +1495,8 @@ impl LxFile {
             };
 
             Self::process_dir_entry(
-                context,
+                &mut context.offset,
+                &mut context.callback,
                 file_id,
                 name.into(),
                 entry_type.try_into().unwrap(),
@@ -1544,15 +1525,18 @@ impl LxFile {
     }
 
     // Helper to emit the . and .. entries.
-    fn process_dot_entries(context: &mut DirEnumContext<'_>) -> lx::Result<bool> {
-        if context.offset == 0
-            && !Self::process_dir_entry(context, 0, lx::LxString::from("."), lx::DT_DIR)?
+    fn process_dot_entries<F>(offset: &mut lx::off_t, callback: &mut F) -> lx::Result<bool>
+    where
+        F: FnMut(lx::DirEntry) -> lx::Result<bool>,
+    {
+        if *offset == 0
+            && !Self::process_dir_entry(offset, callback, 0, lx::LxString::from("."), lx::DT_DIR)?
         {
             return Ok(false);
         }
 
-        if context.offset == 1
-            && !Self::process_dir_entry(context, 0, lx::LxString::from(".."), lx::DT_DIR)?
+        if *offset == 1
+            && !Self::process_dir_entry(offset, callback, 0, lx::LxString::from(".."), lx::DT_DIR)?
         {
             return Ok(false);
         }
@@ -1561,24 +1545,28 @@ impl LxFile {
     }
 
     // Helper to call the user's closure for a directory
-    fn process_dir_entry(
-        context: &mut DirEnumContext<'_>,
+    fn process_dir_entry<F>(
+        offset: &mut lx::off_t,
+        callback: &mut F,
         inode_nr: ntdef::ULONGLONG,
         name: lx::LxString,
         file_type: u8,
-    ) -> lx::Result<bool> {
+    ) -> lx::Result<bool>
+    where
+        F: FnMut(lx::DirEntry) -> lx::Result<bool>,
+    {
         let entry = lx::DirEntry {
             name,
             inode_nr,
-            offset: context.offset + 1, // Pass the offset of the next entry.
+            offset: *offset + 1, // Pass the offset of the next entry.
             file_type,
         };
 
-        let result = (context.callback)(entry)?;
+        let result = (callback)(entry)?;
 
         // Update the offset only if the user wants to continue.
         if result {
-            context.offset += 1;
+            *offset += 1;
         }
 
         Ok(result)

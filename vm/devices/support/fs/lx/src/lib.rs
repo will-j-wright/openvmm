@@ -43,9 +43,15 @@ pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
 pub const S_IXGRP: u32 = 0o010;
 
+pub const DT_UNK: u8 = 0;
+pub const DT_FIFO: u8 = 1;
+pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
+pub const DT_BLK: u8 = 6;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
+pub const DT_SOCK: u8 = 12;
+pub const DT_WHT: u8 = 14;
 
 lx_errors! {
     EPERM = 1;
