@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::api::LX_UTIL_FS_CONTEXT;
 use super::symlink;
 use super::util;
 use super::VolumeState;
@@ -28,6 +27,11 @@ const LX_UTIL_FS_DIR_WRITE_ACCESS: u32 =
 const LX_UTIL_FS_CALLER_HAS_TRAVERSE_PRIVILEGE: u32 = 0x1;
 
 const LX_UTIL_FS_ALLOCATION_BLOCK_SIZE: u64 = 512;
+
+const LX_UTIL_FS_NAME_LENGTH: usize = 16;
+
+pub const LX_DRVFS_DISABLE_NONE: u32 = 0;
+pub const LX_DRVFS_DISABLE_QUERY_BY_NAME_AND_STAT_INFO: u32 = 2;
 
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
 
@@ -96,12 +100,92 @@ pub struct FsContext {
     pub compatibility_flags: FsCompatibilityFlags,
 }
 
-// Temporary implementation until all functions are moved over to use FsContext
 impl FsContext {
-    pub fn new(fs_context: &LX_UTIL_FS_CONTEXT) -> Self {
-        FsContext {
-            compatibility_flags: fs_context.CompatibilityFlags.into(),
+    /// Initialize an FsContext. The compatibility flags will be set based on the
+    /// capabilities of the filesystem.
+    pub fn new(
+        file_handle: &OwnedHandle,
+        fallback_mode: u32,
+        async_mode: bool,
+    ) -> lx::Result<Self> {
+        // Get the filesystem attributes
+        let mut iosb = Default::default();
+        let mut fs_attributes: HeaderVec<FileSystem::FILE_FS_ATTRIBUTE_INFORMATION, [u16; 1]> =
+            HeaderVec::with_capacity(Default::default(), LX_UTIL_FS_NAME_LENGTH);
+        let mut device_info = SystemServices::FILE_FS_DEVICE_INFORMATION::default();
+        // safety: Calling Win32 API as documented
+        unsafe {
+            let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
+                Foundation::HANDLE(file_handle.as_raw_handle()),
+                &mut iosb,
+                fs_attributes.as_mut_ptr() as *mut _,
+                (fs_attributes.capacity() + size_of::<FileSystem::FILE_FS_ATTRIBUTE_INFORMATION>())
+                    as _,
+                FileSystem::FileFsAttributeInformation,
+            ))?;
+            let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
+                Foundation::HANDLE(file_handle.as_raw_handle()),
+                &mut iosb,
+                &mut device_info as *mut SystemServices::FILE_FS_DEVICE_INFORMATION as *mut _,
+                size_of::<SystemServices::FILE_FS_DEVICE_INFORMATION>() as _,
+                FileSystem::FileFsDeviceInformation,
+            ))?;
+        };
+
+        let is_remote = device_info.Characteristics & SystemServices::FILE_REMOTE_DEVICE != 0;
+        let attr = fs_attributes.FileSystemAttributes;
+
+        // SMB does not properly support POSIX unlink/rename.
+        let supports_posix_rename =
+            attr & W32Ss::FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0 && !is_remote;
+
+        let mut flags = FsCompatibilityFlags::new()
+            .with_supports_stable_file_id(attr & W32Ss::FILE_SUPPORTS_OPEN_BY_FILE_ID != 0)
+            .with_supports_posix_unlink_rename(supports_posix_rename)
+            .with_supports_ignore_read_only_disposition(supports_posix_rename)
+            // SMB does not properly support case sensitivity.
+            .with_supports_case_sensitive_search(
+                attr & W32Ss::FILE_CASE_SENSITIVE_SEARCH != 0 && !is_remote,
+            )
+            // SMB claims it supports reparse points, but it's only partial support.
+            // It appears it only allows NT symlinks to be created (which can then not
+            // be followed due to security restrictions); arbitrary reparse points
+            // do not work. Therefore, treat SMB as if it doesn't support reparse
+            // points.
+            .with_supports_reparse_points(
+                attr & W32Ss::FILE_SUPPORTS_REPARSE_POINTS != 0 && !is_remote,
+            )
+            .with_supports_hard_links(attr & W32Ss::FILE_SUPPORTS_HARD_LINKS != 0)
+            // On network file systems, permission mapping may not work correctly. If
+            // the share is being accessed with different credentials than the logged
+            // on user, this would still use the logged on credentials to determine
+            // effective access. This leads to incorrect permission bits, which can
+            // cause the VFS permission checks to deny access incorrectly. Samba on
+            // Linux also returns fake ACLs which break permission mapping.
+            .with_supports_permission_mapping(!is_remote)
+            .with_server_reparse_points(is_remote)
+            .with_asynchronous_mode(async_mode)
+            .with_supports_xattr(attr & W32Ss::FILE_SUPPORTS_EXTENDED_ATTRIBUTES != 0);
+
+        // Determine whether query information by name, FILE_STAT_INFORMATION and
+        // FILE_STAT_LX_INFORMATION are supported.
+        determine_fallback_mode(file_handle, &mut flags, fallback_mode);
+
+        // Determine if per-directory case-sensitivity is supported.
+        if let Ok(_) =
+            util::query_information_file::<FileSystem::FILE_CASE_SENSITIVE_INFORMATION>(file_handle)
+        {
+            flags.set_supports_case_sensitive_dir(true);
+        };
+
+        // Metadata support requires EAs and FILE_STAT_LX_INFORMATION.
+        if flags.supports_xattr() && flags.supports_stat_lx_info() {
+            flags.set_supports_metadata(true);
         }
+
+        Ok(FsContext {
+            compatibility_flags: flags,
+        })
     }
 }
 
@@ -128,7 +212,7 @@ pub fn rename(
     file_handle: &OwnedHandle,
     target_parent: &OwnedHandle,
     target_path: &Path,
-    fs_context: &mut FsContext,
+    fs_context: &FsContext,
     flags: RenameFlags,
 ) -> lx::Result<()> {
     // Set the POSIX semantics flag if the FS supports POSIX unlink rename
@@ -160,7 +244,7 @@ pub fn chmod(file_handle: &OwnedHandle, mode: lx::mode_t) -> lx::Result<()> {
     }
 }
 
-pub fn delete_file(fs_context: &mut FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
+pub fn delete_file(fs_context: &FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
     let result = delete_file_core(fs_context, file_handle);
 
     match result {
@@ -175,7 +259,7 @@ pub fn delete_file(fs_context: &mut FsContext, file_handle: &OwnedHandle) -> lx:
     }
 }
 
-pub fn delete_file_core(fs_context: &mut FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
+pub fn delete_file_core(fs_context: &FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
     if fs_context
         .compatibility_flags
         .supports_posix_unlink_rename()
@@ -186,10 +270,7 @@ pub fn delete_file_core(fs_context: &mut FsContext, file_handle: &OwnedHandle) -
     }
 }
 
-pub fn delete_read_only_file(
-    fs_context: &mut FsContext,
-    file_handle: &OwnedHandle,
-) -> lx::Result<()> {
+pub fn delete_read_only_file(fs_context: &FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
     let info: FileSystem::FILE_BASIC_INFORMATION = util::query_information_file(file_handle)?;
 
     if info.FileAttributes & W32Fs::FILE_ATTRIBUTE_READONLY.0 == 0 {
@@ -207,7 +288,9 @@ fn delete_file_core_non_posix(file_handle: &OwnedHandle) -> lx::Result<()> {
     util::set_information_file(&file_handle, &info)
 }
 
-fn delete_file_core_posix(fs_context: &mut FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
+fn delete_file_core_posix(fs_context: &FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
+    let fs_flags: *mut FsCompatibilityFlags =
+        &fs_context.compatibility_flags as *const FsCompatibilityFlags as _;
     loop {
         // Set the flags for FILE_DISPOSITION_INFORMATION_EX and set
         // FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE if the flag is set in
@@ -237,9 +320,11 @@ fn delete_file_core_posix(fs_context: &mut FsContext, file_handle: &OwnedHandle)
                         .compatibility_flags
                         .supports_ignore_read_only_disposition()
                 {
-                    fs_context
-                        .compatibility_flags
-                        .set_supports_ignore_read_only_disposition(false);
+                    // safety: This might race, but the flag will get set to 0 eventually anyway.
+                    //      This is better than having the VolumeState behind a Mutex.
+                    unsafe {
+                        (*fs_flags).set_supports_ignore_read_only_disposition(false);
+                    }
                     continue;
                 }
             }
@@ -652,7 +737,7 @@ fn query_reparse_data(
             None,
             0,
             Some(reparse_buffer.as_mut_ptr() as *mut _),
-            reparse_buffer.capacity() as u32,
+            (reparse_buffer.capacity() + size_of::<SymlinkReparse>()) as u32,
         ))?;
         reparse_buffer.set_len(tail_size);
     };
@@ -761,5 +846,55 @@ pub fn read_reparse_link(
             symlink::read_nt_symlink(header, state).map(|s| Some(s))
         }
         _ => Err(lx::Error::EIO),
+    }
+}
+
+fn determine_fallback_mode(
+    file_handle: &OwnedHandle,
+    flags: &mut FsCompatibilityFlags,
+    fallback_mode: u32,
+) {
+    let empty_string = UnicodeString::new(&[]).unwrap();
+    if fallback_mode == LX_DRVFS_DISABLE_NONE {
+        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
+            Some(&file_handle),
+            &empty_string,
+        ) {
+            flags.set_supports_query_by_name(true);
+            flags.set_supports_stat_info(true);
+            flags.set_supports_stat_lx_info(true);
+            return;
+        };
+
+        // FILE_STAT_LX_INFORMATION didn't work, so try it with FILE_STAT_INFORMATION.
+        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_INFORMATION>(
+            Some(&file_handle),
+            &empty_string,
+        ) {
+            flags.set_supports_query_by_name(true);
+            flags.set_supports_stat_info(true);
+            return;
+        };
+    }
+
+    // Check if FILE_STAT_(LX_)INFORMATION is supported even if query by name is not.
+    if fallback_mode < LX_DRVFS_DISABLE_QUERY_BY_NAME_AND_STAT_INFO {
+        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
+            Some(&file_handle),
+            &empty_string,
+        ) {
+            flags.set_supports_stat_info(true);
+            flags.set_supports_stat_lx_info(true);
+            return;
+        };
+
+        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_INFORMATION>(
+            Some(&file_handle),
+            &empty_string,
+        ) {
+            flags.set_supports_query_by_name(true);
+            flags.set_supports_stat_info(true);
+            return;
+        };
     }
 }

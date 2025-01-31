@@ -13,7 +13,6 @@ use std::ffi;
 use std::os::windows::prelude::*;
 use winapi::shared::basetsd;
 use winapi::shared::ntdef;
-use windows::Wdk::Storage::FileSystem;
 
 // Maximum size needed for an EA buffer containing all metadata fields.
 pub const LX_UTIL_FS_METADATA_EA_BUFFER_SIZE: usize = 84;
@@ -28,24 +27,6 @@ pub const FILE_CS_FLAG_CASE_SENSITIVE_DIR: ntdef::ULONG = 0x1;
 // Fallback modes.
 pub const LX_DRVFS_DISABLE_NONE: ntdef::ULONG = 0;
 
-// Compatibility flags.
-pub const FS_CONTEXT_SUPPORTS_QUERY_BY_NAME: ntdef::ULONG = 0x1;
-pub const FS_CONTEXT_SUPPORTS_STAT_INFO: ntdef::ULONG = 0x2;
-pub const FS_CONTEXT_SUPPORTS_STABLE_FILE_ID: ntdef::ULONG = 0x4;
-pub const FS_CONTEXT_SUPPORTS_CASE_SENSITIVE_SEARCH: ntdef::ULONG = 0x8;
-pub const FS_CONTEXT_SUPPORTS_REPARSE_POINTS: ntdef::ULONG = 0x10;
-pub const FS_CONTEXT_SUPPORTS_HARD_LINKS: ntdef::ULONG = 0x20;
-pub const FS_CONTEXT_SUPPORTS_PERMISSION_MAPPING: ntdef::ULONG = 0x40;
-pub const FS_CONTEXT_SUPPORTS_POSIX_UNLINK_RENAME: ntdef::ULONG = 0x80;
-pub const FS_CONTEXT_CUSTOM_FALLBACK_MODE: ntdef::ULONG = 0x100;
-pub const FS_CONTEXT_SERVER_REPARSE_POINTS: ntdef::ULONG = 0x200;
-pub const FS_CONTEXT_ASYNCHRONOUS_MODE: ntdef::ULONG = 0x400;
-pub const FS_CONTEXT_SUPPORTS_STAT_LX_INFO: ntdef::ULONG = 0x800;
-pub const FS_CONTEXT_SUPPORTS_METADATA: ntdef::ULONG = 0x1000;
-pub const FS_CONTEXT_SUPPORTS_CASE_SENSITIVE_DIR: ntdef::ULONG = 0x2000;
-pub const FS_CONTEXT_SUPPORTS_XATTR: ntdef::ULONG = 0x4000;
-pub const FS_CONTEXT_SUPPORTS_IGNORE_READ_ONLY_DISPOSITION: ntdef::ULONG = 0x8000;
-
 // Flags for converting attributes.
 pub const LX_UTIL_FS_CALLER_HAS_TRAVERSE_PRIVILEGE: ntdef::ULONG = 0x1;
 
@@ -54,50 +35,6 @@ pub const LX_UTIL_XATTR_LIST_CASE_SENSITIVE_DIR: ntdef::ULONG = 0x1;
 
 // Size of PE header signature.
 pub const LX_UTIL_PE_HEADER_SIZE: ntdef::ULONG = 2;
-
-pub type LX_UTIL_FS_WRITE_DIRENTRY = unsafe extern "C" fn(
-    context: ntdef::PVOID,
-    file_id: ntdef::ULONGLONG,
-    name: &pal::windows::UnicodeStringRef<'_>,
-    entry_type: i32,
-    buffer_full: &mut ntdef::BOOLEAN,
-) -> i32;
-
-pub type LX_UTIL_FS_TRANSLATE_ABSOLUTE_NT_SYMLINK = unsafe extern "C" fn(
-    context: ntdef::PVOID,
-    substitute_name: &ntdef::UNICODE_STRING,
-    link_target: &mut ntdef::UNICODE_STRING,
-) -> i32;
-
-#[repr(C)]
-pub struct LX_UTIL_FS_CALLBACKS {
-    pub WriteDirentryMethod: Option<LX_UTIL_FS_WRITE_DIRENTRY>,
-    pub TranslateAbsoluteSymlinkMethod: Option<LX_UTIL_FS_TRANSLATE_ABSOLUTE_NT_SYMLINK>,
-}
-
-#[repr(C)]
-pub struct LX_UTIL_FS_CONTEXT {
-    pub Callbacks: *const LX_UTIL_FS_CALLBACKS,
-    pub CompatibilityFlags: ntdef::ULONG,
-}
-
-unsafe impl Send for LX_UTIL_FS_CONTEXT {}
-unsafe impl Sync for LX_UTIL_FS_CONTEXT {}
-
-#[repr(C)]
-pub struct LX_UTIL_DIRECTORY_ENUMERATOR {
-    Handle: RawHandle,
-    Buffer: ntdef::PVOID,
-    BufferNextEntry: ntdef::PVOID,
-    BufferSize: ntdef::ULONG,
-    NextReadIndex: ntdef::ULONG,
-    FileInformationClassIndex: ntdef::ULONG,
-    Flags: ntdef::ULONG,
-}
-
-unsafe impl Send for LX_UTIL_DIRECTORY_ENUMERATOR {}
-
-unsafe impl Sync for LX_UTIL_DIRECTORY_ENUMERATOR {}
 
 #[repr(C)]
 pub struct LX_UTIL_BUFFER {
@@ -151,15 +88,6 @@ pal::delayload!("lxutil.dll" {
         handle: RawHandle,
         fs_type: usize,
         stat_fs: &mut lx::StatFs,
-    ) -> i32;
-
-    pub fn LxUtilFsInitialize(
-        handle: RawHandle,
-        fallback_mode: ntdef::ULONG,
-        asynchronous_mode: ntdef::BOOLEAN,
-        callbacks: &LX_UTIL_FS_CALLBACKS,
-        fs_context: &mut LX_UTIL_FS_CONTEXT,
-        information: &mut FileSystem::FILE_STAT_INFORMATION,
     ) -> i32;
 
     pub fn LxUtilFsIsAppExecLink(attributes: ntdef::ULONG, reparse_tag: ntdef::ULONG) -> ntdef::BOOLEAN;

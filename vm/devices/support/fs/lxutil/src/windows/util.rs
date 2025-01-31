@@ -418,13 +418,12 @@ pub struct LxStatInformation {
 
 // Get file attributes from a file handle.
 pub fn get_attributes_by_handle(
-    fs_context: &api::LX_UTIL_FS_CONTEXT,
+    fs_context: &fs::FsContext,
     state: &super::VolumeState,
     handle: &OwnedHandle,
 ) -> lx::Result<LxStatInformation> {
     unsafe {
-        let fs_context_new = fs::FsContext::new(fs_context);
-        let stat = fs::query_stat_lx_information(handle, &fs_context_new)?;
+        let stat = fs::query_stat_lx_information(handle, &fs_context)?;
 
         // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
         // determined based on the reparse data.
@@ -449,7 +448,7 @@ pub fn get_attributes_by_handle(
 // Get file attributes from a file name.
 // This may open the file if NtQueryInformationByName is not supported.
 pub fn get_attributes(
-    fs_context: &api::LX_UTIL_FS_CONTEXT,
+    fs_context: &fs::FsContext,
     state: &super::VolumeState,
     root_handle: Option<&OwnedHandle>,
     path: &Path,
@@ -460,12 +459,11 @@ pub fn get_attributes(
     }
 
     // If NtQueryInformationByName is supported, use it.
-    if fs_context.CompatibilityFlags & api::FS_CONTEXT_SUPPORTS_QUERY_BY_NAME != 0 {
+    if fs_context.compatibility_flags.supports_query_by_name() {
         let pathu = dos_to_nt_path(root_handle, path)?;
 
         unsafe {
-            let fs_context_new = fs::FsContext::new(fs_context);
-            let stat = fs::query_stat_lx_information_by_name(&fs_context_new, root_handle, &pathu)?;
+            let stat = fs::query_stat_lx_information_by_name(&fs_context, root_handle, &pathu)?;
 
             // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
             // determined based on the reparse data, which requires opening the file.
@@ -663,12 +661,11 @@ fn override_mode(actual: u32, hard_coded: u32) -> u32 {
 
 // Converts Windows file information to stat attributes.
 pub fn file_info_to_stat(
-    fs_context: &api::LX_UTIL_FS_CONTEXT,
+    fs_context: &fs::FsContext,
     information: &mut LxStatInformation,
     options: &crate::LxVolumeOptions,
     block_size: ntdef::ULONG,
 ) -> lx::Result<lx::Stat> {
-    let fs_context = fs::FsContext::new(fs_context);
     let mut stat = fs::get_lx_attr(
         &fs_context,
         &mut information.stat,
