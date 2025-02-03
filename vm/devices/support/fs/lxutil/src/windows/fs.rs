@@ -13,6 +13,8 @@ use ::windows::Win32::System::SystemServices as W32Ss;
 use bitfield_struct::bitfield;
 use pal::windows::UnicodeString;
 use pal::HeaderVec;
+use std::ffi;
+use std::marker::PhantomData;
 use std::mem::offset_of;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::OwnedHandle;
@@ -98,6 +100,7 @@ pub struct FsCompatibilityFlags {
 
 pub struct FsContext {
     pub compatibility_flags: FsCompatibilityFlags,
+    _phantom: PhantomData<()>, // Prevent manual construction
 }
 
 impl FsContext {
@@ -113,14 +116,14 @@ impl FsContext {
         let mut fs_attributes: HeaderVec<FileSystem::FILE_FS_ATTRIBUTE_INFORMATION, [u16; 1]> =
             HeaderVec::with_capacity(Default::default(), LX_UTIL_FS_NAME_LENGTH);
         let mut device_info = SystemServices::FILE_FS_DEVICE_INFORMATION::default();
+
         // safety: Calling Win32 API as documented
         unsafe {
             let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
                 Foundation::HANDLE(file_handle.as_raw_handle()),
                 &mut iosb,
                 fs_attributes.as_mut_ptr() as *mut _,
-                (fs_attributes.capacity() + size_of::<FileSystem::FILE_FS_ATTRIBUTE_INFORMATION>())
-                    as _,
+                fs_attributes.total_byte_capacity() as _,
                 FileSystem::FileFsAttributeInformation,
             ))?;
             let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
@@ -185,6 +188,7 @@ impl FsContext {
 
         Ok(FsContext {
             compatibility_flags: flags,
+            _phantom: PhantomData,
         })
     }
 }
@@ -289,8 +293,9 @@ fn delete_file_core_non_posix(file_handle: &OwnedHandle) -> lx::Result<()> {
 }
 
 fn delete_file_core_posix(fs_context: &FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
-    let fs_flags: *mut FsCompatibilityFlags =
-        &fs_context.compatibility_flags as *const FsCompatibilityFlags as _;
+    let mut ignore_read_only_disposition = fs_context
+        .compatibility_flags
+        .supports_ignore_read_only_disposition();
     loop {
         // Set the flags for FILE_DISPOSITION_INFORMATION_EX and set
         // FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE if the flag is set in
@@ -299,10 +304,7 @@ fn delete_file_core_posix(fs_context: &FsContext, file_handle: &OwnedHandle) -> 
             FileSystem::FILE_DISPOSITION_INFORMATION_EX_FLAGS(
                 FileSystem::FILE_DISPOSITION_DELETE.0
                     | FileSystem::FILE_DISPOSITION_POSIX_SEMANTICS.0
-                    | if fs_context
-                        .compatibility_flags
-                        .supports_ignore_read_only_disposition()
-                    {
+                    | if ignore_read_only_disposition {
                         FileSystem::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE.0
                     } else {
                         0
@@ -315,16 +317,9 @@ fn delete_file_core_posix(fs_context: &FsContext, file_handle: &OwnedHandle) -> 
         match result {
             Ok(_) => return result,
             Err(e) => {
-                if e.value() == lx::EPERM
-                    && fs_context
-                        .compatibility_flags
-                        .supports_ignore_read_only_disposition()
-                {
-                    // safety: This might race, but the flag will get set to 0 eventually anyway.
-                    //      This is better than having the VolumeState behind a Mutex.
-                    unsafe {
-                        (*fs_flags).set_supports_ignore_read_only_disposition(false);
-                    }
+                if e.value() == lx::EPERM && ignore_read_only_disposition {
+                    // Try again without the IGNORE_READONLY_ATTRIBUTE flag.
+                    ignore_read_only_disposition = false;
                     continue;
                 }
             }
@@ -602,9 +597,26 @@ pub fn query_stat_information(
             0
         };
 
-        // TODO: Can this overflow the buffer and still be valid?
-        let all_information: FileSystem::FILE_ALL_INFORMATION =
-            util::query_information_file(file_handle)?;
+        let mut iosb = Default::default();
+        let mut all_information: FileSystem::FILE_ALL_INFORMATION = Default::default();
+        let (buf, len) = util::FileInformationClass::as_ptr_len_mut(&mut all_information);
+
+        // SAFETY: Calling NtQueryInformationFile as documented.
+        // We don't use util::query_information_file here because it's fine if the buffer overflows due to a long file name.
+        let status = unsafe {
+            FileSystem::NtQueryInformationFile(
+                Foundation::HANDLE(file_handle.as_raw_handle()),
+                &mut iosb,
+                buf as *mut ffi::c_void,
+                len.try_into().unwrap(),
+                FileSystem::FileAllInformation,
+            )
+        };
+
+        if status != Foundation::STATUS_SUCCESS && status != Foundation::STATUS_BUFFER_OVERFLOW {
+            return Err(util::nt_status_to_lx(status));
+        }
+
         let reparse_tag = if all_information.BasicInformation.FileAttributes
             & W32Fs::FILE_ATTRIBUTE_REPARSE_POINT.0
             != 0
@@ -638,7 +650,7 @@ pub fn query_stat_information(
 
 // TODO?: FILE_STAT_LX_INFORMATION is a superset of FILE_STAT_INFORMATION, so it'd be
 // possible to do this by creating a buffer large enough for FILE_STAT_LX_INFORMATION
-// and casting unsafely a couple of times
+// and casting
 fn stat_info_to_stat_lx_info(
     stat_info: FileSystem::FILE_STAT_INFORMATION,
 ) -> FileSystem::FILE_STAT_LX_INFORMATION {
@@ -737,7 +749,7 @@ fn query_reparse_data(
             None,
             0,
             Some(reparse_buffer.as_mut_ptr() as *mut _),
-            (reparse_buffer.capacity() + size_of::<SymlinkReparse>()) as u32,
+            reparse_buffer.total_byte_capacity() as u32,
         ))?;
         reparse_buffer.set_len(tail_size);
     };
