@@ -553,29 +553,27 @@ pub fn get_lx_attr(
         block_count = allocation_size_to_block_count(info.AllocationSize, block_size)
     }
 
-    let stat = lx::Stat {
-        uid: inode_attr.uid.unwrap_or(default_uid),
-        gid: inode_attr.gid.unwrap_or(default_gid),
-        mode,
-        device_nr_special: inode_attr.device_id.unwrap_or(0) as u64,
-        inode_nr: info.FileId as u64,
-        link_count: info.NumberOfLinks as usize,
-        access_time: util::nt_time_to_timespec(info.LastAccessTime, true),
-        write_time: util::nt_time_to_timespec(info.LastWriteTime, true),
-        change_time: if info.ChangeTime == 0 {
-            // Some file systems do not provide a change time. If this is the case,
-            // use the write time.
-            util::nt_time_to_timespec(info.LastWriteTime, true)
-        } else {
-            util::nt_time_to_timespec(info.ChangeTime, true)
-        },
-        block_size: block_size as isize,
-        file_size,
-        block_count,
-        device_nr: 0,
-        pad0: 0,
-        pad1: [0, 0, 0],
+    // lx::Stat has different padding members on ARM and x86. As such, don't construct it manually,
+    // but just fill out the individual fields.
+    let mut stat: lx::Stat = unsafe { std::mem::zeroed() };
+    stat.uid = inode_attr.uid.unwrap_or(default_uid);
+    stat.gid = inode_attr.gid.unwrap_or(default_gid);
+    stat.mode = mode;
+    stat.device_nr_special = inode_attr.device_id.unwrap_or(0) as _;
+    stat.inode_nr = info.FileId as _;
+    stat.link_count = info.NumberOfLinks as _;
+    stat.access_time = util::nt_time_to_timespec(info.LastAccessTime, true);
+    stat.write_time = util::nt_time_to_timespec(info.LastWriteTime, true);
+    stat.change_time = if info.ChangeTime == 0 {
+        // Some file systems do not provide a change time. If this is the case,
+        // use the write time.
+        util::nt_time_to_timespec(info.LastWriteTime, true)
+    } else {
+        util::nt_time_to_timespec(info.ChangeTime, true)
     };
+    stat.block_size = block_size as _;
+    stat.file_size = file_size;
+    stat.block_count = block_count;
 
     Ok(stat)
 }
