@@ -5,6 +5,9 @@
 #![expect(unsafe_code)]
 #![allow(clippy::undocumented_unsafe_blocks)]
 
+#[macro_use]
+mod macros;
+
 pub(crate) mod api;
 pub(crate) mod fs;
 pub(crate) mod path;
@@ -951,7 +954,7 @@ impl LxVolume {
 
             /// Only the required header for FSCTL_SET_REPARSE_POINT, with data length of zero.
             /// See ntifs.h REPARSE_DATA_BUFFER.
-            #[allow(non_snake_case)]
+            #[allow(non_camel_case_types, non_snake_case)]
             #[repr(C)]
             #[derive(Clone, Copy, IntoBytes, Immutable, KnownLayout, FromBytes)]
             struct REPARSE_DATA_BUFFER {
@@ -960,8 +963,7 @@ impl LxVolume {
                 Reserved: u16,
             }
 
-            // SAFETY: Calling C API as documented.
-            let reparse_tag = unsafe { api::LxUtilFsFileModeToReparseTag(mode) };
+            let reparse_tag = util::file_mode_to_reparse_tag(mode);
 
             let reparse_buffer = REPARSE_DATA_BUFFER {
                 ReparseTag: reparse_tag,

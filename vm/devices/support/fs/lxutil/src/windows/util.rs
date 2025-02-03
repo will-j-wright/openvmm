@@ -54,7 +54,6 @@ const LX_POSIX_EPOCH_OFFSET: i64 = 0xd53e8000 + (0x019db1de << 32);
 const LX_UTIL_NT_UNIT_PER_SEC: i64 = 10000000;
 const LX_UTIL_NANO_SEC_PER_NT_UNIT: i64 = 100;
 
-// TODO: Create a macro that implements this
 /// A trait that maps a file information struct for calling into `NtSetInformationFile`, `NtQueryInformationFile` and
 /// other methods that accept a `FileInformationClass`.
 pub trait FileInformationClass: Default {
@@ -76,117 +75,16 @@ pub trait FileInformationClass: Default {
     fn as_ptr_len_mut(&mut self) -> (*mut u8, usize);
 }
 
-impl FileInformationClass for FileSystem::FILE_BASIC_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileBasicInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for SystemServices::FILE_ATTRIBUTE_TAG_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileAttributeTagInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileDispositionInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_DISPOSITION_INFORMATION_EX {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileDispositionInformationEx
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_STAT_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileStatInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_STAT_LX_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileStatLxInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_ALL_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileAllInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
-
-impl FileInformationClass for FileSystem::FILE_CASE_SENSITIVE_INFORMATION {
-    fn file_information_class(&self) -> FileSystem::FILE_INFORMATION_CLASS {
-        FileSystem::FileCaseSensitiveInformation
-    }
-
-    fn as_ptr_len(&self) -> (*const u8, usize) {
-        (ptr::from_ref::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-
-    fn as_ptr_len_mut(&mut self) -> (*mut u8, usize) {
-        (ptr::from_mut::<Self>(self).cast::<u8>(), size_of::<Self>())
-    }
-}
+file_information_classes!(
+    FileSystem::FILE_BASIC_INFORMATION = FileSystem::FileBasicInformation;
+    SystemServices::FILE_ATTRIBUTE_TAG_INFORMATION = FileSystem::FileAttributeTagInformation;
+    FileSystem::FILE_DISPOSITION_INFORMATION = FileSystem::FileDispositionInformation;
+    FileSystem::FILE_DISPOSITION_INFORMATION_EX = FileSystem::FileDispositionInformationEx;
+    FileSystem::FILE_STAT_INFORMATION = FileSystem::FileStatInformation;
+    FileSystem::FILE_STAT_LX_INFORMATION = FileSystem::FileStatLxInformation;
+    FileSystem::FILE_ALL_INFORMATION = FileSystem::FileAllInformation;
+    FileSystem::FILE_CASE_SENSITIVE_INFORMATION = FileSystem::FileCaseSensitiveInformation;
+);
 
 // Open a file using NtCreateFile.
 // Returns the create result from the IO_STATUS_BLOCK along with the handle.
@@ -930,12 +828,12 @@ pub fn nt_status_to_lx(status: Foundation::NTSTATUS) -> lx::Error {
         Foundation::STATUS_BAD_NETWORK_PATH => lx::EHOSTDOWN,
         Foundation::STATUS_NO_MEDIA_IN_DEVICE => lx::ENOMEDIUM,
         Foundation::STATUS_UNRECOGNIZED_MEDIA => lx::EMEDIUMTYPE,
-        Foundation::STATUS_NO_EAS_ON_FILE | Foundation::STATUS_NO_MORE_EAS => lx::ENOATTR,
+        Foundation::STATUS_NO_EAS_ON_FILE | Foundation::STATUS_NO_MORE_EAS => lx::ENODATA,
         Foundation::STATUS_NOT_A_DIRECTORY => lx::ENOTDIR,
         Foundation::STATUS_FILE_IS_A_DIRECTORY => lx::EISDIR,
         Foundation::STATUS_ILLEGAL_INSTRUCTION
         | Foundation::STATUS_INVALID_DEVICE_REQUEST
-        | Foundation::STATUS_EAS_NOT_SUPPORTED => lx::EOPNOTSUPP,
+        | Foundation::STATUS_EAS_NOT_SUPPORTED => lx::ENOTSUP,
         Foundation::STATUS_INVALID_HANDLE
         | Foundation::STATUS_GRAPHICS_ALLOCATION_CLOSED
         | Foundation::STATUS_GRAPHICS_INVALID_ALLOCATION_INSTANCE
@@ -1152,7 +1050,7 @@ pub fn create_link(
 
     // This matches the public definition of FILE_LINK_INFORMATION in ntifs.h, with the variable length payload field
     // at the end removed. u8 arrays are used for fields to remove the need for padding and repr(packed).
-    #[allow(non_snake_case)]
+    #[allow(non_snake_case, non_camel_case_types)]
     #[repr(C)]
     #[derive(Debug, Clone, Copy, IntoBytes, Immutable, KnownLayout, FromBytes)]
     struct FILE_LINK_INFORMATION {
@@ -1420,14 +1318,26 @@ pub fn reparse_tag_to_file_mode(reparse_tag: u32) -> lx::mode_t {
     }
 }
 
+/// Convert a file mode to the appropriate reparse tag
+pub fn file_mode_to_reparse_tag(file_mode: lx::mode_t) -> u32 {
+    match file_mode & lx::S_IFMT {
+        lx::S_IFIFO => FileSystem::IO_REPARSE_TAG_LX_FIFO as _,
+        lx::S_IFSOCK => W32Ss::IO_REPARSE_TAG_AF_UNIX,
+        lx::S_IFCHR => FileSystem::IO_REPARSE_TAG_LX_CHR as _,
+        lx::S_IFBLK => FileSystem::IO_REPARSE_TAG_LX_BLK as _,
+        lx::S_IFLNK => FileSystem::IO_REPARSE_TAG_LX_SYMLINK as _,
+        _ => W32Ss::IO_REPARSE_TAG_RESERVED_ZERO as _,
+    }
+}
+
 /// Convert a reparse tag to the appropriate DT_* file type.
 pub fn reparse_tag_to_file_type(reparse_tag: u32) -> u8 {
     // We need to redefine some of the tags, in the windows crate they're defined as i32s
     // instead of u32s. In the headers themselves they're just #define directives
-    const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
-    const IO_REPARSE_TAG_LX_FIFO: u32 = FileSystem::IO_REPARSE_TAG_LX_FIFO as u32;
-    const IO_REPARSE_TAG_LX_CHR: u32 = FileSystem::IO_REPARSE_TAG_LX_CHR as u32;
-    const IO_REPARSE_TAG_LX_BLK: u32 = FileSystem::IO_REPARSE_TAG_LX_BLK as u32;
+    const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as _;
+    const IO_REPARSE_TAG_LX_FIFO: u32 = FileSystem::IO_REPARSE_TAG_LX_FIFO as _;
+    const IO_REPARSE_TAG_LX_CHR: u32 = FileSystem::IO_REPARSE_TAG_LX_CHR as _;
+    const IO_REPARSE_TAG_LX_BLK: u32 = FileSystem::IO_REPARSE_TAG_LX_BLK as _;
 
     match reparse_tag {
         W32Ss::IO_REPARSE_TAG_SYMLINK

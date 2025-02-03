@@ -89,56 +89,12 @@ trait DirectoryInformation {
     fn reparse_tag(&self) -> u32;
 }
 
-/// Implement DirectoryInformation.
-macro_rules! impl_default_dir_info {
-    ($type:ty, $attr:ident, $tag:ident) => {
-        impl DirectoryInformation for $type {
-            fn file_id(&self) -> i64 {
-                self.FileId
-            }
-
-            fn file_name(&self) -> Result<UnicodeString, lx::Error> {
-                // safety: A properly constructed struct will contain the name in a buffer at the end.
-                let name_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        self.FileName.as_ptr(),
-                        self.FileNameLength as usize / size_of::<u16>(),
-                    )
-                };
-                UnicodeString::new(name_slice).map_err(|_| lx::Error::EINVAL)
-            }
-
-            fn file_attributes(&self) -> u32 {
-                self.$attr
-            }
-
-            fn reparse_tag(&self) -> u32 {
-                self.$tag
-            }
-        }
-    };
-}
-
 // Implement DirectoryInformation for the structures which all have similar implementations.
-impl_default_dir_info!(
-    FILE_ID_64_EXTD_DIR_INFORMATION,
-    FileAttributes,
-    ReparsePointTag
-);
-impl_default_dir_info!(
-    FILE_ID_ALL_EXTD_DIR_INFORMATION,
-    FileAttributes,
-    ReparsePointTag
-);
-impl_default_dir_info!(
-    FileSystem::FILE_ID_FULL_DIR_INFORMATION,
-    FileAttributes,
-    EaSize
-);
-impl_default_dir_info!(
-    FileSystem::FILE_ID_BOTH_DIR_INFORMATION,
-    FileAttributes,
-    EaSize
+impl_directory_information!(
+    FILE_ID_64_EXTD_DIR_INFORMATION, FileAttributes, ReparsePointTag;
+    FILE_ID_ALL_EXTD_DIR_INFORMATION, FileAttributes, ReparsePointTag;
+    FileSystem::FILE_ID_FULL_DIR_INFORMATION, FileAttributes, EaSize;
+    FileSystem::FILE_ID_BOTH_DIR_INFORMATION, FileAttributes, EaSize;
 );
 
 impl DirectoryInformation for FileSystem::FILE_ID_EXTD_DIR_INFORMATION {

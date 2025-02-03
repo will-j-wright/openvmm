@@ -65,7 +65,6 @@ lx_errors! {
     EBADF = 9;
     ECHILD = 10;
     EAGAIN = 11;
-    EWOULDBLOCK = 11;
     ENOMEM = 12;
     EACCES = 13;
     EFAULT = 14;
@@ -94,7 +93,6 @@ lx_errors! {
     ELOOP = 40;
     EIDRM = 43;
     ENODATA = 61;
-    ENOATTR = 61;
     EPROTO = 71;
     EOVERFLOW = 75;
     EUSERS = 87;
@@ -105,7 +103,6 @@ lx_errors! {
     ENOPROTOOPT = 92;
     EPROTONOSUPPORT = 93;
     ESOCKTNOSUPPORT = 94;
-    EOPNOTSUPP = 95;
     ENOTSUP = 95;
     EAFNOSUPPORT = 97;
     EADDRINUSE = 98;

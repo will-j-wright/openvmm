@@ -80,8 +80,6 @@ pal::delayload!("lxutil.dll" {
         size: &mut ntdef::USHORT,
     ) -> ntioapi::PREPARSE_DATA_BUFFER;
 
-    pub fn LxUtilFsFileModeToReparseTag(mode: lx::mode_t) -> ntdef::ULONG;
-
     pub fn LxUtilFsGetFileSystemBlockSize(handle: RawHandle) -> ntdef::ULONG;
 
     pub fn LxUtilFsGetLxFileSystemAttributes(
