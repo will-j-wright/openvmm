@@ -90,7 +90,7 @@ fn char_needs_unescape(c: u16) -> bool {
 // Convert the path seperators from NT to LX.
 pub fn nt_path_to_lx_path(path: &UnicodeString) -> lx::Result<UnicodeString> {
     // Copy the path into a new UnicodeString
-    let new_path = UnicodeString::new(path.as_slice()).map_err(|_| lx::Error::EINVAL)?;
+    let mut new_path = UnicodeString::new(path.as_slice()).map_err(|_| lx::Error::EINVAL)?;
     let path_slice = new_path.as_mut_slice();
     for c in path_slice {
         if *c == '\\' as u16 {
@@ -117,7 +117,7 @@ pub fn unescape_path(path: &UnicodeString) -> lx::Result<Option<UnicodeString>> 
         Ok(None)
     } else {
         // Copy the path into a new UnicodeString
-        let new_path = UnicodeString::new(path_slice).map_err(|_| lx::Error::EINVAL)?;
+        let mut new_path = UnicodeString::new(path_slice).map_err(|_| lx::Error::EINVAL)?;
         let path_slice = new_path.as_mut_slice();
         for c in path_slice {
             if char_needs_unescape(*c) {
