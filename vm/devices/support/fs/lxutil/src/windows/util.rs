@@ -154,7 +154,6 @@ pub fn reopen_file(
 fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
     let mut client_token_raw = Foundation::HANDLE::default();
     let mut duplicate_token_raw = Foundation::HANDLE::default();
-    let client_token: OwnedHandle;
     // safety: Calling Win32 API as documented.
     let result = unsafe {
         check_status(FileSystem::NtOpenThreadToken(
@@ -186,7 +185,7 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
     //
     // safety: The validity of the handle has been checked by verifying
     // the success of the previous Win32 calls.
-    client_token = unsafe { OwnedHandle::from_raw_handle(client_token_raw.0) };
+    let client_token = unsafe { OwnedHandle::from_raw_handle(client_token_raw.0) };
 
     let mut token_statistics = Security::TOKEN_STATISTICS::default();
     let mut bytes_written: u32 = 0;
@@ -196,7 +195,7 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
         let _ = check_status(FileSystem::NtQueryInformationToken(
             client_token_raw,
             Security::TokenStatistics,
-            Some(&mut token_statistics as *mut Security::TOKEN_STATISTICS as *mut ffi::c_void),
+            Some((ptr::from_mut::<Security::TOKEN_STATISTICS>(&mut token_statistics)).cast()),
             size_of::<Security::TOKEN_STATISTICS>() as u32,
             &mut bytes_written,
         ))?;
@@ -205,21 +204,21 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
     // If it's not an impersonation token, create one.
     if token_statistics.TokenType != W32Sec::TokenImpersonation {
         let security_qos = W32Sec::SECURITY_QUALITY_OF_SERVICE {
-            Length: size_of::<W32Sec::SECURITY_QUALITY_OF_SERVICE> as u32,
+            Length: size_of::<W32Sec::SECURITY_QUALITY_OF_SERVICE>() as _,
             ImpersonationLevel: W32Sec::SecurityImpersonation,
-            ContextTrackingMode: W32Sec::SECURITY_DYNAMIC_TRACKING.0 as u8,
+            ContextTrackingMode: W32Sec::SECURITY_DYNAMIC_TRACKING.0,
             EffectiveOnly: false.into(),
         };
         let mut object_attributes = Wdk::Foundation::OBJECT_ATTRIBUTES::default();
         object_attributes.SecurityQualityOfService =
-            &security_qos as *const W32Sec::SECURITY_QUALITY_OF_SERVICE as *const ffi::c_void;
+            ptr::from_ref::<W32Sec::SECURITY_QUALITY_OF_SERVICE>(&security_qos).cast();
 
         // safety: Calling Win32 API as documented.
         unsafe {
             let _ = check_status(FileSystem::NtDuplicateToken(
                 client_token_raw,
                 W32Sec::TOKEN_QUERY.0,
-                Some(&mut object_attributes),
+                Some(&object_attributes),
                 Foundation::BOOLEAN(0),
                 W32Sec::TokenImpersonation,
                 &mut duplicate_token_raw,
@@ -258,7 +257,7 @@ pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32
                     | Security::GROUP_SECURITY_INFORMATION
                     | Security::DACL_SECURITY_INFORMATION)
                     .0,
-                Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut ffi::c_void),
+                Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr().cast()),
                 initial_size as u32,
                 &mut length_needed,
             ))
@@ -291,11 +290,11 @@ pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32
     // safety: calling Win32 API as documented.
     unsafe {
         W32Sec::AccessCheck(
-            Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut ffi::c_void),
+            Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr().cast()),
             Foundation::HANDLE(client_token.as_raw_handle()),
             desired_access,
             &generic_mapping,
-            Some(&mut privilege_set as *mut W32Sec::PRIVILEGE_SET),
+            Some(ptr::from_mut::<W32Sec::PRIVILEGE_SET>(&mut privilege_set)),
             &mut privilege_set_length,
             &mut granted_access,
             &mut access_status,
@@ -323,7 +322,7 @@ pub fn get_attributes_by_handle(
     handle: &OwnedHandle,
 ) -> lx::Result<LxStatInformation> {
     unsafe {
-        let stat = fs::query_stat_lx_information(handle, &fs_context)?;
+        let stat = fs::query_stat_lx_information(handle, fs_context)?;
 
         // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
         // determined based on the reparse data.
@@ -363,7 +362,7 @@ pub fn get_attributes(
         let pathu = dos_to_nt_path(root_handle, path)?;
 
         unsafe {
-            let stat = fs::query_stat_lx_information_by_name(&fs_context, root_handle, &pathu)?;
+            let stat = fs::query_stat_lx_information_by_name(fs_context, root_handle, &pathu)?;
 
             // For NT symlinks and V2 LX symlinks, the size of the file is not correct, and must be
             // determined based on the reparse data, which requires opening the file.
@@ -567,7 +566,7 @@ pub fn file_info_to_stat(
     block_size: ntdef::ULONG,
 ) -> lx::Result<lx::Stat> {
     let mut stat = fs::get_lx_attr(
-        &fs_context,
+        fs_context,
         &mut information.stat,
         api::LX_UTIL_FS_CALLER_HAS_TRAVERSE_PRIVILEGE,
         block_size,
@@ -659,7 +658,7 @@ pub fn query_information_file<T: FileInformationClass>(handle: &OwnedHandle) -> 
         let _ = check_status(FileSystem::NtQueryInformationFile(
             Foundation::HANDLE(handle.as_raw_handle()),
             &mut iosb,
-            buf as *mut ffi::c_void,
+            buf.cast(),
             len.try_into().unwrap(),
             info.file_information_class(),
         ))?;
@@ -686,7 +685,7 @@ pub fn query_information_file_by_name<T: FileInformationClass>(
     let obj_attr = Wdk::Foundation::OBJECT_ATTRIBUTES {
         Length: size_of::<Wdk::Foundation::OBJECT_ATTRIBUTES>() as _,
         RootDirectory: root_handle,
-        ObjectName: path.as_ptr() as *const _,
+        ObjectName: path.as_ptr().cast(),
         Attributes: Kernel::OBJ_FORCE_ACCESS_CHECK as _,
         SecurityDescriptor: ptr::null_mut(),
         SecurityQualityOfService: ptr::null_mut(),
@@ -698,7 +697,7 @@ pub fn query_information_file_by_name<T: FileInformationClass>(
         let _ = check_status(FileSystem::NtQueryInformationByName(
             &obj_attr,
             &mut iosb,
-            buf as *mut ffi::c_void,
+            buf.cast(),
             len.try_into().unwrap(),
             info.file_information_class(),
         ))?;
@@ -720,7 +719,7 @@ pub fn set_information_file<T: FileInformationClass>(
         let _ = check_status(FileSystem::NtSetInformationFile(
             Foundation::HANDLE(handle.as_raw_handle()),
             &mut iosb,
-            buf as *const ffi::c_void,
+            buf.cast(),
             len.try_into().unwrap(),
             info.file_information_class(),
         ))?;

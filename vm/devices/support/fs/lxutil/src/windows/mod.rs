@@ -67,7 +67,7 @@ impl VolumeState {
         &self,
         handle: &OwnedHandle,
     ) -> lx::Result<util::LxStatInformation> {
-        util::get_attributes_by_handle(&self.fs_context, &self, handle)
+        util::get_attributes_by_handle(&self.fs_context, self, handle)
     }
 
     pub fn get_attributes(
@@ -76,7 +76,7 @@ impl VolumeState {
         path: &Path,
         existing_handle: Option<&OwnedHandle>,
     ) -> lx::Result<util::LxStatInformation> {
-        util::get_attributes(&self.fs_context, &self, root_handle, path, existing_handle)
+        util::get_attributes(&self.fs_context, self, root_handle, path, existing_handle)
     }
 
     pub fn read_reparse_link(
@@ -430,13 +430,7 @@ impl LxVolume {
         let handle = self.open_file(path, winnt::FILE_READ_ATTRIBUTES | winnt::DELETE, 0)?;
 
         let flags = fs::RenameFlags::default();
-        let error = match fs::rename(
-            &handle,
-            &self.root,
-            &new_path,
-            &self.state.fs_context,
-            flags,
-        ) {
+        let error = match fs::rename(&handle, &self.root, new_path, &self.state.fs_context, flags) {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
@@ -466,13 +460,7 @@ impl LxVolume {
             }
 
             // Retry the rename.
-            fs::rename(
-                &handle,
-                &self.root,
-                &new_path,
-                &self.state.fs_context,
-                flags,
-            )?;
+            fs::rename(&handle, &self.root, new_path, &self.state.fs_context, flags)?;
         } else {
             return Err(error);
         }

@@ -13,7 +13,6 @@ use ::windows::Win32::System::SystemServices as W32Ss;
 use bitfield_struct::bitfield;
 use pal::windows::UnicodeString;
 use pal::HeaderVec;
-use std::ffi;
 use std::marker::PhantomData;
 use std::mem::offset_of;
 use std::os::windows::io::AsRawHandle;
@@ -122,14 +121,17 @@ impl FsContext {
             let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
                 Foundation::HANDLE(file_handle.as_raw_handle()),
                 &mut iosb,
-                fs_attributes.as_mut_ptr() as *mut _,
+                fs_attributes.as_mut_ptr().cast(),
                 fs_attributes.total_byte_capacity() as _,
                 FileSystem::FileFsAttributeInformation,
             ))?;
             let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
                 Foundation::HANDLE(file_handle.as_raw_handle()),
                 &mut iosb,
-                &mut device_info as *mut SystemServices::FILE_FS_DEVICE_INFORMATION as *mut _,
+                (std::ptr::from_mut::<SystemServices::FILE_FS_DEVICE_INFORMATION>(
+                    &mut device_info,
+                ))
+                .cast(),
                 size_of::<SystemServices::FILE_FS_DEVICE_INFORMATION>() as _,
                 FileSystem::FileFsDeviceInformation,
             ))?;
@@ -175,8 +177,8 @@ impl FsContext {
         determine_fallback_mode(file_handle, &mut flags, fallback_mode);
 
         // Determine if per-directory case-sensitivity is supported.
-        if let Ok(_) =
-            util::query_information_file::<FileSystem::FILE_CASE_SENSITIVE_INFORMATION>(file_handle)
+        if util::query_information_file::<FileSystem::FILE_CASE_SENSITIVE_INFORMATION>(file_handle)
+            .is_ok()
         {
             flags.set_supports_case_sensitive_dir(true);
         };
@@ -289,7 +291,7 @@ fn delete_file_core_non_posix(file_handle: &OwnedHandle) -> lx::Result<()> {
         DeleteFile: true.into(),
     };
 
-    util::set_information_file(&file_handle, &info)
+    util::set_information_file(file_handle, &info)
 }
 
 fn delete_file_core_posix(fs_context: &FsContext, file_handle: &OwnedHandle) -> lx::Result<()> {
@@ -312,7 +314,7 @@ fn delete_file_core_posix(fs_context: &FsContext, file_handle: &OwnedHandle) -> 
             );
         let info = FileSystem::FILE_DISPOSITION_INFORMATION_EX { Flags: flags };
 
-        let result = util::set_information_file(&file_handle, &info);
+        let result = util::set_information_file(file_handle, &info);
 
         match result {
             Ok(_) => return result,
@@ -526,7 +528,7 @@ pub fn allocation_size_to_block_count(allocation_size: i64, block_size: u32) -> 
 }
 
 /// Convert file information to a stat structure used by Linux.
-
+///
 /// N.B. This routine does not provide all fields. The file system's device ID
 /// is not provided.
 pub fn get_lx_attr(
@@ -605,7 +607,7 @@ pub fn query_stat_information(
             FileSystem::NtQueryInformationFile(
                 Foundation::HANDLE(file_handle.as_raw_handle()),
                 &mut iosb,
-                buf as *mut ffi::c_void,
+                buf.cast(),
                 len.try_into().unwrap(),
                 FileSystem::FileAllInformation,
             )
@@ -746,7 +748,7 @@ fn query_reparse_data(
             Ioctl::FSCTL_GET_REPARSE_POINT,
             None,
             0,
-            Some(reparse_buffer.as_mut_ptr() as *mut _),
+            Some(reparse_buffer.as_mut_ptr().cast()),
             reparse_buffer.total_byte_capacity() as u32,
         ))?;
         reparse_buffer.set_len(tail_size);
@@ -765,17 +767,17 @@ pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::R
     let (_, reparse_buffer) = query_reparse_data(file_handle)?;
 
     // safety: Accessing union field of type returned from Win32 API
-    let reparse_tag = unsafe { (*reparse_buffer).header.ReparseTag };
+    let reparse_tag = unsafe { reparse_buffer.header.ReparseTag };
     const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
 
     match reparse_tag {
         IO_REPARSE_TAG_LX_SYMLINK => {
             // safety: Accessing union field of type returned from Win32 API
-            let version = unsafe { (*reparse_buffer).data.symlink.version };
+            let version = unsafe { reparse_buffer.data.symlink.version };
             match version {
                 LX_UTIL_SYMLINK_DATA_VERSION_2 => {
                     // safety: Accessing union field of type returned from Win32 API
-                    let data_length = unsafe { (*reparse_buffer).header.ReparseDataLength };
+                    let data_length = unsafe { reparse_buffer.header.ReparseDataLength };
                     Ok(data_length as u32 - LX_UTIL_SYMLINK_TARGET_OFFSET)
                 }
                 _ => Err(lx::Error::EIO),
@@ -783,7 +785,7 @@ pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::R
         }
         W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
             // safety: Accessing union field of type returned from Win32 API)
-            let header = unsafe { &(*reparse_buffer).header };
+            let header = unsafe { &(reparse_buffer.header) };
             symlink::read_nt_symlink_length(header, state)
         }
         _ => Err(lx::Error::EIO),
@@ -799,7 +801,7 @@ pub fn read_reparse_link(
     let (iosb, reparse_buffer) = query_reparse_data(file_handle)?;
 
     // safety: Accessing union field of type returned from Win32 API
-    let reparse_tag = unsafe { (*reparse_buffer).header.ReparseTag };
+    let reparse_tag = unsafe { reparse_buffer.header.ReparseTag };
     const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
 
     match reparse_tag {
@@ -816,7 +818,7 @@ pub fn read_reparse_link(
                 }
                 LX_UTIL_SYMLINK_DATA_VERSION_2 => {
                     // safety: Accessing union field of type returned from Win32 API
-                    let data_length = unsafe { (*reparse_buffer).header.ReparseDataLength };
+                    let data_length = unsafe { reparse_buffer.header.ReparseDataLength };
                     let path_length = data_length - LX_UTIL_SYMLINK_TARGET_OFFSET as u16;
                     if iosb.Information < LX_UTIL_SYMLINK_REPARSE_BASE_SIZE as usize
                         || iosb.Information
@@ -824,7 +826,7 @@ pub fn read_reparse_link(
                     {
                         Err(lx::Error::EIO)
                     } else {
-                        if path_length as u16 > LX_PATH_MAX {
+                        if path_length > LX_PATH_MAX {
                             Err(lx::Error::EIO)
                         } else {
                             // Construct a UnicodeString from the u8 buffer
@@ -832,7 +834,7 @@ pub fn read_reparse_link(
                             // be valid by the Win32 API due to the previous checks
                             let wide_bytes: Vec<u16> = std::str::from_utf8(unsafe {
                                 std::slice::from_raw_parts(
-                                    (*reparse_buffer).data.symlink.target.as_ptr(),
+                                    reparse_buffer.data.symlink.target.as_ptr(),
                                     path_length as usize,
                                 )
                             })
@@ -852,8 +854,8 @@ pub fn read_reparse_link(
         }
         W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
             // safety: Accessing union field of type returned from Win32 API)
-            let header = unsafe { &(*reparse_buffer).header };
-            symlink::read_nt_symlink(header, state).map(|s| Some(s))
+            let header = unsafe { &(reparse_buffer.header) };
+            symlink::read_nt_symlink(header, state).map(Some)
         }
         _ => Err(lx::Error::EIO),
     }
@@ -866,10 +868,12 @@ fn determine_fallback_mode(
 ) {
     let empty_string = UnicodeString::new(&[]).unwrap();
     if fallback_mode == LX_DRVFS_DISABLE_NONE {
-        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
-            Some(&file_handle),
+        if util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
+            Some(file_handle),
             &empty_string,
-        ) {
+        )
+        .is_ok()
+        {
             flags.set_supports_query_by_name(true);
             flags.set_supports_stat_info(true);
             flags.set_supports_stat_lx_info(true);
@@ -877,10 +881,12 @@ fn determine_fallback_mode(
         };
 
         // FILE_STAT_LX_INFORMATION didn't work, so try it with FILE_STAT_INFORMATION.
-        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_INFORMATION>(
-            Some(&file_handle),
+        if util::query_information_file_by_name::<FileSystem::FILE_STAT_INFORMATION>(
+            Some(file_handle),
             &empty_string,
-        ) {
+        )
+        .is_ok()
+        {
             flags.set_supports_query_by_name(true);
             flags.set_supports_stat_info(true);
             return;
@@ -889,22 +895,25 @@ fn determine_fallback_mode(
 
     // Check if FILE_STAT_(LX_)INFORMATION is supported even if query by name is not.
     if fallback_mode < LX_DRVFS_DISABLE_QUERY_BY_NAME_AND_STAT_INFO {
-        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
-            Some(&file_handle),
+        if util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
+            Some(file_handle),
             &empty_string,
-        ) {
+        )
+        .is_ok()
+        {
             flags.set_supports_stat_info(true);
             flags.set_supports_stat_lx_info(true);
             return;
         };
 
-        if let Ok(_) = util::query_information_file_by_name::<FileSystem::FILE_STAT_INFORMATION>(
-            Some(&file_handle),
+        if util::query_information_file_by_name::<FileSystem::FILE_STAT_INFORMATION>(
+            Some(file_handle),
             &empty_string,
-        ) {
+        )
+        .is_ok()
+        {
             flags.set_supports_query_by_name(true);
             flags.set_supports_stat_info(true);
-            return;
         };
     }
 }

@@ -82,9 +82,8 @@ fn char_needs_escape(c: u8) -> bool {
 fn char_needs_unescape(c: u16) -> bool {
     // Not all characters within the range correspond to escaped characters,
     // so  make sure that the original character needed to be escaped.
-    return c >= PATH_ESCAPE_MIN
-        && c <= PATH_ESCAPE_MAX
-        && char_needs_escape((c - PATH_ESCAPE_MIN) as u8);
+    (PATH_ESCAPE_MIN..=PATH_ESCAPE_MAX).contains(&c)
+        && char_needs_escape((c - PATH_ESCAPE_MIN) as u8)
 }
 
 // Convert the path seperators from NT to LX.

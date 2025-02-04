@@ -32,6 +32,7 @@ struct DirectoryEnumeratorFlags {
 }
 
 // Some of these FileInformationClasses are missing from windows-rs.
+#[allow(clippy::enum_variant_names)]
 #[derive(PartialEq)]
 enum DirectoryEnumeratorFileInformationClass {
     FileId64ExtdDirectoryInformation,
@@ -325,18 +326,18 @@ impl DirectoryEnumerator {
             return Ok(None);
         }
 
-        if self.buffer_next_entry == ptr::null_mut() {
+        if self.buffer_next_entry.is_null() {
             let bytes_read = self.fill_buffer(handle, restart_scan)?;
 
             if bytes_read == 0 {
-                debug_assert!(self.buffer_next_entry == ptr::null_mut());
+                debug_assert!(self.buffer_next_entry.is_null());
 
                 self.flags.set_end_reached(true);
                 return Ok(None);
             }
         }
 
-        debug_assert!(self.buffer_next_entry != ptr::null_mut());
+        debug_assert!(!self.buffer_next_entry.is_null());
         let entry: &dyn DirectoryInformation = match self.file_information_class {
             DirectoryEnumeratorFileInformationClass::FileId64ExtdDirectoryInformation => {
                 self.get_next_entry::<FILE_ID_64_EXTD_DIR_INFORMATION>()?
@@ -373,7 +374,7 @@ impl DirectoryEnumerator {
 
     /// Fills the buffer of the enumerator. Returns the number of bytes read into the buffer.
     fn fill_buffer(&mut self, handle: &OwnedHandle, restart_scan: bool) -> lx::Result<u32> {
-        debug_assert!(self.buffer_next_entry == ptr::null_mut());
+        debug_assert!(self.buffer_next_entry.is_null());
 
         let mut raw_event = Foundation::HANDLE::default();
         let _event;
@@ -533,7 +534,7 @@ impl DirectoryEnumerator {
         }
 
         // safety: The pointer is aligned and will read within the buffer bounds.
-        unsafe { Ok(&mut *(ptr as *mut T)) }
+        unsafe { Ok(&mut *(ptr.cast())) }
     }
 
     fn get_next_entry<T>(&self) -> lx::Result<&mut T>
@@ -547,7 +548,7 @@ impl DirectoryEnumerator {
         }
 
         // safety: The pointer is aligned and will read within the buffer bounds.
-        unsafe { Ok(&mut *(self.buffer_next_entry as *mut T)) }
+        unsafe { Ok(&mut *(self.buffer_next_entry.cast())) }
     }
 
     /// Process a dir entry using a user-provided callback. Returns whether the user wants to continue.
@@ -589,7 +590,7 @@ impl DirectoryEnumerator {
 
     /// Advances the enumerator to the next entry.
     fn next(&mut self) -> lx::Result<()> {
-        debug_assert!(self.buffer != ptr::null_mut() && self.buffer_next_entry != ptr::null_mut());
+        debug_assert!(!self.buffer.is_null() && !self.buffer_next_entry.is_null());
 
         // If the end was previously reached, do nothing.
         if self.flags.end_reached() {
