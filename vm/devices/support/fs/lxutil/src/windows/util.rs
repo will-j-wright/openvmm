@@ -1352,13 +1352,6 @@ pub fn reparse_tag_to_file_type(reparse_tag: u32) -> u8 {
 
 /// Check if a UnicodeString is "." or ".."
 pub fn is_self_relative_unicode_path(path: &windows::UnicodeString) -> bool {
-    let slice = path.as_slice();
-    let dot = '.' as u16;
-    if slice.len() == 1 {
-        slice.starts_with(&[dot])
-    } else if slice.len() == 2 {
-        slice.starts_with(&[dot, dot])
-    } else {
-        false
-    }
+    const DOT: u16 = '.' as u16;
+    matches!(path.as_slice(), [DOT] | [DOT, DOT])
 }

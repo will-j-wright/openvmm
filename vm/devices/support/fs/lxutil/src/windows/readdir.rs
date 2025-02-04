@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use super::api;
 use super::fs;
 use super::util;
 use crate::windows::path;
 use bitfield_struct::bitfield;
 use pal::windows::UnicodeString;
+use pal::windows::UnicodeStringRef;
 use std::ffi;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
@@ -44,56 +46,17 @@ enum DirectoryEnumeratorFileInformationClass {
     FileDirectoryInformation,
 }
 
-#[allow(non_camel_case_types, non_snake_case, unused)]
-#[repr(C)]
-struct FILE_ID_64_EXTD_DIR_INFORMATION {
-    pub NextEntryOffset: u32,
-    pub FileIndex: u32,
-    pub CreationTime: i64,
-    pub LastAccessTime: i64,
-    pub LastWriteTime: i64,
-    pub ChangeTime: i64,
-    pub EndOfFile: i64,
-    pub AllocationSize: i64,
-    pub FileAttributes: u32,
-    pub FileNameLength: u32,
-    pub EaSize: u32,
-    pub ReparsePointTag: u32,
-    pub FileId: i64,
-    pub FileName: [u16; 1],
-}
-
-#[allow(non_camel_case_types, non_snake_case, unused)]
-#[repr(C)]
-struct FILE_ID_ALL_EXTD_DIR_INFORMATION {
-    pub NextEntryOffset: u32,
-    pub FileIndex: u32,
-    pub CreationTime: i64,
-    pub LastAccessTime: i64,
-    pub LastWriteTime: i64,
-    pub ChangeTime: i64,
-    pub EndOfFile: i64,
-    pub AllocationSize: i64,
-    pub FileAttributes: u32,
-    pub FileNameLength: u32,
-    pub EaSize: u32,
-    pub ReparsePointTag: u32,
-    pub FileId: i64,
-    pub FileId128: W32Fs::FILE_ID_128,
-    pub FileName: [u16; 1],
-}
-
 trait DirectoryInformation {
     fn file_id(&self) -> i64;
-    fn file_name(&self) -> lx::Result<UnicodeString>;
+    fn file_name(&self) -> lx::Result<UnicodeStringRef<'_>>;
     fn file_attributes(&self) -> u32;
     fn reparse_tag(&self) -> u32;
 }
 
 // Implement DirectoryInformation for the structures which all have similar implementations.
 impl_directory_information!(
-    FILE_ID_64_EXTD_DIR_INFORMATION, FileAttributes, ReparsePointTag;
-    FILE_ID_ALL_EXTD_DIR_INFORMATION, FileAttributes, ReparsePointTag;
+    api::FILE_ID_64_EXTD_DIR_INFORMATION, FileAttributes, ReparsePointTag;
+    api::FILE_ID_ALL_EXTD_DIR_INFORMATION, FileAttributes, ReparsePointTag;
     FileSystem::FILE_ID_FULL_DIR_INFORMATION, FileAttributes, EaSize;
     FileSystem::FILE_ID_BOTH_DIR_INFORMATION, FileAttributes, EaSize;
 );
@@ -104,7 +67,7 @@ impl DirectoryInformation for FileSystem::FILE_ID_EXTD_DIR_INFORMATION {
         i64::from_ne_bytes(*self.FileId.Identifier.first_chunk::<8>().unwrap())
     }
 
-    fn file_name(&self) -> Result<UnicodeString, lx::Error> {
+    fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
         // safety: A properly constructed struct will contain the name in a buffer at the end.
         let name_slice = unsafe {
             std::slice::from_raw_parts(
@@ -112,7 +75,7 @@ impl DirectoryInformation for FileSystem::FILE_ID_EXTD_DIR_INFORMATION {
                 self.FileNameLength as usize / size_of::<u16>(),
             )
         };
-        UnicodeString::new(name_slice).map_err(|_| lx::Error::EINVAL)
+        UnicodeStringRef::new(name_slice).ok_or(lx::Error::EINVAL)
     }
 
     fn file_attributes(&self) -> u32 {
@@ -129,7 +92,7 @@ impl DirectoryInformation for FileSystem::FILE_FULL_DIR_INFORMATION {
         0
     }
 
-    fn file_name(&self) -> Result<UnicodeString, lx::Error> {
+    fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
         // safety: A properly constructed struct will contain the name in a buffer at the end.
         let name_slice = unsafe {
             std::slice::from_raw_parts(
@@ -137,7 +100,7 @@ impl DirectoryInformation for FileSystem::FILE_FULL_DIR_INFORMATION {
                 self.FileNameLength as usize / size_of::<u16>(),
             )
         };
-        UnicodeString::new(name_slice).map_err(|_| lx::Error::EINVAL)
+        UnicodeStringRef::new(name_slice).ok_or(lx::Error::EINVAL)
     }
 
     fn file_attributes(&self) -> u32 {
@@ -154,7 +117,7 @@ impl DirectoryInformation for FileSystem::FILE_DIRECTORY_INFORMATION {
         0
     }
 
-    fn file_name(&self) -> Result<UnicodeString, lx::Error> {
+    fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
         // safety: A properly constructed struct will contain the name in a buffer at the end.
         let name_slice = unsafe {
             std::slice::from_raw_parts(
@@ -162,7 +125,7 @@ impl DirectoryInformation for FileSystem::FILE_DIRECTORY_INFORMATION {
                 self.FileNameLength as usize / size_of::<u16>(),
             )
         };
-        UnicodeString::new(name_slice).map_err(|_| lx::Error::EINVAL)
+        UnicodeStringRef::new(name_slice).ok_or(lx::Error::EINVAL)
     }
 
     fn file_attributes(&self) -> u32 {
@@ -276,11 +239,10 @@ impl DirectoryEnumerator {
                 }
             };
 
-            let file_name = match path::unescape_path(&file_info.file_name)? {
-                Some(s) => s,
-                // The path didn't need to be unescaped.
-                None => file_info.file_name,
-            };
+            // Unescape the LX path.
+            let mut file_name =
+                UnicodeString::new(file_info.file_name.as_slice()).map_err(|_| lx::Error::EIO)?;
+            path::unescape_path(file_name.as_mut_slice());
 
             let result = self.process_dir_entry(
                 callback,
@@ -340,10 +302,10 @@ impl DirectoryEnumerator {
         debug_assert!(!self.buffer_next_entry.is_null());
         let entry: &dyn DirectoryInformation = match self.file_information_class {
             DirectoryEnumeratorFileInformationClass::FileId64ExtdDirectoryInformation => {
-                self.get_next_entry::<FILE_ID_64_EXTD_DIR_INFORMATION>()?
+                self.get_next_entry::<api::FILE_ID_64_EXTD_DIR_INFORMATION>()?
             }
             DirectoryEnumeratorFileInformationClass::FileIdAllExtdDirectoryInformation => {
-                self.get_next_entry::<FILE_ID_ALL_EXTD_DIR_INFORMATION>()?
+                self.get_next_entry::<api::FILE_ID_ALL_EXTD_DIR_INFORMATION>()?
             }
             DirectoryEnumeratorFileInformationClass::FileIdExtdDirectoryInformation => {
                 self.get_next_entry::<FileSystem::FILE_ID_EXTD_DIR_INFORMATION>()?
@@ -362,9 +324,12 @@ impl DirectoryEnumerator {
             }
         };
 
+        let file_name =
+            UnicodeString::new(entry.file_name()?.as_slice()).map_err(|_| lx::Error::EIO)?;
+
         let file_info = FileDirectoryInformation {
             file_id: entry.file_id(),
-            file_name: entry.file_name()?,
+            file_name,
             file_attributes: entry.file_attributes(),
             reparse_tag: entry.reparse_tag(),
         };

@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use pal::windows::UnicodeString;
 use std::borrow::Cow;
 use std::path::Path;
 use std::str;
@@ -86,47 +85,14 @@ fn char_needs_unescape(c: u16) -> bool {
         && char_needs_escape((c - PATH_ESCAPE_MIN) as u8)
 }
 
-// Convert the path seperators from NT to LX.
-pub fn nt_path_to_lx_path(path: &UnicodeString) -> lx::Result<UnicodeString> {
-    // Copy the path into a new UnicodeString
-    let mut new_path = UnicodeString::new(path.as_slice()).map_err(|_| lx::Error::EINVAL)?;
-    let path_slice = new_path.as_mut_slice();
-    for c in path_slice {
-        if *c == '\\' as u16 {
+// Unescape a path.
+pub fn unescape_path(path: &mut [u16]) {
+    for c in path {
+        if char_needs_unescape(*c) {
+            *c -= PATH_ESCAPE_MIN;
+        } else if *c == '\\' as u16 {
             *c = '/' as u16;
         }
-    }
-
-    Ok(new_path)
-}
-
-// Unescape a path. This function is only used in the lxutil implementation,
-// so the parameter and return types are `UnicodeString`s rather than `Path`s.
-// This also makes the conversion a lot simpler, as the conversions use a
-// single u16 value to represent the escape codepoint.
-//
-// If the path doesn't need unescaping, return None.
-pub fn unescape_path(path: &UnicodeString) -> lx::Result<Option<UnicodeString>> {
-    // Convert from UTF-16 UNICODE_STRING to String
-    let path_slice = path.as_slice();
-    let needs_unescape = path_slice.iter().any(|c| char_needs_unescape(*c));
-
-    // If the path doesn't need to be unescaped, return the original path.
-    if !needs_unescape {
-        Ok(None)
-    } else {
-        // Copy the path into a new UnicodeString
-        let mut new_path = UnicodeString::new(path_slice).map_err(|_| lx::Error::EINVAL)?;
-        let path_slice = new_path.as_mut_slice();
-        for c in path_slice {
-            if char_needs_unescape(*c) {
-                *c -= PATH_ESCAPE_MIN;
-            } else if *c == '/' as u16 {
-                *c = '\\' as u16;
-            }
-        }
-
-        Ok(Some(new_path))
     }
 }
 
@@ -271,28 +237,19 @@ mod tests {
     use pal::windows::UnicodeString;
 
     #[test]
-    fn to_lx() {
-        let path1 = "test".try_into().unwrap();
-        let path2 = "test\\test".try_into().unwrap();
-        let path2_expected: UnicodeString = "test/test".try_into().unwrap();
-
-        let lx_path1 = nt_path_to_lx_path(&path1).unwrap();
-        let lx_path2 = nt_path_to_lx_path(&path2).unwrap();
-
-        assert_eq!(path1.as_slice(), lx_path1.as_slice());
-        assert_eq!(path2_expected.as_slice(), lx_path2.as_slice());
-    }
-
-    #[test]
     fn unescape() {
-        let path1 = "test".try_into().unwrap();
-        let path2 = "foo\u{f03a}bar".try_into().unwrap();
+        let mut path1: UnicodeString = "test".try_into().unwrap();
+        let mut path2: UnicodeString = "foo\u{f03a}bar".try_into().unwrap();
+        let mut path3: UnicodeString = "foo\\bar".try_into().unwrap();
+        let path1_expected: UnicodeString = "test".try_into().unwrap();
         let path2_expected: UnicodeString = "foo:bar".try_into().unwrap();
+        let path3_expected: UnicodeString = "foo/bar".try_into().unwrap();
 
-        assert!(unescape_path(&path1).unwrap().is_none()); // Path doesn't need to be unescaped
-        assert_eq!(
-            unescape_path(&path2).unwrap().unwrap().as_slice(),
-            path2_expected.as_slice()
-        );
+        unescape_path(path1.as_mut_slice());
+        unescape_path(path2.as_mut_slice());
+        unescape_path(path3.as_mut_slice());
+        assert_eq!(path1.as_slice(), path1_expected.as_slice());
+        assert_eq!(path2.as_slice(), path2_expected.as_slice());
+        assert_eq!(path3.as_slice(), path3_expected.as_slice());
     }
 }

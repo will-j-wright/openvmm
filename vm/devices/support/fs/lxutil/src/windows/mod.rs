@@ -22,6 +22,7 @@ use ::windows::Wdk::System::SystemServices;
 use ::windows::Win32::Foundation;
 use ntapi::ntioapi;
 use pal::windows;
+use pal::windows::UnicodeString;
 use parking_lot::Mutex;
 use std::ffi;
 use std::mem;
@@ -79,10 +80,7 @@ impl VolumeState {
         util::get_attributes(&self.fs_context, self, root_handle, path, existing_handle)
     }
 
-    pub fn read_reparse_link(
-        &self,
-        handle: &OwnedHandle,
-    ) -> lx::Result<Option<windows::UnicodeString>> {
+    pub fn read_reparse_link(&self, handle: &OwnedHandle) -> lx::Result<Option<String>> {
         fs::read_reparse_link(handle, self)
     }
 }
@@ -320,7 +318,7 @@ impl LxVolume {
 
         // Open the file to read its reparse data.
         let mut handle = self.open_file(path, winnt::FILE_READ_ATTRIBUTES, 0)?;
-        let mut target = windows::UnicodeString::empty();
+        let mut target = String::new();
         unsafe {
             // Try to read the link target from the reparse data.
             let target_string = self.state.read_reparse_link(&handle)?;
@@ -340,18 +338,18 @@ impl LxVolume {
                     winnt::FILE_READ_ATTRIBUTES | winnt::FILE_READ_DATA,
                 )?;
 
+                let mut wide_target = UnicodeString::empty();
+
                 util::check_lx_error(api::LxUtilSymlinkRead(
                     handle.as_raw_handle(),
-                    target.as_mut_ptr(),
+                    wide_target.as_mut_ptr(),
                 ))?;
+
+                target = String::from_utf16(wide_target.as_slice()).map_err(|_| lx::Error::EIO)?;
             }
         }
 
-        let target = String::from_utf16(target.as_slice())
-            .map_err(|_| lx::Error::EINVAL)?
-            .into();
-
-        Ok(target)
+        Ok(target.into())
     }
 
     pub fn unlink(&self, path: &Path, flags: i32) -> lx::Result<()> {

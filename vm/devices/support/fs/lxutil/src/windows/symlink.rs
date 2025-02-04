@@ -2,14 +2,14 @@
 // Licensed under the MIT License.
 
 use pal::windows::UnicodeString;
-use widestring::U16CString;
+use pal::windows::UnicodeStringRef;
 use windows::Wdk::Storage::FileSystem;
 use windows::Win32::System::SystemServices as W32Ss;
 
 /// Get the symlink substitute name and flags from the reparse data.
 fn get_substitute_name(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
-) -> lx::Result<(UnicodeString, u32)> {
+) -> lx::Result<(UnicodeStringRef<'_>, u32)> {
     // safety: Caller guarantees that the reparse data buffer is well-formed.
     let (buffer, offset, length, flags) = unsafe {
         match reparse.ReparseTag {
@@ -44,11 +44,11 @@ fn get_substitute_name(
     // safety: The validity of the reparse buffer is provided by the caller. If the buffer is valid,
     // the area pointed to by `buffer + offset` is a valid wstring of length `length`, and this operation is safe.
     let substitute_name = unsafe {
-        UnicodeString::new(std::slice::from_raw_parts(
+        UnicodeStringRef::new(std::slice::from_raw_parts(
             buffer.as_ptr().byte_offset(offset as _),
             (length as usize) / size_of::<u16>(),
         ))
-        .map_err(|_| lx::Error::EIO)?
+        .ok_or(lx::Error::EIO)?
     };
 
     Ok((substitute_name, flags))
@@ -56,9 +56,9 @@ fn get_substitute_name(
 
 /// Translates an absolute NT symlink target to an LX path.
 fn translate_absolute_target(
-    substitute_name: &UnicodeString,
+    substitute_name: &UnicodeStringRef<'_>,
     state: &super::VolumeState,
-) -> lx::Result<UnicodeString> {
+) -> lx::Result<String> {
     if state.options.sandbox || state.options.symlink_root.is_empty() {
         // EPERM is the default return value if no callback is provided
         return Err(lx::Error::EPERM);
@@ -104,14 +104,6 @@ fn translate_absolute_target(
     let (_, name) = name.split_at(2);
     let name = name.replace('\\', "/");
     let target = format!("{}{}{}", &state.options.symlink_root, drive_letter, name);
-    let target = match U16CString::from_str(target) {
-        Ok(val) => val,
-        Err(_) => return Err(lx::Error::EIO),
-    };
-    let target = match UnicodeString::new(target.as_ref()) {
-        Ok(val) => val,
-        Err(_) => return Err(lx::Error::EIO),
-    };
 
     Ok(target)
 }
@@ -120,17 +112,17 @@ fn translate_absolute_target(
 pub fn read_nt_symlink(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
     state: &super::VolumeState,
-) -> lx::Result<UnicodeString> {
+) -> lx::Result<String> {
     let (substitute_name, flags) = get_substitute_name(reparse)?;
 
     if flags & FileSystem::SYMLINK_FLAG_RELATIVE == 0 {
         translate_absolute_target(&substitute_name, state)
     } else {
-        if let Some(path) = super::path::unescape_path(&substitute_name)? {
-            Ok(path)
-        } else {
-            Ok(super::path::nt_path_to_lx_path(&substitute_name)?)
-        }
+        let mut name =
+            UnicodeString::new(substitute_name.as_slice()).map_err(|_| lx::Error::EIO)?;
+        super::path::unescape_path(name.as_mut_slice());
+
+        String::from_utf16(name.as_slice()).map_err(|_| lx::Error::EIO)
     }
 }
 
@@ -140,8 +132,5 @@ pub fn read_nt_symlink_length(
     state: &super::VolumeState,
 ) -> lx::Result<u32> {
     // The length is just the target's UTF-8 length.
-    let target = read_nt_symlink(reparse, state)?;
-    Ok(String::from_utf16(target.as_slice())
-        .map_err(|_| lx::Error::EIO)?
-        .len() as u32)
+    Ok(read_nt_symlink(reparse, state)?.len() as _)
 }

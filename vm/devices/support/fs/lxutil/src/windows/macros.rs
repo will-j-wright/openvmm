@@ -12,7 +12,7 @@ macro_rules! impl_directory_information {
                 self.FileId
             }
 
-            fn file_name(&self) -> Result<UnicodeString, lx::Error> {
+            fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
                 // safety: A properly constructed struct will contain the name in a buffer at the end.
                 let name_slice = unsafe {
                     std::slice::from_raw_parts(
@@ -20,7 +20,7 @@ macro_rules! impl_directory_information {
                         self.FileNameLength as usize / size_of::<u16>(),
                     )
                 };
-                UnicodeString::new(name_slice).map_err(|_| lx::Error::EINVAL)
+                UnicodeStringRef::new(name_slice).ok_or(lx::Error::EINVAL)
             }
 
             fn file_attributes(&self) -> u32 {

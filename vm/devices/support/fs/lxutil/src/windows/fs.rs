@@ -797,7 +797,7 @@ pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::R
 pub fn read_reparse_link(
     file_handle: &OwnedHandle,
     state: &VolumeState,
-) -> lx::Result<Option<UnicodeString>> {
+) -> lx::Result<Option<String>> {
     let (iosb, reparse_buffer) = query_reparse_data(file_handle)?;
 
     // safety: Accessing union field of type returned from Win32 API
@@ -829,23 +829,17 @@ pub fn read_reparse_link(
                         if path_length > LX_PATH_MAX {
                             Err(lx::Error::EIO)
                         } else {
-                            // Construct a UnicodeString from the u8 buffer
                             // safety: The section of memory used to construct the string is guaranteed to
                             // be valid by the Win32 API due to the previous checks
-                            let wide_bytes: Vec<u16> = std::str::from_utf8(unsafe {
+                            let str = std::str::from_utf8(unsafe {
                                 std::slice::from_raw_parts(
                                     reparse_buffer.data.symlink.target.as_ptr(),
                                     path_length as usize,
                                 )
                             })
-                            .map_err(|_| lx::Error::EIO)?
-                            .encode_utf16()
-                            .collect();
+                            .map_err(|_| lx::Error::EIO)?;
 
-                            Ok(Some(
-                                UnicodeString::new(wide_bytes.as_slice())
-                                    .map_err(|_| lx::Error::EIO)?,
-                            ))
+                            Ok(Some(str.to_string()))
                         }
                     }
                 }
@@ -866,7 +860,7 @@ fn determine_fallback_mode(
     flags: &mut FsCompatibilityFlags,
     fallback_mode: u32,
 ) {
-    let empty_string = UnicodeString::new(&[]).unwrap();
+    let empty_string = UnicodeString::empty();
     if fallback_mode == LX_DRVFS_DISABLE_NONE {
         if util::query_information_file_by_name::<FileSystem::FILE_STAT_LX_INFORMATION>(
             Some(file_handle),
