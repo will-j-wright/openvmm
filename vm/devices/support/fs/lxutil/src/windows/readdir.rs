@@ -240,9 +240,7 @@ impl DirectoryEnumerator {
             };
 
             // Unescape the LX path.
-            let mut file_name =
-                UnicodeString::new(file_info.file_name.as_slice()).map_err(|_| lx::Error::EIO)?;
-            path::unescape_path(file_name.as_mut_slice());
+            let file_name = path::unescape_path(file_info.file_name.as_slice())?;
 
             let result = self.process_dir_entry(
                 callback,
@@ -522,20 +520,12 @@ impl DirectoryEnumerator {
         callback: &mut F,
         offset: &mut lx::off_t,
         file_id: i64,
-        name: &UnicodeString,
+        name: &String,
         entry_type: u8,
     ) -> lx::Result<bool>
     where
         F: FnMut(lx::DirEntry) -> lx::Result<bool>,
     {
-        let name = match String::from_utf16(name.as_slice()) {
-            Ok(s) => s,
-            // If the name is invalid UTF-16, skip the entry.
-            Err(_) => {
-                return Ok(true);
-            }
-        };
-
         let entry = lx::DirEntry {
             name: name.into(),
             inode_nr: file_id as _,

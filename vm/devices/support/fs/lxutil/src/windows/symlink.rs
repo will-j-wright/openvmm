@@ -120,9 +120,8 @@ pub fn read_nt_symlink(
     } else {
         let mut name =
             UnicodeString::new(substitute_name.as_slice()).map_err(|_| lx::Error::EIO)?;
-        super::path::unescape_path(name.as_mut_slice());
 
-        String::from_utf16(name.as_slice()).map_err(|_| lx::Error::EIO)
+        super::path::unescape_path(name.as_mut_slice())
     }
 }
 

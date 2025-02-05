@@ -86,14 +86,18 @@ fn char_needs_unescape(c: u16) -> bool {
 }
 
 // Unescape a path.
-pub fn unescape_path(path: &mut [u16]) {
-    for c in path {
+pub fn unescape_path(path: &[u16]) -> lx::Result<String> {
+    char::decode_utf16(path.iter().map(|c| {
         if char_needs_unescape(*c) {
-            *c -= PATH_ESCAPE_MIN;
-        } else if *c == '\\' as u16 {
-            *c = '/' as u16;
+            *c - PATH_ESCAPE_MIN
+        } else if (*c) == '\\' as u16 {
+            '/' as u16
+        } else {
+            *c
         }
-    }
+    }))
+    .map(|c| c.map_err(|_| lx::Error::EIO))
+    .collect()
 }
 
 // List indicating which characters are legal in NTFS. This was adapted from
@@ -241,15 +245,15 @@ mod tests {
         let mut path1: UnicodeString = "test".try_into().unwrap();
         let mut path2: UnicodeString = "foo\u{f03a}bar".try_into().unwrap();
         let mut path3: UnicodeString = "foo\\bar".try_into().unwrap();
-        let path1_expected: UnicodeString = "test".try_into().unwrap();
-        let path2_expected: UnicodeString = "foo:bar".try_into().unwrap();
-        let path3_expected: UnicodeString = "foo/bar".try_into().unwrap();
+        let path1_expected = "test";
+        let path2_expected = "foo:bar";
+        let path3_expected = "foo/bar";
 
-        unescape_path(path1.as_mut_slice());
-        unescape_path(path2.as_mut_slice());
-        unescape_path(path3.as_mut_slice());
-        assert_eq!(path1.as_slice(), path1_expected.as_slice());
-        assert_eq!(path2.as_slice(), path2_expected.as_slice());
-        assert_eq!(path3.as_slice(), path3_expected.as_slice());
+        let new_path1 = unescape_path(path1.as_mut_slice()).unwrap();
+        let new_path2 = unescape_path(path2.as_mut_slice()).unwrap();
+        let new_path3 = unescape_path(path3.as_mut_slice()).unwrap();
+        assert_eq!(new_path1, path1_expected);
+        assert_eq!(new_path2, path2_expected);
+        assert_eq!(new_path3, path3_expected);
     }
 }
