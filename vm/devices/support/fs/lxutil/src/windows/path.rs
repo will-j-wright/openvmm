@@ -245,15 +245,12 @@ mod tests {
         let mut path1: UnicodeString = "test".try_into().unwrap();
         let mut path2: UnicodeString = "foo\u{f03a}bar".try_into().unwrap();
         let mut path3: UnicodeString = "foo\\bar".try_into().unwrap();
-        let path1_expected = "test";
-        let path2_expected = "foo:bar";
-        let path3_expected = "foo/bar";
 
         let new_path1 = unescape_path(path1.as_mut_slice()).unwrap();
         let new_path2 = unescape_path(path2.as_mut_slice()).unwrap();
         let new_path3 = unescape_path(path3.as_mut_slice()).unwrap();
-        assert_eq!(new_path1, path1_expected);
-        assert_eq!(new_path2, path2_expected);
-        assert_eq!(new_path3, path3_expected);
+        assert_eq!(new_path1, "test");
+        assert_eq!(new_path2, "foo:bar");
+        assert_eq!(new_path3, "foo/bar");
     }
 }
