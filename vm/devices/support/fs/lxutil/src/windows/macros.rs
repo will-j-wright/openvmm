@@ -13,7 +13,7 @@ macro_rules! impl_directory_information {
             }
 
             fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
-                // safety: A properly constructed struct will contain the name in a buffer at the end.
+                // SAFETY: A properly constructed struct will contain the name in a buffer at the end.
                 let name_slice = unsafe {
                     std::slice::from_raw_parts(
                         self.FileName.as_ptr(),

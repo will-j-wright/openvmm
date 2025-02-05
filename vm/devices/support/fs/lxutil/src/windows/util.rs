@@ -154,7 +154,7 @@ pub fn reopen_file(
 fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
     let mut client_token_raw = Foundation::HANDLE::default();
     let mut duplicate_token_raw = Foundation::HANDLE::default();
-    // safety: Calling Win32 API as documented.
+    // SAFETY: Calling Win32 API as documented.
     let result = unsafe {
         check_status(FileSystem::NtOpenThreadToken(
             Threading::GetCurrentThread(),
@@ -167,7 +167,7 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
     if let Err(e) = result {
         // Use the process token if there's no token.
         if e.value() == Foundation::STATUS_NO_TOKEN.0 {
-            // safety: Calling Win32 API as documented.
+            // SAFETY: Calling Win32 API as documented.
             unsafe {
                 let _ = check_status(FileSystem::NtOpenProcessToken(
                     Threading::GetCurrentProcess(),
@@ -183,14 +183,14 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
     // Create the RAII handle now so it gets closed on drop if we need
     // to create a duplicate token.
     //
-    // safety: The validity of the handle has been checked by verifying
+    // SAFETY: The validity of the handle has been checked by verifying
     // the success of the previous Win32 calls.
     let client_token = unsafe { OwnedHandle::from_raw_handle(client_token_raw.0) };
 
     let mut token_statistics = Security::TOKEN_STATISTICS::default();
     let mut bytes_written: u32 = 0;
     // Make sure that it's an impersonation token (NtAccessCheck requires one).
-    // safety: Calling Win32 API as documented.
+    // SAFETY: Calling Win32 API as documented.
     unsafe {
         let _ = check_status(FileSystem::NtQueryInformationToken(
             client_token_raw,
@@ -213,7 +213,7 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
         object_attributes.SecurityQualityOfService =
             ptr::from_ref::<W32Sec::SECURITY_QUALITY_OF_SERVICE>(&security_qos).cast();
 
-        // safety: Calling Win32 API as documented.
+        // SAFETY: Calling Win32 API as documented.
         unsafe {
             let _ = check_status(FileSystem::NtDuplicateToken(
                 client_token_raw,
@@ -271,7 +271,7 @@ pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32
         }
     }
 
-    // safety: The tail elements are guaranteed to be initialized.
+    // SAFETY: The tail elements are guaranteed to be initialized.
     unsafe {
         sd.set_len(length_needed as usize - size_of::<Security::SECURITY_DESCRIPTOR>());
     }
@@ -287,7 +287,7 @@ pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32
     let mut granted_access = 0;
     let mut access_status = Foundation::BOOL::default();
 
-    // safety: calling Win32 API as documented.
+    // SAFETY: calling Win32 API as documented.
     unsafe {
         W32Sec::AccessCheck(
             Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr().cast()),

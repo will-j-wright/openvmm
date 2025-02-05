@@ -116,7 +116,7 @@ impl FsContext {
             HeaderVec::with_capacity(Default::default(), LX_UTIL_FS_NAME_LENGTH);
         let mut device_info = SystemServices::FILE_FS_DEVICE_INFORMATION::default();
 
-        // safety: Calling Win32 API as documented
+        // SAFETY: Calling Win32 API as documented
         unsafe {
             let _ = util::check_status(FileSystem::NtQueryVolumeInformationFile(
                 Foundation::HANDLE(file_handle.as_raw_handle()),
@@ -737,7 +737,7 @@ fn query_reparse_data(
         HeaderVec::<SymlinkReparse, [u8; 1]>::with_capacity(SymlinkReparse::default(), tail_size);
     let mut iosb = Default::default();
 
-    // safety: calling Win32 API as documented.
+    // SAFETY: calling Win32 API as documented.
     unsafe {
         let _ = util::check_status(FileSystem::NtFsControlFile(
             Foundation::HANDLE(file_handle.as_raw_handle()),
@@ -766,17 +766,17 @@ fn query_reparse_data(
 pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::Result<u32> {
     let (_, reparse_buffer) = query_reparse_data(file_handle)?;
 
-    // safety: Accessing union field of type returned from Win32 API
+    // SAFETY: Accessing union field of type returned from Win32 API
     let reparse_tag = unsafe { reparse_buffer.header.ReparseTag };
     const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
 
     match reparse_tag {
         IO_REPARSE_TAG_LX_SYMLINK => {
-            // safety: Accessing union field of type returned from Win32 API
+            // SAFETY: Accessing union field of type returned from Win32 API
             let version = unsafe { reparse_buffer.data.symlink.version };
             match version {
                 LX_UTIL_SYMLINK_DATA_VERSION_2 => {
-                    // safety: Accessing union field of type returned from Win32 API
+                    // SAFETY: Accessing union field of type returned from Win32 API
                     let data_length = unsafe { reparse_buffer.header.ReparseDataLength };
                     Ok(data_length as u32 - LX_UTIL_SYMLINK_TARGET_OFFSET)
                 }
@@ -784,7 +784,7 @@ pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::R
             }
         }
         W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
-            // safety: Accessing union field of type returned from Win32 API)
+            // SAFETY: Accessing union field of type returned from Win32 API)
             let header = unsafe { &(reparse_buffer.header) };
             symlink::read_nt_symlink_length(header, state)
         }
@@ -800,13 +800,13 @@ pub fn read_reparse_link(
 ) -> lx::Result<Option<String>> {
     let (iosb, reparse_buffer) = query_reparse_data(file_handle)?;
 
-    // safety: Accessing union field of type returned from Win32 API
+    // SAFETY: Accessing union field of type returned from Win32 API
     let reparse_tag = unsafe { reparse_buffer.header.ReparseTag };
     const IO_REPARSE_TAG_LX_SYMLINK: u32 = FileSystem::IO_REPARSE_TAG_LX_SYMLINK as u32;
 
     match reparse_tag {
         IO_REPARSE_TAG_LX_SYMLINK => {
-            // safety: Accessing union field of type returned from Win32 API
+            // SAFETY: Accessing union field of type returned from Win32 API
             let version = unsafe { (*reparse_buffer).data.symlink.version };
             match version {
                 LX_UTIL_SYMLINK_DATA_VERSION_1 => {
@@ -817,7 +817,7 @@ pub fn read_reparse_link(
                     }
                 }
                 LX_UTIL_SYMLINK_DATA_VERSION_2 => {
-                    // safety: Accessing union field of type returned from Win32 API
+                    // SAFETY: Accessing union field of type returned from Win32 API
                     let data_length = unsafe { reparse_buffer.header.ReparseDataLength };
                     let path_length = data_length - LX_UTIL_SYMLINK_TARGET_OFFSET as u16;
                     if iosb.Information < LX_UTIL_SYMLINK_REPARSE_BASE_SIZE as usize
@@ -829,7 +829,7 @@ pub fn read_reparse_link(
                         if path_length > LX_PATH_MAX {
                             Err(lx::Error::EIO)
                         } else {
-                            // safety: The section of memory used to construct the string is guaranteed to
+                            // SAFETY: The section of memory used to construct the string is guaranteed to
                             // be valid by the Win32 API due to the previous checks
                             let str = std::str::from_utf8(unsafe {
                                 std::slice::from_raw_parts(
@@ -847,7 +847,7 @@ pub fn read_reparse_link(
             }
         }
         W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
-            // safety: Accessing union field of type returned from Win32 API)
+            // SAFETY: Accessing union field of type returned from Win32 API)
             let header = unsafe { &(reparse_buffer.header) };
             symlink::read_nt_symlink(header, state).map(Some)
         }

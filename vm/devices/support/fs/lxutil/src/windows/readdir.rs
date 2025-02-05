@@ -68,7 +68,7 @@ impl DirectoryInformation for FileSystem::FILE_ID_EXTD_DIR_INFORMATION {
     }
 
     fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
-        // safety: A properly constructed struct will contain the name in a buffer at the end.
+        // SAFETY: A properly constructed struct will contain the name in a buffer at the end.
         let name_slice = unsafe {
             std::slice::from_raw_parts(
                 self.FileName.as_ptr(),
@@ -93,7 +93,7 @@ impl DirectoryInformation for FileSystem::FILE_FULL_DIR_INFORMATION {
     }
 
     fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
-        // safety: A properly constructed struct will contain the name in a buffer at the end.
+        // SAFETY: A properly constructed struct will contain the name in a buffer at the end.
         let name_slice = unsafe {
             std::slice::from_raw_parts(
                 self.FileName.as_ptr(),
@@ -118,7 +118,7 @@ impl DirectoryInformation for FileSystem::FILE_DIRECTORY_INFORMATION {
     }
 
     fn file_name(&self) -> Result<UnicodeStringRef<'_>, lx::Error> {
-        // safety: A properly constructed struct will contain the name in a buffer at the end.
+        // SAFETY: A properly constructed struct will contain the name in a buffer at the end.
         let name_slice = unsafe {
             std::slice::from_raw_parts(
                 self.FileName.as_ptr(),
@@ -343,7 +343,7 @@ impl DirectoryEnumerator {
 
         let mut raw_event = Foundation::HANDLE::default();
         let _event;
-        // safety: Calling Win32 API as documented.
+        // SAFETY: Calling Win32 API as documented.
         if self.flags.asynchronous_mode() {
             unsafe {
                 let _ = util::check_status(FileSystem::NtCreateEvent(
@@ -359,7 +359,7 @@ impl DirectoryEnumerator {
 
         let mut iosb = Default::default();
         loop {
-            // safety: Calling Win32 API as documented.
+            // SAFETY: Calling Win32 API as documented.
             let mut status = unsafe {
                 FileSystem::NtQueryDirectoryFile(
                     Foundation::HANDLE(handle.as_raw_handle()),
@@ -377,14 +377,14 @@ impl DirectoryEnumerator {
             };
 
             if status == Foundation::STATUS_PENDING {
-                // safety: Calling Win32 API as documented.
+                // SAFETY: Calling Win32 API as documented.
                 if unsafe { Threading::NtWaitForSingleObject(raw_event, false, ptr::null_mut()) }
                     != Foundation::STATUS_SUCCESS
                 {
                     return Err(lx::Error::EINVAL);
                 }
 
-                // safety: Accessing field of correctly constructed union.
+                // SAFETY: Accessing field of correctly constructed union.
                 status = unsafe { iosb.Anonymous.Status };
             }
 
@@ -498,7 +498,7 @@ impl DirectoryEnumerator {
             return Err(lx::Error::EFAULT);
         }
 
-        // safety: The pointer is aligned and will read within the buffer bounds.
+        // SAFETY: The pointer is aligned and will read within the buffer bounds.
         unsafe { Ok(&mut *(ptr.cast())) }
     }
 
@@ -512,7 +512,7 @@ impl DirectoryEnumerator {
             return Err(lx::Error::EFAULT);
         }
 
-        // safety: The pointer is aligned and will read within the buffer bounds.
+        // SAFETY: The pointer is aligned and will read within the buffer bounds.
         unsafe { Ok(&mut *(self.buffer_next_entry.cast())) }
     }
 
@@ -603,7 +603,7 @@ impl DirectoryEnumerator {
 
     /// Free the buffer with RtlFreeHeap.
     fn free_buffer(&self) {
-        // safety: Calling Win32 API as documented.
+        // SAFETY: Calling Win32 API as documented.
         unsafe {
             FileSystem::RtlFreeHeap(Memory::GetProcessHeap().unwrap().0, 0, Some(self.buffer))
         };

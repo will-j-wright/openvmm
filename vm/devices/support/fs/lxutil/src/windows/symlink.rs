@@ -10,7 +10,7 @@ use windows::Win32::System::SystemServices as W32Ss;
 fn get_substitute_name(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
 ) -> lx::Result<(UnicodeStringRef<'_>, u32)> {
-    // safety: Caller guarantees that the reparse data buffer is well-formed.
+    // SAFETY: Caller guarantees that the reparse data buffer is well-formed.
     let (buffer, offset, length, flags) = unsafe {
         match reparse.ReparseTag {
             W32Ss::IO_REPARSE_TAG_SYMLINK => (
@@ -41,7 +41,7 @@ fn get_substitute_name(
         }
     };
 
-    // safety: The validity of the reparse buffer is provided by the caller. If the buffer is valid,
+    // SAFETY: The validity of the reparse buffer is provided by the caller. If the buffer is valid,
     // the area pointed to by `buffer + offset` is a valid wstring of length `length`, and this operation is safe.
     let substitute_name = unsafe {
         UnicodeStringRef::new(std::slice::from_raw_parts(
