@@ -2,15 +2,15 @@
 // Licensed under the MIT License.
 
 use pal::windows::UnicodeString;
-use pal::windows::UnicodeStringRef;
 use windows::Wdk::Storage::FileSystem;
 use windows::Win32::System::SystemServices as W32Ss;
 
 /// Get the symlink substitute name and flags from the reparse data.
-fn get_substitute_name(
+/// The caller must guarantee that the reparse data buffer is well-formed.
+unsafe fn get_substitute_name(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
-) -> lx::Result<(UnicodeStringRef<'_>, u32)> {
-    // SAFETY: Caller guarantees that the reparse data buffer is well-formed.
+) -> lx::Result<(&[u16], u32)> {
+    // SAFETY: Caller must guarantee that the reparse data buffer is well-formed.
     let (buffer, offset, length, flags) = unsafe {
         match reparse.ReparseTag {
             W32Ss::IO_REPARSE_TAG_SYMLINK => (
@@ -44,11 +44,10 @@ fn get_substitute_name(
     // SAFETY: The validity of the reparse buffer is provided by the caller. If the buffer is valid,
     // the area pointed to by `buffer + offset` is a valid wstring of length `length`, and this operation is safe.
     let substitute_name = unsafe {
-        UnicodeStringRef::new(std::slice::from_raw_parts(
+        std::slice::from_raw_parts(
             buffer.as_ptr().byte_offset(offset as _),
             (length as usize) / size_of::<u16>(),
-        ))
-        .ok_or(lx::Error::EIO)?
+        )
     };
 
     Ok((substitute_name, flags))
@@ -56,7 +55,7 @@ fn get_substitute_name(
 
 /// Translates an absolute NT symlink target to an LX path.
 fn translate_absolute_target(
-    substitute_name: &UnicodeStringRef<'_>,
+    substitute_name: &[u16],
     state: &super::VolumeState,
 ) -> lx::Result<String> {
     if state.options.sandbox || state.options.symlink_root.is_empty() {
@@ -64,15 +63,14 @@ fn translate_absolute_target(
         return Err(lx::Error::EPERM);
     }
 
-    // Convert from UTF-16 UNICODE_STRING to String
-    let name = substitute_name.as_slice();
-    if name.len() < 6 {
+    // Convert from UTF-16 slice to String
+    if substitute_name.len() < 6 {
         return Err(lx::Error::EIO);
     }
-    let name = if name[name.len() - 1] == 0 {
-        &name[..name.len() - 1]
+    let name = if substitute_name[substitute_name.len() - 1] == 0 {
+        &substitute_name[..substitute_name.len() - 1]
     } else {
-        &name[..name.len()]
+        &substitute_name[..substitute_name.len()]
     };
     let name = match String::from_utf16(name) {
         Ok(name) => name,
@@ -109,27 +107,29 @@ fn translate_absolute_target(
 }
 
 /// Determine the target of an NT symlink. Only relative links are supported.
-pub fn read_nt_symlink(
+/// The caller must guarantee that the reparse buffer is well-formed.
+pub unsafe fn read_nt_symlink(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
     state: &super::VolumeState,
 ) -> lx::Result<String> {
-    let (substitute_name, flags) = get_substitute_name(reparse)?;
+    let (substitute_name, flags) = unsafe { get_substitute_name(reparse)? };
 
     if flags & FileSystem::SYMLINK_FLAG_RELATIVE == 0 {
         translate_absolute_target(&substitute_name, state)
     } else {
-        let mut name =
-            UnicodeString::new(substitute_name.as_slice()).map_err(|_| lx::Error::EIO)?;
+        let mut name = UnicodeString::new(substitute_name).map_err(|_| lx::Error::EIO)?;
 
         super::path::unescape_path(name.as_mut_slice())
     }
 }
 
 /// Determine the length of an NT symlink.
-pub fn read_nt_symlink_length(
+/// The caller must guarantee that the reparse buffer is well-formed.
+pub unsafe fn read_nt_symlink_length(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
     state: &super::VolumeState,
 ) -> lx::Result<u32> {
     // The length is just the target's UTF-8 length.
-    Ok(read_nt_symlink(reparse, state)?.len() as _)
+    // SAFETY: The validity of the reparse buffer is guaranteed by the caller.
+    Ok(unsafe { read_nt_symlink(reparse, state) }?.len() as _)
 }

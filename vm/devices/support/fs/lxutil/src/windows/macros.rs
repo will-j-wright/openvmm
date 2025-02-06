@@ -33,6 +33,7 @@ macro_rules! impl_directory_information {
         })*
     };
 }
+pub(crate) use impl_directory_information;
 
 /// A macro to implement FileInformationClass.
 /// Takes any number of inputs of the format `FILE_X_INFORMATION = FileXInformation;`
@@ -53,3 +54,4 @@ macro_rules! file_information_classes {
         })*
     };
 }
+pub(crate) use file_information_classes;

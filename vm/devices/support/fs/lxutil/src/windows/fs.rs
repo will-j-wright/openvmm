@@ -602,7 +602,9 @@ pub fn query_stat_information(
         let (buf, len) = util::FileInformationClass::as_ptr_len_mut(&mut all_information);
 
         // SAFETY: Calling NtQueryInformationFile as documented.
-        // We don't use util::query_information_file here because it's fine if the buffer overflows due to a long file name.
+        // Don't use util::query_information_file so we can check for STATUS_BUFFER_OVERFLOW, which indicates that
+        // the buffer wasn't big enough to have the file name at the end of the FILE_NAME_INFORMATION written.
+        // In this case, the rest of the buffer is still valid.
         let status = unsafe {
             FileSystem::NtQueryInformationFile(
                 Foundation::HANDLE(file_handle.as_raw_handle()),
@@ -613,6 +615,7 @@ pub fn query_stat_information(
             )
         };
 
+        // STATUS_BUFFER_OVERFLOW is acceptable, the result is still valid.
         if status != Foundation::STATUS_SUCCESS && status != Foundation::STATUS_BUFFER_OVERFLOW {
             return Err(util::nt_status_to_lx(status));
         }
@@ -784,9 +787,12 @@ pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::R
             }
         }
         W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
-            // SAFETY: Accessing union field of type returned from Win32 API)
-            let header = unsafe { &(reparse_buffer.header) };
-            symlink::read_nt_symlink_length(header, state)
+            // SAFETY: Accessing union field of type returned from Win32 API).
+            // The reparse buffer is well-formed as returned from Win32.
+            unsafe {
+                let header = &(reparse_buffer.header);
+                symlink::read_nt_symlink_length(header, state)
+            }
         }
         _ => Err(lx::Error::EIO),
     }
@@ -847,9 +853,12 @@ pub fn read_reparse_link(
             }
         }
         W32Ss::IO_REPARSE_TAG_SYMLINK | W32Ss::IO_REPARSE_TAG_MOUNT_POINT => {
-            // SAFETY: Accessing union field of type returned from Win32 API)
-            let header = unsafe { &(reparse_buffer.header) };
-            symlink::read_nt_symlink(header, state).map(Some)
+            // SAFETY: Accessing union field of type returned from Win32 API).
+            // The reparse buffer is well-formed as returned from Win32.
+            unsafe {
+                let header = &(reparse_buffer.header);
+                symlink::read_nt_symlink(header, state).map(Some)
+            }
         }
         _ => Err(lx::Error::EIO),
     }

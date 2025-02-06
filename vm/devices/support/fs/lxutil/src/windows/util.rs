@@ -3,6 +3,7 @@
 
 use super::api;
 use super::fs;
+use super::macros::file_information_classes;
 use crate::SetAttributes;
 use crate::SetTime;
 use ::windows::Wdk;

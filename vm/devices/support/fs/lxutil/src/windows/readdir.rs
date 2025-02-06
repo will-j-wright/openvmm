@@ -3,6 +3,7 @@
 
 use super::api;
 use super::fs;
+use super::macros::impl_directory_information;
 use super::util;
 use crate::windows::path;
 use bitfield_struct::bitfield;
@@ -395,20 +396,22 @@ impl DirectoryEnumerator {
                         //      even if it's actually a different structure. All
                         //      the fields used are at the same offset in all structs.
                         let mut offset = 0;
-                        let mut previous = None;
+                        let mut prev_offset = 0;
 
                         // Loop through all of the complete entries.
                         while let Ok(entry) =
                             self.get_buffer::<FileSystem::FILE_DIRECTORY_INFORMATION>(offset)
                         {
+                            prev_offset = offset;
                             offset += entry.NextEntryOffset as usize;
                             buffer_too_small = false;
-                            previous = Some(entry);
                         }
 
                         // Set the final complete entry's next offset to 0.
-                        if let Some(prev) = previous {
-                            prev.NextEntryOffset = 0;
+                        if let Ok(previous) =
+                            self.get_buffer::<FileSystem::FILE_DIRECTORY_INFORMATION>(prev_offset)
+                        {
+                            previous.NextEntryOffset = 0;
                         }
                     }
                     Foundation::STATUS_NO_MORE_FILES | Foundation::STATUS_NO_SUCH_FILE => {
@@ -481,7 +484,7 @@ impl DirectoryEnumerator {
         Ok(iosb.Information as _)
     }
 
-    fn get_buffer<T>(&self, offset: usize) -> lx::Result<&mut T>
+    fn get_buffer<T>(&mut self, offset: usize) -> lx::Result<&mut T>
     where
         T: DirectoryInformation,
     {
@@ -500,7 +503,7 @@ impl DirectoryEnumerator {
         unsafe { Ok(&mut *(ptr.cast())) }
     }
 
-    fn get_next_entry<T>(&self) -> lx::Result<&mut T>
+    fn get_next_entry<T>(&mut self) -> lx::Result<&mut T>
     where
         T: DirectoryInformation,
     {
@@ -552,7 +555,7 @@ impl DirectoryEnumerator {
             return Ok(());
         }
 
-        let entry: &FileSystem::FILE_FULL_DIR_INFORMATION = self.get_next_entry()?;
+        let entry: FileSystem::FILE_FULL_DIR_INFORMATION = self.get_next_entry().cloned()?;
         if entry.NextEntryOffset != 0 {
             self.buffer_next_entry = self
                 .buffer_next_entry

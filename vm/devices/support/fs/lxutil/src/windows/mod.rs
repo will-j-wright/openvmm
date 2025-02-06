@@ -5,7 +5,6 @@
 #![expect(unsafe_code)]
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-#[macro_use]
 mod macros;
 
 pub(crate) mod api;
