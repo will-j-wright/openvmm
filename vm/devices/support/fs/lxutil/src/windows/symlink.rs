@@ -5,8 +5,12 @@ use pal::windows::UnicodeString;
 use windows::Wdk::Storage::FileSystem;
 use windows::Win32::System::SystemServices as W32Ss;
 
+// TODO: Remove the need for `unsafe` by enlightening this function of the full
+// size of the reparse buffer
 /// Get the symlink substitute name and flags from the reparse data.
-/// The caller must guarantee that the reparse data buffer is well-formed.
+/// # Safety
+/// The caller must guarantee that the reparse data buffer is well-formed,
+/// with contains a valid wstring of length `length` at the end of the buffer.
 unsafe fn get_substitute_name(
     reparse: &FileSystem::REPARSE_DATA_BUFFER,
 ) -> lx::Result<(&[u16], u32)> {
