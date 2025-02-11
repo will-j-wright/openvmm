@@ -119,7 +119,7 @@ pub unsafe fn read_nt_symlink(
     let (substitute_name, flags) = unsafe { get_substitute_name(reparse)? };
 
     if flags & FileSystem::SYMLINK_FLAG_RELATIVE == 0 {
-        translate_absolute_target(&substitute_name, state)
+        translate_absolute_target(substitute_name, state)
     } else {
         let mut name = UnicodeString::new(substitute_name).map_err(|_| lx::Error::EIO)?;
 

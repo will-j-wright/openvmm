@@ -211,7 +211,7 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
             } else {
                 0
             },
-            EffectiveOnly: false.into(),
+            EffectiveOnly: false,
         };
         let mut object_attributes = Wdk::Foundation::OBJECT_ATTRIBUTES::default();
         object_attributes.SecurityQualityOfService =
@@ -1161,7 +1161,7 @@ pub fn rename(
         }
     } else {
         FileSystem::FILE_RENAME_INFORMATION_0 {
-            ReplaceIfExists: true.into(),
+            ReplaceIfExists: true,
         }
     };
 

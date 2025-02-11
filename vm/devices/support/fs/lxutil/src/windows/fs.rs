@@ -287,9 +287,7 @@ pub fn delete_read_only_file(fs_context: &FsContext, file_handle: &OwnedHandle) 
 }
 
 fn delete_file_core_non_posix(file_handle: &OwnedHandle) -> lx::Result<()> {
-    let info = FileSystem::FILE_DISPOSITION_INFORMATION {
-        DeleteFile: true.into(),
-    };
+    let info = FileSystem::FILE_DISPOSITION_INFORMATION { DeleteFile: true };
 
     util::set_information_file(file_handle, &info)
 }
