@@ -13,7 +13,6 @@ use ::windows::Win32::Foundation;
 use ::windows::Win32::Security;
 use ::windows::Win32::Security as W32Sec;
 use ::windows::Win32::Storage::FileSystem as W32Fs;
-use ::windows::Win32::System::Kernel;
 use ::windows::Win32::System::SystemServices as W32Ss;
 use ::windows::Win32::System::Threading;
 use ntapi::ntioapi;
@@ -207,7 +206,11 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
         let security_qos = W32Sec::SECURITY_QUALITY_OF_SERVICE {
             Length: size_of::<W32Sec::SECURITY_QUALITY_OF_SERVICE>() as _,
             ImpersonationLevel: W32Sec::SecurityImpersonation,
-            ContextTrackingMode: W32Sec::SECURITY_DYNAMIC_TRACKING.0,
+            ContextTrackingMode: if W32Sec::SECURITY_DYNAMIC_TRACKING {
+                1
+            } else {
+                0
+            },
             EffectiveOnly: false.into(),
         };
         let mut object_attributes = Wdk::Foundation::OBJECT_ATTRIBUTES::default();
@@ -220,7 +223,7 @@ fn get_token_for_access_check() -> lx::Result<OwnedHandle> {
                 client_token_raw,
                 W32Sec::TOKEN_QUERY.0,
                 Some(&object_attributes),
-                Foundation::BOOLEAN(0),
+                false,
                 W32Sec::TokenImpersonation,
                 &mut duplicate_token_raw,
             ))?;
@@ -258,7 +261,7 @@ pub fn check_security(file: &OwnedHandle, desired_access: u32) -> lx::Result<u32
                     | Security::GROUP_SECURITY_INFORMATION
                     | Security::DACL_SECURITY_INFORMATION)
                     .0,
-                Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr().cast()),
+                Some(Security::PSECURITY_DESCRIPTOR(sd.as_mut_ptr().cast())),
                 initial_size as u32,
                 &mut length_needed,
             ))
@@ -687,7 +690,7 @@ pub fn query_information_file_by_name<T: FileInformationClass>(
         Length: size_of::<Wdk::Foundation::OBJECT_ATTRIBUTES>() as _,
         RootDirectory: root_handle,
         ObjectName: path.as_ptr().cast(),
-        Attributes: Kernel::OBJ_FORCE_ACCESS_CHECK as _,
+        Attributes: Foundation::OBJ_FORCE_ACCESS_CHECK as _,
         SecurityDescriptor: ptr::null_mut(),
         SecurityQualityOfService: ptr::null_mut(),
     };

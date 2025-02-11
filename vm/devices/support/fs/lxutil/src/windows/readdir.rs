@@ -166,7 +166,7 @@ impl DirectoryEnumerator {
         let buf = unsafe {
             FileSystem::RtlAllocateHeap(
                 Memory::GetProcessHeap().map_err(|_| lx::Error::ENOMEM)?.0,
-                0,
+                None,
                 DIR_ENUM_BUFFER_SIZE,
             )
         };
@@ -340,7 +340,7 @@ impl DirectoryEnumerator {
     fn fill_buffer(&mut self, handle: &OwnedHandle, restart_scan: bool) -> lx::Result<u32> {
         debug_assert!(self.buffer_next_entry.is_null());
 
-        let mut raw_event = Foundation::HANDLE::default();
+        let mut raw_event = Default::default();
         let _event;
         // SAFETY: Calling Win32 API as documented.
         if self.flags.asynchronous_mode() {
@@ -362,7 +362,11 @@ impl DirectoryEnumerator {
             let mut status = unsafe {
                 FileSystem::NtQueryDirectoryFile(
                     Foundation::HANDLE(handle.as_raw_handle()),
-                    raw_event,
+                    if raw_event.is_invalid() {
+                        None
+                    } else {
+                        Some(raw_event)
+                    },
                     None,
                     None,
                     &mut iosb,
@@ -474,7 +478,7 @@ impl DirectoryEnumerator {
             let buf = unsafe {
                 FileSystem::RtlAllocateHeap(
                     Memory::GetProcessHeap().map_err(|_| lx::Error::ENOMEM)?.0,
-                    0,
+                    None,
                     self.buffer_size as usize + BUFFER_EXTRA_SIZE,
                 )
             };
@@ -598,7 +602,7 @@ impl DirectoryEnumerator {
     fn free_buffer(&self) {
         // SAFETY: Calling Win32 API as documented.
         unsafe {
-            FileSystem::RtlFreeHeap(Memory::GetProcessHeap().unwrap().0, 0, Some(self.buffer))
+            FileSystem::RtlFreeHeap(Memory::GetProcessHeap().unwrap().0, None, Some(self.buffer))
         };
     }
 }

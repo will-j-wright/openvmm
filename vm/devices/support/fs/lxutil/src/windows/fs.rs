@@ -744,7 +744,7 @@ fn query_reparse_data(
     unsafe {
         let _ = util::check_status(FileSystem::NtFsControlFile(
             Foundation::HANDLE(file_handle.as_raw_handle()),
-            Foundation::HANDLE::default(),
+            Some(Foundation::HANDLE::default()),
             None,
             None,
             &mut iosb,
