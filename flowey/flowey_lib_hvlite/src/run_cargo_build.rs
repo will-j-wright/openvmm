@@ -43,6 +43,12 @@ pub enum CargoBuildOutput {
         dll_lib: PathBuf,
         pdb: PathBuf,
     },
+    WindowsWinmdLib {
+        dll: PathBuf,
+        dll_lib: PathBuf,
+        pdb: PathBuf,
+        winmd: PathBuf,
+    },
     UefiBin {
         efi: PathBuf,
         pdb: PathBuf,
