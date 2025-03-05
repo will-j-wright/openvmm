@@ -176,12 +176,15 @@ if not tool:
     group.add_argument('--tool', choices=tools)
     group.add_argument('--dump', action='store_true')
     group.add_argument('--install', action='store_true')
+    group.add_argument('--sdk', action='store_true')
     parser.add_argument('args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.dump:
         action = "dump"
     elif args.install:
         action = "install"
+    elif args.sdk:
+        action = "sdk"
     arch = args.arch
     tool = args.tool
     ignore_cache = args.ignore_cache
@@ -221,3 +224,5 @@ elif action == "install":
         if os.path.islink(dst):
             os.unlink(dst)
         os.symlink(script, dst)
+elif action == "sdk":
+    print(os.path.normpath(sdk_paths(arch)['bin']))
