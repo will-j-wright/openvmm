@@ -23,7 +23,7 @@ import tempfile
 import glob
 import argparse
 
-tools = ['clang-cl', 'lld-link', 'llvm-lib', 'llvm-dlltool', 'llvm-rc']
+tools = ['clang-cl', 'lld-link', 'llvm-lib', 'llvm-dlltool', 'llvm-rc', 'msvc-midlrt']
 
 
 def wslpath(p):
@@ -59,7 +59,8 @@ def vs_paths(arch):
         msvc_path = f'{install_path}/VC/Tools/MSVC/{v}'
         lib = [f'{msvc_path}/lib/{arch}']
         include = [f'{msvc_path}/include']
-        return {'lib': lib, 'include': include}
+        bin = f'{msvc_path}/bin/Host{arch}/arch'
+        return {'lib': lib, 'include': include, 'bin': bin}
     except:
         raise Exception("Visual Studio not found")
 
@@ -72,7 +73,8 @@ def sdk_paths(arch):
     version = versions[-1]
     lib = [f'{roots}/Lib/{version}/{dir}/{arch}' for dir in ['ucrt', 'um']]
     include = [f'{roots}/Include/{version}/{dir}' for dir in ['ucrt', 'um', 'shared', 'cppwinrt', 'winrt']]
-    return {'lib': lib, 'include': include}
+    bin = f'{roots}/bin/{version}/{arch}/'
+    return {'lib': lib, 'include': include, 'bin': bin}
 
 
 def check_config(a):
@@ -99,7 +101,12 @@ def find_llvm_tool(name):
     return None
 
 
-def get_config(arch, required_tool, ignore_cache):
+def find_midlrt(arch, vs, sdk):
+    midlrt = f'{sdk['bin']}/midlrt.exe'
+    return os.path.normpath(midlrt)
+
+
+def get_config(arch, required_tool, ignore_cache):    
     cache_dir = os.environ.get(
         'XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
     cache_dir = f'{cache_dir}/windows-cross'
@@ -128,9 +135,16 @@ def get_config(arch, required_tool, ignore_cache):
             raise Exception("Unknown architecture")
         vs = vs_paths(win_arch)
         sdk = sdk_paths(win_arch)
+        tool_paths = {}
+        for tool in tools:
+            if tool == 'msvc-midlrt':
+                tool_paths[tool] = find_midlrt(win_arch, vs, sdk)
+            else:
+                tool_paths[tool] = find_llvm_tool(tool)
         config = {'lib': [os.path.normpath(p) for p in vs['lib'] + sdk['lib']],
                   'include': [os.path.normpath(p) for p in vs['include'] + sdk['include']],
-                  'tools': {tool: find_llvm_tool(tool) for tool in tools}}
+                  'path': [os.path.normpath(vs['bin'])],
+                  'tools': tool_paths}
 
         if not check_config(config):
             raise Exception("invalid paths")
@@ -191,8 +205,12 @@ if action == "run":
         exit(1)
     lib = ';'.join(config['lib'])
     include = ';'.join(config['include'])
-    environ = dict(os.environ.copy(), LIB=lib, INCLUDE=include)
-    os.execvpe(tool_path, [tool_path] + tool_args, environ)
+    path = ';'.join(config['path'])
+
+    environ = os.environ.copy()
+    new_path = f'{environ['PATH']}:{path}'
+    new_environ = dict(environ, PATH=new_path, LIB=lib, INCLUDE=include)
+    os.execvpe(tool_path, [tool_path] + tool_args, new_environ)
 elif action == "dump":
     print(json.dumps(config))
 elif action == "install":
