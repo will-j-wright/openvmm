@@ -59,7 +59,7 @@ def vs_paths(arch):
         msvc_path = f'{install_path}/VC/Tools/MSVC/{v}'
         lib = [f'{msvc_path}/lib/{arch}']
         include = [f'{msvc_path}/include']
-        bin = f'{msvc_path}/bin/Host{arch}/arch'
+        bin = f'{msvc_path}/bin/Host{arch}/{arch}'
         return {'lib': lib, 'include': include, 'bin': bin}
     except:
         raise Exception("Visual Studio not found")
