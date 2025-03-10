@@ -207,16 +207,19 @@ if action == "run":
     if not tool_path:
         print(f"tool {tool} not found, try installing it")
         exit(1)
-    lib = ':'.join(config['lib'])
-    include = ':'.join(config['include'])
-    path = ':'.join(config['path'])
 
+    separator = ':' if tool == "msvc-midlrt" else ';'
+    lib = separator.join(config['lib'])
+    include = separator.join(config['include'])
+    path = separator.join(config['path'])
     environ = dict(os.environ.copy(), LIB=lib, INCLUDE=include, PATH=path)
-    wslenv = environ['WSLENV']
-    if wslenv is None:
-        wslenv = ""
-    wslenv = wslenv + ":PATH/wp:INCLUDE/wp:LIB/wp"
-    environ['WSLENV'] = wslenv
+    if tool == "msvc-midlrt":
+        wslenv = environ['WSLENV']
+        if wslenv is None:
+            wslenv = ""
+        wslenv = wslenv + ":PATH/wp:INCLUDE/wp:LIB/wp"
+        environ['WSLENV'] = wslenv
+    
     os.execvpe(tool_path, [tool_path] + tool_args, environ)
 elif action == "dump":
     print(json.dumps(config))
