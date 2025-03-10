@@ -136,6 +136,7 @@ def get_config(arch, required_tool, ignore_cache):
         vs = vs_paths(win_arch)
         sdk = sdk_paths(win_arch)
         tool_paths = {}
+        config = {}
         for tool in tools:
             if tool == 'msvc-midlrt':
                 tool_paths[tool] = find_midlrt(win_arch, vs, sdk)
@@ -143,8 +144,8 @@ def get_config(arch, required_tool, ignore_cache):
                 tool_paths[tool] = find_llvm_tool(tool)
         config = {'lib': [os.path.normpath(p) for p in vs['lib'] + sdk['lib']],
                   'include': [os.path.normpath(p) for p in vs['include'] + sdk['include']],
-                  'path': [os.path.normpath(vs['bin'])],
-                  'tools': tool_paths}
+                  'tools': tool_paths,
+                  'path': [os.path.normpath(p) for p in sdk['include']] + [os.path.normpath(vs['bin'])]}
 
         if not check_config(config):
             raise Exception("invalid paths")
@@ -206,14 +207,17 @@ if action == "run":
     if not tool_path:
         print(f"tool {tool} not found, try installing it")
         exit(1)
-    lib = ';'.join(config['lib'])
-    include = ';'.join(config['include'])
-    path = ';'.join(config['path'])
+    lib = ':'.join(config['lib'])
+    include = ':'.join(config['include'])
+    path = ':'.join(config['path'])
 
-    environ = os.environ.copy()
-    new_path = f'{environ['PATH']}:{path}'
-    new_environ = dict(environ, PATH=new_path, LIB=lib, INCLUDE=include)
-    os.execvpe(tool_path, [tool_path] + tool_args, new_environ)
+    environ = dict(os.environ.copy(), LIB=lib, INCLUDE=include, PATH=path)
+    wslenv = environ['WSLENV']
+    if wslenv is None:
+        wslenv = ""
+    wslenv = wslenv + ":PATH/wp:INCLUDE/wp:LIB/wp"
+    environ['WSLENV'] = wslenv
+    os.execvpe(tool_path, [tool_path] + tool_args, environ)
 elif action == "dump":
     print(json.dumps(config))
 elif action == "install":
