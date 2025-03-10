@@ -59,8 +59,7 @@ def vs_paths(arch):
         msvc_path = f'{install_path}/VC/Tools/MSVC/{v}'
         lib = [f'{msvc_path}/lib/{arch}']
         include = [f'{msvc_path}/include']
-        bin = f'{msvc_path}/bin/Host{arch}/{arch}'
-        return {'lib': lib, 'include': include, 'bin': bin}
+        return {'lib': lib, 'include': include}
     except:
         raise Exception("Visual Studio not found")
 
@@ -144,8 +143,7 @@ def get_config(arch, required_tool, ignore_cache):
                 tool_paths[tool] = find_llvm_tool(tool)
         config = {'lib': [os.path.normpath(p) for p in vs['lib'] + sdk['lib']],
                   'include': [os.path.normpath(p) for p in vs['include'] + sdk['include']],
-                  'tools': tool_paths,
-                  'path': [os.path.normpath(p) for p in sdk['include']] + [os.path.normpath(vs['bin'])]}
+                  'tools': tool_paths,}
 
         if not check_config(config):
             raise Exception("invalid paths")
@@ -211,13 +209,12 @@ if action == "run":
     separator = ':' if tool == "msvc-midlrt" else ';'
     lib = separator.join(config['lib'])
     include = separator.join(config['include'])
-    path = separator.join(config['path'])
-    environ = dict(os.environ.copy(), LIB=lib, INCLUDE=include, PATH=path)
+    environ = dict(os.environ.copy(), LIB=lib, INCLUDE=include)
     if tool == "msvc-midlrt":
         wslenv = environ['WSLENV']
         if wslenv is None:
             wslenv = ""
-        wslenv = wslenv + ":PATH/wp:INCLUDE/wp:LIB/wp"
+        wslenv = wslenv + ":INCLUDE/wp:LIB/wp"
         environ['WSLENV'] = wslenv
     
     os.execvpe(tool_path, [tool_path] + tool_args, environ)
