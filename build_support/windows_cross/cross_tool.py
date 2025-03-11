@@ -143,7 +143,8 @@ def get_config(arch, required_tool, ignore_cache):
                 tool_paths[tool] = find_llvm_tool(tool)
         config = {'lib': [os.path.normpath(p) for p in vs['lib'] + sdk['lib']],
                   'include': [os.path.normpath(p) for p in vs['include'] + sdk['include']],
-                  'tools': tool_paths,}
+                  'tools': tool_paths,
+                  'sdk': [os.path.normpath(sdk['bin'])]}
 
         if not check_config(config):
             raise Exception("invalid paths")
@@ -175,7 +176,6 @@ if not tool:
     group.add_argument('--tool', choices=tools)
     group.add_argument('--dump', action='store_true')
     group.add_argument('--install', action='store_true')
-    group.add_argument('--sdk', action='store_true')
     parser.add_argument('args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.dump:
@@ -228,5 +228,3 @@ elif action == "install":
         if os.path.islink(dst):
             os.unlink(dst)
         os.symlink(script, dst)
-elif action == "sdk":
-    print(os.path.normpath(sdk_paths(arch)['bin']))
