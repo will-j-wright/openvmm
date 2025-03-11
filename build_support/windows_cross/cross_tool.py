@@ -23,7 +23,7 @@ import tempfile
 import glob
 import argparse
 
-tools = ['clang-cl', 'lld-link', 'llvm-lib', 'llvm-dlltool', 'llvm-rc', 'msvc-midlrt']
+tools = ['clang-cl', 'lld-link', 'llvm-lib', 'llvm-dlltool', 'llvm-rc', 'midlrt.exe']
 
 
 def wslpath(p):
@@ -137,7 +137,7 @@ def get_config(arch, required_tool, ignore_cache):
         tool_paths = {}
         config = {}
         for tool in tools:
-            if tool == 'msvc-midlrt':
+            if tool == 'midlrt.exe':
                 tool_paths[tool] = find_midlrt(win_arch, vs, sdk)
             else:
                 tool_paths[tool] = find_llvm_tool(tool)
@@ -206,11 +206,11 @@ if action == "run":
         print(f"tool {tool} not found, try installing it")
         exit(1)
 
-    separator = ':' if tool == "msvc-midlrt" else ';'
+    separator = ':' if tool == "midlrt.exe" else ';'
     lib = separator.join(config['lib'])
     include = separator.join(config['include'])
     environ = dict(os.environ.copy(), LIB=lib, INCLUDE=include)
-    if tool == "msvc-midlrt":
+    if tool == "midlrt.exe":
         wslenv = environ['WSLENV']
         if wslenv is None:
             wslenv = ""
