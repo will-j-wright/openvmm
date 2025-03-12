@@ -212,7 +212,7 @@ if action == "run":
         wslenv = environ['WSLENV']
         if wslenv is None:
             wslenv = ""
-        wslenv = wslenv + ":INCLUDE/wp:LIB/wp"
+        wslenv = wslenv + ":INCLUDE/wl:LIB/wl"
         environ['WSLENV'] = wslenv
     
     os.execvpe(tool_path, [tool_path] + tool_args, environ)
