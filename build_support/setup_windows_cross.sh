@@ -45,7 +45,7 @@ function setup_windows_cross {
     export RC_x86_64_pc_windows_msvc=$(tool "$tooldir" x86_64-llvm-rc)
     export DLLTOOL_x86_64_pc_windows_msvc=$(tool "$tooldir" x86_64-llvm-dlltool)
     export MIDLRT_x86_64_pc_windows_msvc=$(tool "$tooldir" x86_64-midlrt.exe)
-    export CROSS_TOOL="$tooldir/cross_tool.py"
+    export OPENVMM_WINDOWS_CROSS_TOOL="$tooldir/cross_tool.py"
 }
 
 # Check if this file was run directly instead of sourced, and fail with a
