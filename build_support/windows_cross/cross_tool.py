@@ -100,7 +100,7 @@ def find_llvm_tool(name):
     return None
 
 
-def find_midlrt(arch, vs, sdk):
+def find_midlrt(sdk):
     midlrt = f'{sdk['bin']}/midlrt.exe'
     return os.path.normpath(midlrt)
 
@@ -138,7 +138,7 @@ def get_config(arch, required_tool, ignore_cache):
         config = {}
         for tool in tools:
             if tool == 'midlrt.exe':
-                tool_paths[tool] = find_midlrt(win_arch, vs, sdk)
+                tool_paths[tool] = find_midlrt(sdk)
             else:
                 tool_paths[tool] = find_llvm_tool(tool)
         config = {'lib': [os.path.normpath(p) for p in vs['lib'] + sdk['lib']],
@@ -182,8 +182,6 @@ if not tool:
         action = "dump"
     elif args.install:
         action = "install"
-    elif args.sdk:
-        action = "sdk"
     arch = args.arch
     tool = args.tool
     ignore_cache = args.ignore_cache
