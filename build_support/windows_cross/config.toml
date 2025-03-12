@@ -21,6 +21,7 @@ AR_x86_64_pc_windows_msvc = { value = "windows_cross/x86_64-llvm-lib", relative 
 RC_x86_64_pc_windows_msvc = { value = "windows_cross/x86_64-llvm-rc", relative = true }
 DLLTOOL_x86_64_pc_windows_msvc = { value = "windows_cross/x86_64-llvm-dlltool", relative = true }
 MIDLRT_x86_64_pc_windows_msvc = { value = "windows_cross/x86_64-midlrt.exe", relative = true }
+OPENVMM_WINDOWS_CROSS_TOOL = { value = "windows_cross/cross_tool.py", relative = true }
 
 [target.x86_64-pc-windows-msvc]
 linker = "windows_cross/x86_64-lld-link"
