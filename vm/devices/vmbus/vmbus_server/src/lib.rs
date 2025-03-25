@@ -240,7 +240,7 @@ impl EventPort for ChannelEvent {
     }
 }
 
-#[derive(Debug, Protobuf, SavedStateRoot)]
+#[derive(Debug, Protobuf, SavedStateRoot, Clone)]
 #[mesh(package = "vmbus.server")]
 pub struct SavedState {
     #[mesh(1)]
