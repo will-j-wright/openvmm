@@ -1593,7 +1593,7 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
         Ok(())
     }
 
-    pub fn post_restore(&mut self) -> Result<(), RestoreError> {
+    pub fn post_restore(&mut self) {
         for (offer_id, channel) in self.inner.channels.iter_mut() {
             match channel.restore_state {
                 RestoreState::Restored => {
@@ -1672,43 +1672,6 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
                 GpadlState::OfferedTearingDown => unreachable!(),
             }
         }
-
-        // Restore server state, and resend server notifications if needed. If these notifications
-        // were processed before the save, it's harmless as the values will be the same.
-        let request = match self.inner.state {
-            ConnectionState::Connecting {
-                info,
-                next_action: _,
-            } => Some(ModifyConnectionRequest {
-                version: Some(info.version.version as u32),
-                interrupt_page: info.interrupt_page.into(),
-                monitor_page: info.monitor_page.into(),
-                target_message_vp: Some(info.target_message_vp),
-                force: true,
-                notify_relay: true,
-            }),
-            ConnectionState::Connected(info) => Some(ModifyConnectionRequest {
-                version: None,
-                monitor_page: info.monitor_page.into(),
-                interrupt_page: info.interrupt_page.into(),
-                target_message_vp: Some(info.target_message_vp),
-                force: true,
-                // If the save didn't happen while modifying, the relay doesn't need to be notified
-                // of this info as it doesn't constitute a change, we're just restoring existing
-                // connection state.
-                notify_relay: info.modifying,
-            }),
-            // No action needed for these states; if disconnecting, check_disconnected will resend
-            // the reset request if needed.
-            ConnectionState::Disconnected | ConnectionState::Disconnecting { .. } => None,
-        };
-
-        if let Some(request) = request {
-            self.notifier.modify_connection(request)?;
-        }
-
-        self.check_disconnected();
-        Ok(())
     }
 
     /// Initiates a state reset and a closing of all channels.
@@ -4924,9 +4887,8 @@ mod tests {
         let state = env.server.save();
         env.c().reset();
         assert!(env.notifier.is_reset());
-        env.server.restore(state).unwrap();
+        env.c().restore(state).unwrap();
         env.c().restore_channel(offer_id1, false).unwrap();
-        env.c().post_restore().unwrap();
     }
 
     #[test]
@@ -5012,7 +4974,7 @@ mod tests {
         env.c().revoke_channel(offer_id5);
         env.c().revoke_channel(offer_id6);
 
-        env.server.restore(state.clone()).unwrap();
+        env.c().restore(state.clone()).unwrap();
 
         env.c().revoke_channel(offer_id1);
         env.c().revoke_channel(offer_id4);
@@ -5028,7 +4990,7 @@ mod tests {
             ChannelState::Reoffered
         ));
 
-        env.c().post_restore().unwrap();
+        env.c().post_restore();
 
         assert_eq!(env.notifier.monitor_page, Some(expected_monitor));
         assert_eq!(env.notifier.target_message_vp, Some(0));
@@ -5055,9 +5017,8 @@ mod tests {
         env.complete_reset();
         env.notifier.check_reset();
 
-        env.server.restore(state).unwrap();
+        env.c().restore(state).unwrap();
         env.c().restore_channel(offer_id3, false).unwrap();
-        env.c().post_restore().unwrap();
         assert_eq!(env.notifier.monitor_page, Some(expected_monitor));
         assert_eq!(env.notifier.target_message_vp, Some(0));
     }
@@ -5085,9 +5046,8 @@ mod tests {
         env.complete_connect();
         env.notifier.check_reset();
 
-        env.server.restore(state).unwrap();
+        env.c().restore(state).unwrap();
         env.c().restore_channel(offer_id1, false).unwrap();
-        env.c().post_restore().unwrap();
         assert_eq!(
             env.notifier.monitor_page,
             Some(MonitorPageGpas {
@@ -5148,8 +5108,8 @@ mod tests {
         let state = env.server.save();
         env.c().reset();
         env.notifier.check_reset();
-        env.server.restore(state).unwrap();
-        env.c().post_restore().unwrap();
+
+        env.c().restore(state).unwrap();
 
         // Restore should have resent the request.
         let request = env.next_action();
@@ -5204,13 +5164,13 @@ mod tests {
         let offer_id1 = env.offer(1);
         let offer_id2 = env.offer(2);
         let offer_id3 = env.offer(3);
-        env.server.restore(state).unwrap();
+
+        env.c().restore(state).unwrap();
 
         // This will panic if the reserved channel was not restored.
         env.c().restore_channel(offer_id1, true).unwrap();
         env.c().restore_channel(offer_id2, false).unwrap();
         env.c().restore_channel(offer_id3, false).unwrap();
-        env.c().post_restore().unwrap();
 
         // Make sure the gpadl was restored as well.
         assert!(env.server.gpadls.contains_key(&(GpadlId(1), offer_id1)));
@@ -5258,11 +5218,11 @@ mod tests {
         let offer_id1 = env.offer(1);
         let offer_id2 = env.offer(2);
         let offer_id3 = env.offer(3);
-        env.server.restore(state).unwrap();
+
+        env.c().restore(state).unwrap();
         env.c().restore_channel(offer_id1, false).unwrap();
         env.c().restore_channel(offer_id2, true).unwrap();
         env.c().restore_channel(offer_id3, true).unwrap();
-        env.c().post_restore().unwrap();
 
         // The messages should be pending again.
         assert!(env.server.has_pending_messages());
