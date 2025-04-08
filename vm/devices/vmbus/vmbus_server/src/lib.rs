@@ -207,7 +207,6 @@ enum VmbusRequest {
     Inspect(inspect::Deferred),
     Save(Rpc<(), SavedState>),
     Restore(Rpc<SavedState, Result<(), RestoreError>>),
-    PostRestore(Rpc<(), Result<(), RestoreError>>),
     Start,
     Stop(Rpc<(), ()>),
 }
@@ -555,13 +554,6 @@ impl VmbusServer {
     pub async fn restore(&self, state: SavedState) -> Result<(), RestoreError> {
         self.task_send
             .call(VmbusRequest::Restore, state)
-            .await
-            .unwrap()
-    }
-
-    pub async fn post_restore(&self) -> Result<(), RestoreError> {
-        self.task_send
-            .call(VmbusRequest::PostRestore, ())
             .await
             .unwrap()
     }
@@ -958,11 +950,10 @@ impl ServerTask {
             }),
             VmbusRequest::Restore(rpc) => rpc.handle_sync(|state| {
                 self.unstick_on_start = !state.lost_synic_bug_fixed;
-                self.server.restore(state.server)
+                self.server
+                    .with_notifier(&mut self.inner)
+                    .restore(state.server)
             }),
-            VmbusRequest::PostRestore(rpc) => {
-                rpc.handle_sync(|()| self.server.with_notifier(&mut self.inner).post_restore())
-            }
             VmbusRequest::Stop(rpc) => rpc.handle_sync(|()| {
                 if self.inner.running {
                     self.inner.running = false;
@@ -971,6 +962,7 @@ impl ServerTask {
             VmbusRequest::Start => {
                 if !self.inner.running {
                     self.inner.running = true;
+                    self.server.with_notifier(&mut self.inner).post_restore();
                     if self.unstick_on_start {
                         tracing::info!(
                             "lost synic bug fix is not in yet, call unstick_channels to mitigate the issue."
@@ -2407,7 +2399,6 @@ mod tests {
         // will be repeated. This must not panic.
         env.vmbus.restore(saved_state).await.unwrap();
         channel.restore().await;
-        env.vmbus.post_restore().await.unwrap();
         env.vmbus.start();
 
         // Handle the teardown after restore.
