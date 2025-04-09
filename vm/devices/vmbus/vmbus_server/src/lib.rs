@@ -1389,7 +1389,7 @@ impl Notifier for ServerTaskInner {
         self.map_interrupt_page(request.interrupt_page)
             .context("Failed to map interrupt page.")?;
 
-        self.set_monitor_page(request.monitor_page, request.force)
+        self.set_monitor_page(request.monitor_page)
             .context("Failed to map monitor page.")?;
 
         if let Some(vp) = request.target_message_vp {
@@ -1702,11 +1702,7 @@ impl ServerTaskInner {
         Ok(())
     }
 
-    fn set_monitor_page(
-        &mut self,
-        monitor_page: Update<MonitorPageGpas>,
-        force: bool,
-    ) -> anyhow::Result<()> {
+    fn set_monitor_page(&mut self, monitor_page: Update<MonitorPageGpas>) -> anyhow::Result<()> {
         let monitor_page = match monitor_page {
             Update::Unchanged => return Ok(()),
             Update::Reset => None,
@@ -1715,20 +1711,18 @@ impl ServerTaskInner {
 
         // Force is used by restore because there may be restored channels in the open state.
         // TODO: can this check be moved into channels.rs?
-        if !force
-            && self.channels.iter().any(|(_, c)| {
-                matches!(
-                    &c.state,
-                    ChannelState::Open {
-                        open_params,
-                        ..
-                    } | ChannelState::Opening {
-                        open_params,
-                        ..
-                    } if open_params.monitor_info.is_some()
-                )
-            })
-        {
+        if self.channels.iter().any(|(_, c)| {
+            matches!(
+                &c.state,
+                ChannelState::Open {
+                    open_params,
+                    ..
+                } | ChannelState::Opening {
+                    open_params,
+                    ..
+                } if open_params.monitor_info.is_some()
+            )
+        }) {
             anyhow::bail!("attempt to change monitor page while open channels using mnf");
         }
 
