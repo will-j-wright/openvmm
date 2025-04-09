@@ -222,7 +222,6 @@ impl<'a, N: 'a + Notifier> super::ServerWithNotifier<'a, N> {
                 interrupt_page: info.interrupt_page.into(),
                 monitor_page: info.monitor_page.into(),
                 target_message_vp: Some(info.target_message_vp),
-                force: true,
                 notify_relay: true,
             }),
             super::ConnectionState::Connected(info) => Some(super::ModifyConnectionRequest {
@@ -230,7 +229,6 @@ impl<'a, N: 'a + Notifier> super::ServerWithNotifier<'a, N> {
                 monitor_page: info.monitor_page.into(),
                 interrupt_page: info.interrupt_page.into(),
                 target_message_vp: Some(info.target_message_vp),
-                force: true,
                 // If the save didn't happen while modifying, the relay doesn't need to be notified
                 // of this info as it doesn't constitute a change, we're just restoring existing
                 // connection state.

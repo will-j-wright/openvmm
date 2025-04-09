@@ -326,7 +326,6 @@ pub struct ModifyConnectionRequest {
     pub monitor_page: Update<MonitorPageGpas>,
     pub interrupt_page: Update<u64>,
     pub target_message_vp: Option<u32>,
-    pub force: bool,
     pub notify_relay: bool,
 }
 
@@ -338,7 +337,6 @@ impl Default for ModifyConnectionRequest {
             monitor_page: Update::Unchanged,
             interrupt_page: Update::Unchanged,
             target_message_vp: None,
-            force: false,
             notify_relay: true,
         }
     }
@@ -1593,6 +1591,8 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
         Ok(())
     }
 
+    /// Revoke and reoffer channels to the guest, depending on their `RestoreState.`
+    /// This function should be called after [`ServerWithNotifier::restore`].
     pub fn post_restore(&mut self) {
         for (offer_id, channel) in self.inner.channels.iter_mut() {
             match channel.restore_state {
@@ -2215,7 +2215,6 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
             monitor_page: monitor_page.into(),
             interrupt_page: request.interrupt_page.into(),
             target_message_vp: Some(request.target_message_vp),
-            force: false,
             notify_relay: true,
         }) {
             tracelimit::error_ratelimited!(?err, "server failed to change state");
@@ -5068,7 +5067,6 @@ mod tests {
                 }),
                 interrupt_page: Update::Reset,
                 target_message_vp: Some(0),
-                force: true,
                 ..Default::default()
             }
         );
@@ -5122,7 +5120,6 @@ mod tests {
                 }),
                 interrupt_page: Update::Reset,
                 target_message_vp: Some(0),
-                force: true,
                 ..Default::default()
             }
         );
