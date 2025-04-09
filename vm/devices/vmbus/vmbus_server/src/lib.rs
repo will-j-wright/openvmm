@@ -962,7 +962,9 @@ impl ServerTask {
             VmbusRequest::Start => {
                 if !self.inner.running {
                     self.inner.running = true;
-                    self.server.with_notifier(&mut self.inner).post_restore();
+                    self.server
+                        .with_notifier(&mut self.inner)
+                        .revoke_unclaimed_channels();
                     if self.unstick_on_start {
                         tracing::info!(
                             "lost synic bug fix is not in yet, call unstick_channels to mitigate the issue."

@@ -175,7 +175,7 @@ impl<'a, N: 'a + Notifier> super::ServerWithNotifier<'a, N> {
     /// additional calls to offer or revoke channels.
     ///
     /// Once all channels are in the appropriate state,
-    /// [`super::ServerWithNotifier::post_restore`] should be called. This will revoke
+    /// [`super::ServerWithNotifier::revoke_unclaimed_channels`] should be called. This will revoke
     /// any channels that were in the saved state but were not restored via
     /// `restore_channel`.
     pub fn restore(&mut self, saved: SavedState) -> Result<(), RestoreError> {

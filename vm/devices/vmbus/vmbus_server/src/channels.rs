@@ -396,8 +396,8 @@ enum RestoreState {
     /// The channel has been offered newly this session.
     New,
     /// The channel was in the saved state and has been re-offered this session,
-    /// but restore_channel has not yet been called on it, and post_restore has
-    /// not yet been called.
+    /// but restore_channel has not yet been called on it, and revoke_unclaimed_channels
+    /// has not yet been called.
     Restoring,
     /// The channel was in the saved state but has not yet been re-offered this
     /// session.
@@ -1593,7 +1593,7 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
 
     /// Revoke and reoffer channels to the guest, depending on their `RestoreState.`
     /// This function should be called after [`ServerWithNotifier::restore`].
-    pub fn post_restore(&mut self) {
+    pub fn revoke_unclaimed_channels(&mut self) {
         for (offer_id, channel) in self.inner.channels.iter_mut() {
             match channel.restore_state {
                 RestoreState::Restored => {
@@ -1603,7 +1603,7 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
                     // This is a fresh channel offer, not in the saved state.
                     // Send the offer to the guest if it has not already been
                     // sent (which could have happened if the channel was
-                    // offered after restore() but before post_restore()).
+                    // offered after restore() but before revoke_unclaimed_channels()).
                     if let ConnectionState::Connected(info) = &self.inner.state {
                         if matches!(channel.state, ChannelState::ClientReleased) {
                             channel.prepare_channel(
@@ -1718,7 +1718,7 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
                 assert!(!matches!(channel.state, ChannelState::Revoked));
                 // This channel was previously offered to the guest in the saved
                 // state. Match this back up to handle future calls to
-                // restore_channel and post_restore.
+                // restore_channel and revoke_unclaimed_channels.
                 channel.restore_state = RestoreState::Restoring;
 
                 // The relay can specify a host-determined monitor ID, which needs to match what's
@@ -4989,7 +4989,7 @@ mod tests {
             ChannelState::Reoffered
         ));
 
-        env.c().post_restore();
+        env.c().revoke_unclaimed_channels();
 
         assert_eq!(env.notifier.monitor_page, Some(expected_monitor));
         assert_eq!(env.notifier.target_message_vp, Some(0));
