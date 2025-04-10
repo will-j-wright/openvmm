@@ -1711,7 +1711,6 @@ impl ServerTaskInner {
             Update::Set(value) => Some(value),
         };
 
-        // Force is used by restore because there may be restored channels in the open state.
         // TODO: can this check be moved into channels.rs?
         if self.channels.iter().any(|(_, c)| {
             matches!(
