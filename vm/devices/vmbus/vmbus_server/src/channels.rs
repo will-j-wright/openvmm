@@ -1672,6 +1672,8 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
                 GpadlState::OfferedTearingDown => unreachable!(),
             }
         }
+
+        self.check_disconnected();
     }
 
     /// Initiates a state reset and a closing of all channels.
