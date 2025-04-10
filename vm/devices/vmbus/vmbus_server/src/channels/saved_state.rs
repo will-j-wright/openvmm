@@ -184,6 +184,39 @@ impl<'a, N: 'a + Notifier> super::ServerWithNotifier<'a, N> {
         if let Some(saved) = saved.state {
             self.inner.state = saved.connection.restore()?;
 
+            // Restore server state, and resend server notifications if needed. If these notifications
+            // were processed before the save, it's harmless as the values will be the same.
+            let request = match self.inner.state {
+                super::ConnectionState::Connecting {
+                    info,
+                    next_action: _,
+                } => Some(super::ModifyConnectionRequest {
+                    version: Some(info.version.version as u32),
+                    interrupt_page: info.interrupt_page.into(),
+                    monitor_page: info.monitor_page.into(),
+                    target_message_vp: Some(info.target_message_vp),
+                    notify_relay: true,
+                }),
+                super::ConnectionState::Connected(info) => Some(super::ModifyConnectionRequest {
+                    version: None,
+                    monitor_page: info.monitor_page.into(),
+                    interrupt_page: info.interrupt_page.into(),
+                    target_message_vp: Some(info.target_message_vp),
+                    // If the save didn't happen while modifying, the relay doesn't need to be notified
+                    // of this info as it doesn't constitute a change, we're just restoring existing
+                    // connection state.
+                    notify_relay: info.modifying,
+                }),
+                // No action needed for these states; if disconnecting, check_disconnected will resend
+                // the reset request if needed.
+                super::ConnectionState::Disconnected
+                | super::ConnectionState::Disconnecting { .. } => None,
+            };
+
+            if let Some(request) = request {
+                self.notifier.modify_connection(request)?;
+            }
+
             for saved_channel in saved.channels {
                 self.inner.restore_one_channel(saved_channel)?;
             }
@@ -210,42 +243,6 @@ impl<'a, N: 'a + Notifier> super::ServerWithNotifier<'a, N> {
         for message in saved.pending_messages {
             self.inner.pending_messages.0.push_back(message.restore()?);
         }
-
-        // Restore server state, and resend server notifications if needed. If these notifications
-        // were processed before the save, it's harmless as the values will be the same.
-        let request = match self.inner.state {
-            super::ConnectionState::Connecting {
-                info,
-                next_action: _,
-            } => Some(super::ModifyConnectionRequest {
-                version: Some(info.version.version as u32),
-                interrupt_page: info.interrupt_page.into(),
-                monitor_page: info.monitor_page.into(),
-                target_message_vp: Some(info.target_message_vp),
-                notify_relay: true,
-            }),
-            super::ConnectionState::Connected(info) => Some(super::ModifyConnectionRequest {
-                version: None,
-                monitor_page: info.monitor_page.into(),
-                interrupt_page: info.interrupt_page.into(),
-                target_message_vp: Some(info.target_message_vp),
-                // If the save didn't happen while modifying, the relay doesn't need to be notified
-                // of this info as it doesn't constitute a change, we're just restoring existing
-                // connection state.
-                notify_relay: info.modifying,
-            }),
-            // No action needed for these states; if disconnecting, check_disconnected will resend
-            // the reset request if needed.
-            super::ConnectionState::Disconnected | super::ConnectionState::Disconnecting { .. } => {
-                None
-            }
-        };
-
-        if let Some(request) = request {
-            self.notifier.modify_connection(request)?;
-        }
-
-        self.check_disconnected();
 
         Ok(())
     }
