@@ -14,6 +14,8 @@ use super::ProxyHandle;
 use super::TaggedStream;
 use super::VmbusServerControl;
 use crate::HvsockRelayChannelHalf;
+use crate::SavedStateRelayChannelHalf;
+use crate::channels::SavedState;
 use crate::event::MaybeWrappedEvent;
 use crate::event::WrappedEvent;
 use anyhow::Context;
@@ -22,6 +24,7 @@ use futures::StreamExt;
 use futures::future::OptionFuture;
 use futures::stream::SelectAll;
 use guestmem::GuestMemory;
+use hvdef::Vtl;
 use mesh::Cancel;
 use mesh::CancelContext;
 use mesh::rpc::Rpc;
@@ -59,10 +62,12 @@ use windows::Win32::Foundation::ERROR_CANCELLED;
 use windows::core::HRESULT;
 use zerocopy::IntoBytes;
 
-/// Provides access to a vmbus server, and its optional hvsocket relay.
+/// Provides access to a vmbus server, its optional hvsocket relay, and
+/// a channel to received saved state information.
 pub struct ProxyServerInfo {
     control: Arc<VmbusServerControl>,
     hvsock_relay: Option<HvsockRelayChannelHalf>,
+    saved_state: SavedStateRelayChannelHalf,
 }
 
 impl ProxyServerInfo {
@@ -70,10 +75,12 @@ impl ProxyServerInfo {
     pub fn new(
         control: Arc<VmbusServerControl>,
         hvsock_relay: Option<HvsockRelayChannelHalf>,
+        saved_state: SavedStateRelayChannelHalf,
     ) -> Self {
         Self {
             control,
             hvsock_relay,
+            saved_state,
         }
     }
 }
@@ -148,6 +155,8 @@ struct ProxyTask {
     vtl2_server: Option<Arc<VmbusServerControl>>,
     hvsock_response_send: Option<mesh::Sender<HvsockConnectResult>>,
     vtl2_hvsock_response_send: Option<mesh::Sender<HvsockConnectResult>>,
+    saved_state: Arc<Mutex<Option<SavedState>>>,
+    vtl2_saved_state: Arc<Mutex<Option<SavedState>>>,
 }
 
 impl ProxyTask {
@@ -166,6 +175,8 @@ impl ProxyTask {
             hvsock_response_send,
             vtl2_hvsock_response_send,
             vtl2_server,
+            saved_state: Arc::new(Mutex::new(None)),
+            vtl2_saved_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -608,12 +619,45 @@ impl ProxyTask {
         true
     }
 
+    fn handle_saved_state_request(&self, request: Result<SavedState, mesh::RecvError>, vtl: Vtl) {
+        let request = match request {
+            Ok(request) => request,
+            Err(e) => {
+                // Closed can happen normally during shutdown, so does not need to be logged.
+                if !matches!(e, mesh::RecvError::Closed) {
+                    tracelimit::error_ratelimited!(
+                        error = ?&e as &dyn std::error::Error,
+                        "saved state request receive failed"
+                    );
+                }
+                return;
+            }
+        };
+
+        match vtl {
+            Vtl::Vtl0 => {
+                *self.saved_state.lock() = Some(request);
+            }
+            Vtl::Vtl2 => {
+                *self.vtl2_saved_state.lock() = Some(request);
+            }
+            _ => {
+                tracelimit::error_ratelimited!(
+                    vtl = ?vtl,
+                    "saved state request receive failed: Unsupported VTL"
+                );
+            }
+        }
+    }
+
     async fn run_server_requests(
         self: &Arc<Self>,
         spawner: impl Spawn,
         mut recv: mesh::Receiver<TaggedStream<u64, mesh::Receiver<ChannelRequest>>>,
         mut hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
         mut vtl2_hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
+        mut saved_state_recv: mesh::Receiver<SavedState>,
+        mut vtl2_saved_state_recv: Option<mesh::Receiver<SavedState>>,
     ) {
         let mut channel_requests = SelectAll::new();
 
@@ -627,6 +671,13 @@ impl ProxyTask {
 
                 let mut vtl2_hvsock_requests = OptionFuture::from(
                     vtl2_hvsock_request_recv
+                        .as_mut()
+                        .map(|recv| Box::pin(recv.recv()).fuse()),
+                );
+                let mut saved_state_requests = Box::pin(saved_state_recv.recv()).fuse();
+
+                let mut vtl2_saved_state_requests = OptionFuture::from(
+                    vtl2_saved_state_recv
                         .as_mut()
                         .map(|recv| Box::pin(recv.recv()).fuse()),
                 );
@@ -645,6 +696,12 @@ impl ProxyTask {
                         if !self.handle_hvsock_request(&spawner, r.unwrap(), 2) {
                             vtl2_hvsock_request_recv = None;
                         }
+                    }
+                    r = saved_state_requests => {
+                        self.handle_saved_state_request(r, Vtl::Vtl0);
+                    }
+                    r = vtl2_saved_state_requests => {
+                        self.handle_saved_state_request(r.unwrap(), Vtl::Vtl2);
                     }
                     complete => break 'outer,
                 }
@@ -676,19 +733,21 @@ async fn proxy_thread(
         .unzip();
 
     // Separate the hvsocket relay channels and the server for VTL2.
-    let (vtl2_control, vtl2_hvsock_request_recv, vtl2_hvsock_response_send) =
+    let (vtl2_control, vtl2_hvsock_request_recv, vtl2_hvsock_response_send, vtl2_saved_state_recv) =
         if let Some(server) = vtl2_server {
             let (vtl2_hvsock_request_recv, vtl2_hvsock_response_send) = server
                 .hvsock_relay
                 .map(|relay| (relay.request_receive, relay.response_send))
                 .unzip();
+            let vtl2_saved_state_recv = server.saved_state;
             (
                 Some(server.control),
                 vtl2_hvsock_request_recv,
                 vtl2_hvsock_response_send,
+                Some(vtl2_saved_state_recv),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
     let (send, recv) = mesh::channel();
@@ -701,8 +760,14 @@ async fn proxy_thread(
         Arc::clone(&proxy),
     ));
     let offers = task.run_proxy_actions(send, flush_recv);
-    let requests =
-        task.run_server_requests(spawner, recv, hvsock_request_recv, vtl2_hvsock_request_recv);
+    let requests = task.run_server_requests(
+        spawner,
+        recv,
+        hvsock_request_recv,
+        vtl2_hvsock_request_recv,
+        server.saved_state,
+        vtl2_saved_state_recv,
+    );
 
     futures::future::join(offers, requests).await;
     tracing::debug!("proxy thread finished");

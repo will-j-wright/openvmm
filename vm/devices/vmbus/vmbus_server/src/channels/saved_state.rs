@@ -170,14 +170,17 @@ impl<'a, N: 'a + Notifier> super::ServerWithNotifier<'a, N> {
     /// Restores state.
     ///
     /// This may be called before or after channels have been offered. After
-    /// calling this routine, [`super::ServerWithNotifier::restore_channel`] should be
+    /// calling this routine, [`restore_channel`] should be
     /// called for each channel to be restored, possibly interleaved with
     /// additional calls to offer or revoke channels.
     ///
     /// Once all channels are in the appropriate state,
-    /// [`super::ServerWithNotifier::revoke_unclaimed_channels`] should be called. This will revoke
+    /// [`revoke_unclaimed_channels`] should be called. This will revoke
     /// any channels that were in the saved state but were not restored via
-    /// `restore_channel`.
+    /// [`restore_channel`].
+    ///
+    /// [`revoke_unclaimed_channels`]: super::ServerWithNotifier::revoke_unclaimed_channels
+    /// [`restore_channel`]: super::ServerWithNotifier::restore_channel
     pub fn restore(&mut self, saved: SavedState) -> Result<(), RestoreError> {
         tracing::trace!(?saved, "restoring channel state");
 
