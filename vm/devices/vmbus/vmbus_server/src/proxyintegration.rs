@@ -619,7 +619,11 @@ impl ProxyTask {
         true
     }
 
-    fn handle_saved_state_request(&self, request: Result<SavedState, mesh::RecvError>, vtl: Vtl) {
+    fn handle_saved_state_request(
+        &self,
+        request: Result<Option<SavedState>, mesh::RecvError>,
+        vtl: Vtl,
+    ) {
         let request = match request {
             Ok(request) => request,
             Err(e) => {
@@ -636,10 +640,10 @@ impl ProxyTask {
 
         match vtl {
             Vtl::Vtl0 => {
-                *self.saved_state.lock() = Some(request);
+                *self.saved_state.lock() = request;
             }
             Vtl::Vtl2 => {
-                *self.vtl2_saved_state.lock() = Some(request);
+                *self.vtl2_saved_state.lock() = request;
             }
             _ => {
                 tracelimit::error_ratelimited!(
@@ -656,8 +660,8 @@ impl ProxyTask {
         mut recv: mesh::Receiver<TaggedStream<u64, mesh::Receiver<ChannelRequest>>>,
         mut hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
         mut vtl2_hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
-        mut saved_state_recv: mesh::Receiver<SavedState>,
-        mut vtl2_saved_state_recv: Option<mesh::Receiver<SavedState>>,
+        mut saved_state_recv: SavedStateRelayChannelHalf,
+        mut vtl2_saved_state_recv: Option<SavedStateRelayChannelHalf>,
     ) {
         let mut channel_requests = SelectAll::new();
 

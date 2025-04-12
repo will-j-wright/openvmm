@@ -193,9 +193,9 @@ pub type VmbusRelayChannel = RelayChannel<ModifyRelayRequest, ModifyConnectionRe
 pub type HvsockServerChannelHalf = ServerChannelHalf<HvsockConnectRequest, HvsockConnectResult>;
 pub type HvsockRelayChannelHalf = RelayChannelHalf<HvsockConnectRequest, HvsockConnectResult>;
 pub type HvsockRelayChannel = RelayChannel<HvsockConnectRequest, HvsockConnectResult>;
-pub type SavedStateServerChannelHalf = mesh::Sender<channels::SavedState>;
-pub type SavedStateRelayChannelHalf = mesh::Receiver<channels::SavedState>;
-pub type SavedStateRelayChannel = UnidirectionalRelayChannel<channels::SavedState>;
+pub type SavedStateServerChannelHalf = mesh::Sender<Option<channels::SavedState>>;
+pub type SavedStateRelayChannelHalf = mesh::Receiver<Option<channels::SavedState>>;
+pub type SavedStateRelayChannel = UnidirectionalRelayChannel<Option<channels::SavedState>>;
 
 /// A request from the server to the relay to modify connection state.
 ///
@@ -670,7 +670,7 @@ struct ServerTaskInner {
     message_port: Box<dyn GuestMessagePort>,
     hvsock_requests: usize,
     hvsock_send: mesh::Sender<HvsockConnectRequest>,
-    saved_state_send: Option<mesh::Sender<channels::SavedState>>,
+    saved_state_send: Option<SavedStateServerChannelHalf>,
     channels: HashMap<OfferId, Channel>,
     channel_responses: FuturesUnordered<
         Pin<Box<dyn Send + Future<Output = (OfferId, u64, Result<ChannelResponse, RpcError>)>>>,
@@ -984,7 +984,7 @@ impl ServerTask {
             VmbusRequest::Restore(rpc) => rpc.handle_sync(|state| {
                 self.unstick_on_start = !state.lost_synic_bug_fixed;
                 if let Some(sender) = self.inner.saved_state_send.as_ref() {
-                    sender.send(state.server.clone());
+                    sender.send(Some(state.server.clone()));
                 }
 
                 self.server
@@ -999,6 +999,12 @@ impl ServerTask {
             VmbusRequest::Start => {
                 if !self.inner.running {
                     self.inner.running = true;
+                    if let Some(sender) = self.inner.saved_state_send.as_ref() {
+                        // Indicate to the proxy that the server is starting and that it should
+                        // clear its saved state cache.
+                        sender.send(None);
+                    }
+
                     self.server
                         .with_notifier(&mut self.inner)
                         .revoke_unclaimed_channels();
