@@ -122,6 +122,7 @@ pub struct VmbusServerBuilder<'a, T: Spawn> {
     vtl: Vtl,
     hvsock_notify: Option<HvsockServerChannelHalf>,
     server_relay: Option<VmbusServerChannelHalf>,
+    proxy_saved_state_notify: Option<SavedStateServerChannelHalf>,
     external_server: Option<mesh::Sender<InitiateContactRequest>>,
     external_requests: Option<mesh::Receiver<InitiateContactRequest>>,
     use_message_redirect: bool,
@@ -169,12 +170,32 @@ impl<Request: 'static + Send, Response: 'static + Send> RelayChannel<Request, Re
     }
 }
 
+/// A unidirectional connection between a vmbus server to a relay.
+pub struct UnidirectionalRelayChannel<Request> {
+    pub relay_half: mesh::Receiver<Request>,
+    pub server_half: mesh::Sender<Request>,
+}
+
+impl<Request: 'static + Send> UnidirectionalRelayChannel<Request> {
+    /// Creates a new unidirectional channel between the vmbus server and a relay.
+    pub fn new() -> Self {
+        let (request_send, request_receive) = mesh::channel();
+        Self {
+            relay_half: request_receive,
+            server_half: request_send,
+        }
+    }
+}
+
 pub type VmbusServerChannelHalf = ServerChannelHalf<ModifyRelayRequest, ModifyConnectionResponse>;
 pub type VmbusRelayChannelHalf = RelayChannelHalf<ModifyRelayRequest, ModifyConnectionResponse>;
 pub type VmbusRelayChannel = RelayChannel<ModifyRelayRequest, ModifyConnectionResponse>;
 pub type HvsockServerChannelHalf = ServerChannelHalf<HvsockConnectRequest, HvsockConnectResult>;
 pub type HvsockRelayChannelHalf = RelayChannelHalf<HvsockConnectRequest, HvsockConnectResult>;
 pub type HvsockRelayChannel = RelayChannel<HvsockConnectRequest, HvsockConnectResult>;
+pub type SavedStateServerChannelHalf = mesh::Sender<channels::SavedState>;
+pub type SavedStateRelayChannelHalf = mesh::Receiver<channels::SavedState>;
+pub type SavedStateRelayChannel = UnidirectionalRelayChannel<channels::SavedState>;
 
 /// A request from the server to the relay to modify connection state.
 ///
@@ -268,6 +289,7 @@ impl<'a, T: Spawn> VmbusServerBuilder<'a, T> {
             vtl: Vtl::Vtl0,
             hvsock_notify: None,
             server_relay: None,
+            proxy_saved_state_notify: None,
             external_server: None,
             external_requests: None,
             use_message_redirect: false,
@@ -297,6 +319,15 @@ impl<'a, T: Spawn> VmbusServerBuilder<'a, T> {
     /// Sets a send/receive pair used to handle hvsocket requests.
     pub fn hvsock_notify(mut self, hvsock_notify: Option<HvsockServerChannelHalf>) -> Self {
         self.hvsock_notify = hvsock_notify;
+        self
+    }
+
+    /// Sets a send channel used to enlighten ProxyIntegration about saved channels.
+    pub fn proxy_saved_state_notify(
+        mut self,
+        proxy_saved_state_notify: Option<SavedStateServerChannelHalf>,
+    ) -> Self {
+        self.proxy_saved_state_notify = proxy_saved_state_notify;
         self
     }
 
@@ -499,6 +530,7 @@ impl<'a, T: Spawn> VmbusServerBuilder<'a, T> {
             synic: self.synic,
             hvsock_requests: 0,
             hvsock_send,
+            saved_state_send: self.proxy_saved_state_notify,
             channels: HashMap::new(),
             channel_responses: FuturesUnordered::new(),
             relay_send: relay_request_send,
@@ -638,6 +670,7 @@ struct ServerTaskInner {
     message_port: Box<dyn GuestMessagePort>,
     hvsock_requests: usize,
     hvsock_send: mesh::Sender<HvsockConnectRequest>,
+    saved_state_send: Option<mesh::Sender<channels::SavedState>>,
     channels: HashMap<OfferId, Channel>,
     channel_responses: FuturesUnordered<
         Pin<Box<dyn Send + Future<Output = (OfferId, u64, Result<ChannelResponse, RpcError>)>>>,
@@ -950,6 +983,10 @@ impl ServerTask {
             }),
             VmbusRequest::Restore(rpc) => rpc.handle_sync(|state| {
                 self.unstick_on_start = !state.lost_synic_bug_fixed;
+                if let Some(sender) = self.inner.saved_state_send.as_ref() {
+                    sender.send(state.server.clone());
+                }
+
                 self.server
                     .with_notifier(&mut self.inner)
                     .restore(state.server)

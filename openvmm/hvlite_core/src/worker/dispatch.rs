@@ -114,6 +114,7 @@ use vm_topology::processor::x86::X2ApicState;
 use vm_topology::processor::x86::X86Topology;
 use vmbus_channel::channel::VmbusDevice;
 use vmbus_server::HvsockRelayChannel;
+use vmbus_server::SavedStateRelayChannel;
 use vmbus_server::VmbusServer;
 use vmbus_server::hvsock::HvsockRelay;
 use vmcore::save_restore::SavedStateRoot;
@@ -1669,47 +1670,57 @@ impl InitializedVm {
 
             vmbus_redirect = vmbus_cfg.vtl2_redirect;
             let hvsock_channel = HvsockRelayChannel::new();
+            let saved_state_channel = SavedStateRelayChannel::new();
 
-            let (vtl2_vmbus, vtl2_request_send) = if let Some(vtl2_vmbus_cfg) = cfg.vtl2_vmbus {
-                let (server_request_send, server_request_recv) = mesh::channel();
-                let vtl2_hvsock_channel = HvsockRelayChannel::new();
+            let (vtl2_vmbus, vtl2_request_send, vtl2_saved_state_channel) =
+                if let Some(vtl2_vmbus_cfg) = cfg.vtl2_vmbus {
+                    let (server_request_send, server_request_recv) = mesh::channel();
+                    let vtl2_hvsock_channel = HvsockRelayChannel::new();
+                    let vtl2_saved_state_channel = SavedStateRelayChannel::new();
 
-                let vmbus_driver = driver_source.simple();
-                let vtl2_vmbus = VmbusServer::builder(&vmbus_driver, synic.clone(), gm.clone())
-                    .vtl(Vtl::Vtl2)
-                    .max_version(
-                        vtl2_vmbus_cfg
-                            .vmbus_max_version
-                            .map(vmbus_core::MaxVersionInfo::new),
+                    let vmbus_driver = driver_source.simple();
+                    let vtl2_vmbus = VmbusServer::builder(&vmbus_driver, synic.clone(), gm.clone())
+                        .vtl(Vtl::Vtl2)
+                        .max_version(
+                            vtl2_vmbus_cfg
+                                .vmbus_max_version
+                                .map(vmbus_core::MaxVersionInfo::new),
+                        )
+                        .hvsock_notify(Some(vtl2_hvsock_channel.server_half))
+                        .proxy_saved_state_notify(Some(
+                            vtl2_saved_state_channel.server_half.clone(),
+                        ))
+                        .external_requests(Some(server_request_recv))
+                        .enable_mnf(true)
+                        .build()
+                        .context("failed to create VTL2 vmbus server")?;
+
+                    let vtl2_vmbus = VmbusServerHandle::new(
+                        &vmbus_driver,
+                        state_units.add("vtl2_vmbus"),
+                        vtl2_vmbus,
                     )
-                    .hvsock_notify(Some(vtl2_hvsock_channel.server_half))
-                    .external_requests(Some(server_request_recv))
-                    .enable_mnf(true)
-                    .build()
-                    .context("failed to create VTL2 vmbus server")?;
+                    .context("failed to add vmbus state unit")?;
 
-                let vtl2_vmbus = VmbusServerHandle::new(
-                    &vmbus_driver,
-                    state_units.add("vtl2_vmbus"),
-                    vtl2_vmbus,
-                )
-                .context("failed to add vmbus state unit")?;
+                    let relay = HvsockRelay::new(
+                        vmbus_driver,
+                        vtl2_vmbus.control().clone(),
+                        vtl2_hvsock_channel.relay_half,
+                        vtl2_vmbus_cfg.vsock_path.map(Into::into),
+                        vtl2_vmbus_cfg.vsock_listener,
+                    )
+                    .context("failed to create vtl2 hvsock relay")?;
 
-                let relay = HvsockRelay::new(
-                    vmbus_driver,
-                    vtl2_vmbus.control().clone(),
-                    vtl2_hvsock_channel.relay_half,
-                    vtl2_vmbus_cfg.vsock_path.map(Into::into),
-                    vtl2_vmbus_cfg.vsock_listener,
-                )
-                .context("failed to create vtl2 hvsock relay")?;
+                    vtl2_hvsock_relay = Some(relay);
 
-                vtl2_hvsock_relay = Some(relay);
-
-                (Some(vtl2_vmbus), Some(server_request_send))
-            } else {
-                (None, None)
-            };
+                    (
+                        Some(vtl2_vmbus),
+                        Some(server_request_send),
+                        Some(vtl2_saved_state_channel),
+                    )
+                } else {
+                    (None, None, None)
+                };
 
             let vmbus_driver = driver_source.simple();
             let vmbus = VmbusServer::builder(&vmbus_driver, synic.clone(), gm.clone())
@@ -1733,9 +1744,17 @@ impl InitializedVm {
                     vmbus_server::ProxyIntegration::start(
                         &vmbus_driver,
                         proxy_handle,
-                        vmbus_server::ProxyServerInfo::new(vmbus.control(), None),
+                        vmbus_server::ProxyServerInfo::new(
+                            vmbus.control(),
+                            None,
+                            saved_state_channel.relay_half,
+                        ),
                         vtl2_vmbus.as_ref().map(|server| {
-                            vmbus_server::ProxyServerInfo::new(server.control().clone(), None)
+                            vmbus_server::ProxyServerInfo::new(
+                                server.control().clone(),
+                                None,
+                                vtl2_saved_state_channel.unwrap().relay_half,
+                            )
                         }),
                         Some(&gm),
                     )
