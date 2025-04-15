@@ -1672,7 +1672,7 @@ impl InitializedVm {
             let hvsock_channel = HvsockRelayChannel::new();
             let saved_state_channel = SavedStateRelayChannel::new();
 
-            let (vtl2_vmbus, vtl2_request_send, vtl2_saved_state_channel) =
+            let (vtl2_vmbus, vtl2_request_send, vtl2_saved_state_recv) =
                 if let Some(vtl2_vmbus_cfg) = cfg.vtl2_vmbus {
                     let (server_request_send, server_request_recv) = mesh::channel();
                     let vtl2_hvsock_channel = HvsockRelayChannel::new();
@@ -1687,9 +1687,7 @@ impl InitializedVm {
                                 .map(vmbus_core::MaxVersionInfo::new),
                         )
                         .hvsock_notify(Some(vtl2_hvsock_channel.server_half))
-                        .proxy_saved_state_notify(Some(
-                            vtl2_saved_state_channel.server_half.clone(),
-                        ))
+                        .proxy_saved_state_notify(Some(vtl2_saved_state_channel.server_half))
                         .external_requests(Some(server_request_recv))
                         .enable_mnf(true)
                         .build()
@@ -1716,7 +1714,7 @@ impl InitializedVm {
                     (
                         Some(vtl2_vmbus),
                         Some(server_request_send),
-                        Some(vtl2_saved_state_channel),
+                        Some(vtl2_saved_state_channel.relay_half),
                     )
                 } else {
                     (None, None, None)
@@ -1753,7 +1751,7 @@ impl InitializedVm {
                             vmbus_server::ProxyServerInfo::new(
                                 server.control().clone(),
                                 None,
-                                vtl2_saved_state_channel.unwrap().relay_half,
+                                vtl2_saved_state_recv.unwrap(),
                             )
                         }),
                         Some(&gm),
