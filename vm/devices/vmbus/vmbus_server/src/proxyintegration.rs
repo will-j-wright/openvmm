@@ -329,7 +329,7 @@ impl ProxyTask {
         let interface_id: Guid = offer.InterfaceType.into();
         let instance_id: Guid = offer.InterfaceInstance.into();
 
-        let offer = OfferParams {
+        let new_offer = OfferParams {
             interface_name: "proxy".to_owned(),
             instance_id,
             interface_id,
@@ -350,7 +350,7 @@ impl ProxyTask {
         let recv = server.send.call_failable(
             OfferRequest::Offer,
             OfferInfo {
-                params: offer.into(),
+                params: new_offer.into(),
                 request_send,
                 server_request_recv,
             },
@@ -370,6 +370,40 @@ impl ProxyTask {
                 (None, None)
             }
         };
+
+        if let Some(saved_state) = match offer.TargetVtl {
+            0 => self.saved_state.lock().clone(),
+            2 => self.vtl2_saved_state.lock().clone(),
+            _ => unreachable!(),
+        } {
+            if saved_state.contains_channel(interface_id, instance_id, offer.SubChannelIndex) {
+                if let Some(send) = server_request_send.as_ref() {
+                    let result = send
+                        .call_failable(
+                            ChannelServerRequest::Restore,
+                            Some(OpenResult {
+                                guest_to_host_interrupt: Interrupt::from_event(
+                                    incoming_event.clone(),
+                                ),
+                            }),
+                        )
+                        .await;
+                    match result {
+                        Ok(r) => {
+                            // send to proxy driver
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                interface_id = %interface_id,
+                                instance_id = %instance_id,
+                                "failed to restore proxy channel"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         self.channels.lock().insert(
             id,

@@ -320,6 +320,26 @@ pub struct SavedState {
     pending_messages: Vec<OutgoingMessage>,
 }
 
+impl SavedState {
+    pub fn contains_channel(
+        &self,
+        interface_id: Guid,
+        instance_id: Guid,
+        subchannel_index: u16,
+    ) -> bool {
+        self.state
+            .as_ref()
+            .map(|s| {
+                s.channels.iter().find(|c| {
+                    c.key.instance_id == instance_id
+                        && c.key.interface_id == interface_id
+                        && c.key.subchannel_index == subchannel_index
+                })
+            })
+            .is_some()
+    }
+}
+
 #[derive(Debug, Clone, Protobuf)]
 #[mesh(package = "vmbus.server.channels")]
 struct ConnectedState {
