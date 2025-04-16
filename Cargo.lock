@@ -3142,9 +3142,12 @@ dependencies = [
  "hyperv_ic_protocol",
  "hyperv_ic_resources",
  "inspect",
+ "jiff",
  "mesh",
+ "pal_async",
  "task_control",
  "thiserror 2.0.12",
+ "tracelimit",
  "tracing",
  "vm_resource",
  "vmbus_async",
@@ -3181,6 +3184,7 @@ version = "0.0.0"
 dependencies = [
  "bitfield-struct 0.10.1",
  "guid",
+ "jiff",
  "open_enum",
  "zerocopy 0.8.23",
 ]
@@ -4220,7 +4224,7 @@ dependencies = [
 [[package]]
 name = "ms-tpm-20-ref"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/ms-tpm-20-ref-rs.git?branch=main#3e9d3874fe9273056c8e6806fc1f35493e7bdfad"
+source = "git+https://github.com/microsoft/ms-tpm-20-ref-rs.git?branch=main#92fdd699015cb7b168c3f58aa78ca87979a14ff5"
 dependencies = [
  "cc",
  "once_cell",
@@ -7818,6 +7822,7 @@ dependencies = [
  "hv1_hypercall",
  "hvdef",
  "inspect",
+ "jiff",
  "kvm",
  "memory_range",
  "open_enum",
@@ -8547,6 +8552,7 @@ dependencies = [
  "futures-concurrency",
  "hvdef",
  "inspect",
+ "jiff",
  "linkme",
  "mesh",
  "pal_async",
@@ -8574,6 +8580,7 @@ name = "vmgs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "cfg-if",
  "crc32fast",
  "disk_backend",
@@ -8585,6 +8592,7 @@ dependencies = [
  "mesh_protobuf",
  "openssl",
  "pal_async",
+ "parking_lot",
  "scsi_buffers",
  "thiserror 2.0.12",
  "tracing",
@@ -8763,6 +8771,7 @@ dependencies = [
  "hvlite_defs",
  "hvlite_ttrpc_vmservice",
  "hyperv_ic_resources",
+ "jiff",
  "mesh",
  "mesh_rpc",
  "nvme_resources",

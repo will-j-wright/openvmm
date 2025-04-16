@@ -978,6 +978,7 @@ fn vm_config_from_command_line(
                 ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
                 register_layout,
                 guest_secret_key: None,
+                logger: None,
             }
             .into_resource(),
         });
@@ -1147,6 +1148,7 @@ fn vm_config_from_command_line(
                 }
                 .into_resource(),
                 hyperv_ic_resources::kvp::KvpIcHandle { recv: kvp_recv }.into_resource(),
+                hyperv_ic_resources::timesync::TimesyncIcHandle.into_resource(),
             ]
             .map(|r| (DeviceVtl::Vtl0, r)),
         );
@@ -1341,6 +1343,7 @@ fn vm_config_from_command_line(
         firmware_event_send: None,
         debugger_rpc: None,
         generation_id_recv: None,
+        rtc_delta_milliseconds: 0,
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
