@@ -266,6 +266,24 @@ impl VmbusProxy {
         NTSTATUS(output.Status).ok()
     }
 
+    pub async fn restore(
+        &self,
+        id: u64,
+        params: &VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS,
+    ) -> Result<()> {
+        unsafe {
+            self.ioctl(
+                proxyioctl::IOCTL_VMBUS_PROXY_RESTORE_CHANNEL,
+                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_INPUT {
+                    ChannelId: id,
+                    OpenParameters: *params,
+                }),
+                (),
+            )
+            .await
+        }
+    }
+
     pub async fn close(&self, id: u64) -> Result<()> {
         unsafe {
             self.ioctl(
