@@ -371,6 +371,7 @@ impl ProxyTask {
             }
         };
 
+        // Restore channel state in the proxy if the requested channel is in the saved state.
         if let Some(saved_state) = match offer.TargetVtl {
             0 => self.saved_state.lock().clone(),
             2 => self.vtl2_saved_state.lock().clone(),
@@ -390,7 +391,57 @@ impl ProxyTask {
                         .await;
                     match result {
                         Ok(r) => {
-                            // send to proxy driver
+                            if let Some(open_request) = r.open_request {
+                                let open_result = self
+                                    .proxy
+                                    .restore(
+                                        id,
+                                        &VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS {
+                                            RingBufferGpadlHandle: open_request
+                                                .open_data
+                                                .ring_gpadl_id
+                                                .0,
+                                            DownstreamRingBufferPageOffset: open_request
+                                                .open_data
+                                                .ring_offset,
+                                            NodeNumber: 0, // BUGBUG: NUMA
+                                        },
+                                    )
+                                    .await;
+                                if let Err(err) = open_result {
+                                    tracing::error!(
+                                        error = &err as &dyn std::error::Error,
+                                        interface_id = %interface_id,
+                                        instance_id = %instance_id,
+                                        "failed to restore proxy channel: proxy IOCTL failed"
+                                    );
+                                } else {
+                                    tracing::trace!(
+                                                interface_id = %interface_id,
+                                                instance_id = %instance_id,
+                                                "restoring GPADLs for proxy channel");
+                                    for gpadl in r.gpadls {
+                                        if let Err(err) = self
+                                            .proxy
+                                            .create_gpadl(
+                                                id,
+                                                gpadl.request.id.0,
+                                                gpadl.request.count.into(),
+                                                gpadl.request.buf.as_bytes(),
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                error = &err as &dyn std::error::Error,
+                                                interface_id = %interface_id,
+                                                instance_id = %instance_id,
+                                                "failed to restore channel GPADLs in proxy"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(err) => {
                             tracing::error!(
