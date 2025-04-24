@@ -1745,13 +1745,13 @@ impl InitializedVm {
                         vmbus_server::ProxyServerInfo::new(
                             vmbus.control(),
                             None,
-                            saved_state_channel.relay_half,
+                            Some(saved_state_channel.relay_half),
                         ),
                         vtl2_vmbus.as_ref().map(|server| {
                             vmbus_server::ProxyServerInfo::new(
                                 server.control().clone(),
                                 None,
-                                vtl2_saved_state_recv.unwrap(),
+                                vtl2_saved_state_recv,
                             )
                         }),
                         Some(&gm),
