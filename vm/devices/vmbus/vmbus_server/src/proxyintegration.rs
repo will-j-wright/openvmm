@@ -67,7 +67,7 @@ use zerocopy::IntoBytes;
 pub struct ProxyServerInfo {
     control: Arc<VmbusServerControl>,
     hvsock_relay: Option<HvsockRelayChannelHalf>,
-    saved_state: SavedStateRelayChannelHalf,
+    saved_state: Option<SavedStateRelayChannelHalf>,
 }
 
 impl ProxyServerInfo {
@@ -75,7 +75,7 @@ impl ProxyServerInfo {
     pub fn new(
         control: Arc<VmbusServerControl>,
         hvsock_relay: Option<HvsockRelayChannelHalf>,
-        saved_state: SavedStateRelayChannelHalf,
+        saved_state: Option<SavedStateRelayChannelHalf>,
     ) -> Self {
         Self {
             control,
@@ -708,7 +708,7 @@ impl ProxyTask {
         &self,
         request: Result<Option<SavedState>, mesh::RecvError>,
         vtl: Vtl,
-    ) {
+    ) -> bool {
         let request = match request {
             Ok(request) => request,
             Err(e) => {
@@ -719,7 +719,7 @@ impl ProxyTask {
                         "saved state request receive failed"
                     );
                 }
-                return;
+                return false;
             }
         };
 
@@ -737,6 +737,7 @@ impl ProxyTask {
                 );
             }
         }
+        true
     }
 
     async fn run_server_requests(
@@ -745,7 +746,7 @@ impl ProxyTask {
         mut recv: mesh::Receiver<TaggedStream<u64, mesh::Receiver<ChannelRequest>>>,
         mut hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
         mut vtl2_hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
-        mut saved_state_recv: SavedStateRelayChannelHalf,
+        mut saved_state_recv: Option<SavedStateRelayChannelHalf>,
         mut vtl2_saved_state_recv: Option<SavedStateRelayChannelHalf>,
     ) {
         let mut channel_requests = SelectAll::new();
@@ -763,7 +764,12 @@ impl ProxyTask {
                         .as_mut()
                         .map(|recv| Box::pin(recv.recv()).fuse()),
                 );
-                let mut saved_state_requests = Box::pin(saved_state_recv.recv()).fuse();
+
+                let mut saved_state_requests = OptionFuture::from(
+                    saved_state_recv
+                        .as_mut()
+                        .map(|recv| Box::pin(recv.recv()).fuse()),
+                );
 
                 let mut vtl2_saved_state_requests = OptionFuture::from(
                     vtl2_saved_state_recv
@@ -787,10 +793,14 @@ impl ProxyTask {
                         }
                     }
                     r = saved_state_requests => {
-                        self.handle_saved_state_request(r, Vtl::Vtl0);
+                        if !self.handle_saved_state_request(r.unwrap(), Vtl::Vtl0) {
+                            saved_state_recv = None;
+                        }
                     }
                     r = vtl2_saved_state_requests => {
-                        self.handle_saved_state_request(r.unwrap(), Vtl::Vtl2);
+                        if !self.handle_saved_state_request(r.unwrap(), Vtl::Vtl2) {
+                            vtl2_hvsock_request_recv = None;
+                        }
                     }
                     complete => break 'outer,
                 }
@@ -833,7 +843,7 @@ async fn proxy_thread(
                 Some(server.control),
                 vtl2_hvsock_request_recv,
                 vtl2_hvsock_response_send,
-                Some(vtl2_saved_state_recv),
+                vtl2_saved_state_recv,
             )
         } else {
             (None, None, None, None)
