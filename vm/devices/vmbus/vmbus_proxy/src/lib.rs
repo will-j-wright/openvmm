@@ -33,6 +33,7 @@ use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows::Win32::System::IO::DeviceIoControl;
+use windows::core::GUID;
 use zerocopy::IntoBytes;
 
 mod proxyioctl;
@@ -266,17 +267,36 @@ impl VmbusProxy {
         NTSTATUS(output.Status).ok()
     }
 
-    pub async fn restore(
-        &self,
-        id: u64,
-        params: &VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS,
-    ) -> Result<()> {
+    pub async fn restore(&self, id: u64) -> Result<()> {
         unsafe {
             self.ioctl(
                 proxyioctl::IOCTL_VMBUS_PROXY_RESTORE_CHANNEL,
-                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_INPUT {
+                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_INPUT { ChannelId: id }),
+                (),
+            )
+            .await
+        }
+    }
+
+    pub async fn restore_state(
+        &self,
+        id: u64,
+        interface_type: GUID,
+        interface_instance: GUID,
+        subchannel_index: u16,
+        open_params: VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS,
+        open: bool,
+    ) -> Result<()> {
+        unsafe {
+            self.ioctl(
+                proxyioctl::IOCTL_VMBUS_PROXY_RESTORE_STATE,
+                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_STATE_INPUT {
                     ChannelId: id,
-                    OpenParameters: *params,
+                    InterfaceType: interface_type,
+                    InterfaceInstance: interface_instance,
+                    SubchannelIndex: subchannel_index,
+                    OpenParameters: open_params,
+                    Open: open,
                 }),
                 (),
             )

@@ -338,6 +338,14 @@ impl SavedState {
             })
             .is_some()
     }
+
+    pub fn channels_iter(&self) -> Option<std::slice::Iter<'_, Channel>> {
+        self.state.as_ref().map(|s| s.channels.iter())
+    }
+
+    pub fn gpadls_iter(&self) -> Option<std::slice::Iter<'_, Gpadl>> {
+        self.state.as_ref().map(|s| s.gpadls.iter())
+    }
 }
 
 #[derive(Debug, Clone, Protobuf)]
@@ -583,7 +591,7 @@ impl ConnectionAction {
 
 #[derive(Debug, Clone, Protobuf)]
 #[mesh(package = "vmbus.server.channels")]
-struct Channel {
+pub struct Channel {
     #[mesh(1)]
     key: OfferKey,
     #[mesh(2)]
@@ -634,6 +642,29 @@ impl Channel {
         let state = self.state.restore()?;
         tracing::info!(key = %self.key, %state, "channel restored");
         Ok((info, stub_offer, state))
+    }
+
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+
+    pub fn saved_open(&self) -> bool {
+        self.state.is_open()
+    }
+
+    pub fn key(&self) -> OfferKey {
+        self.key
+    }
+
+    pub fn open_request(&self) -> Option<OpenRequest> {
+        match self.state {
+            ChannelState::Closed => None,
+            ChannelState::Opening { request, .. } => Some(request),
+            ChannelState::Open { params, .. } => Some(params),
+            ChannelState::Closing { params, .. } => Some(params),
+            ChannelState::ClosingReopen { params, .. } => Some(params),
+            ChannelState::Revoked => None,
+        }
     }
 }
 
@@ -773,15 +804,15 @@ impl SignalInfo {
 
 #[derive(Debug, Copy, Clone, Protobuf)]
 #[mesh(package = "vmbus.server.channels")]
-struct OpenRequest {
+pub struct OpenRequest {
     #[mesh(1)]
     open_id: u32,
     #[mesh(2)]
-    ring_buffer_gpadl_id: GpadlId,
+    pub ring_buffer_gpadl_id: GpadlId,
     #[mesh(3)]
     target_vp: u32,
     #[mesh(4)]
-    downstream_ring_buffer_page_offset: u32,
+    pub downstream_ring_buffer_page_offset: u32,
     #[mesh(5)]
     user_data: [u8; 120],
     #[mesh(6)]
@@ -1024,6 +1055,10 @@ impl ChannelState {
             }
         })
     }
+
+    fn is_open(&self) -> bool {
+        matches!(self, ChannelState::Open { .. })
+    }
 }
 
 impl Display for ChannelState {
@@ -1042,15 +1077,15 @@ impl Display for ChannelState {
 
 #[derive(Debug, Clone, Protobuf)]
 #[mesh(package = "vmbus.server.channels")]
-struct Gpadl {
+pub struct Gpadl {
     #[mesh(1)]
-    id: u32,
+    pub id: u32,
     #[mesh(2)]
-    channel_id: u32,
+    pub channel_id: u32,
     #[mesh(3)]
-    count: u16,
+    pub count: u16,
     #[mesh(4)]
-    buf: Vec<u64>,
+    pub buf: Vec<u64>,
     #[mesh(5)]
     state: GpadlState,
 }
