@@ -24,7 +24,6 @@ use futures::StreamExt;
 use futures::future::OptionFuture;
 use futures::stream::SelectAll;
 use guestmem::GuestMemory;
-use hvdef::Vtl;
 use mesh::Cancel;
 use mesh::CancelContext;
 use mesh::rpc::Rpc;
@@ -371,7 +370,7 @@ impl ProxyTask {
             }
         };
 
-        // Restore channel state in the proxy if the requested channel is in the saved state.
+        // Restore GPADLs in the proxy if the requested channel is in the saved state.
         if let Some(saved_state) = match offer.TargetVtl {
             0 => self.saved_state.lock().clone(),
             2 => self.vtl2_saved_state.lock().clone(),
@@ -391,56 +390,15 @@ impl ProxyTask {
                         .await;
                     match result {
                         Ok(r) => {
-                            if let Some(open_request) = r.open_request {
-                                let open_result = self
-                                    .proxy
-                                    .restore(
-                                        id,
-                                        &VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS {
-                                            RingBufferGpadlHandle: open_request
-                                                .open_data
-                                                .ring_gpadl_id
-                                                .0,
-                                            DownstreamRingBufferPageOffset: open_request
-                                                .open_data
-                                                .ring_offset,
-                                            NodeNumber: 0, // BUGBUG: NUMA
-                                        },
-                                    )
-                                    .await;
-                                if let Err(err) = open_result {
-                                    tracing::error!(
-                                        error = &err as &dyn std::error::Error,
-                                        interface_id = %interface_id,
-                                        instance_id = %instance_id,
-                                        "failed to restore proxy channel: proxy IOCTL failed"
-                                    );
-                                } else {
-                                    tracing::trace!(
-                                                interface_id = %interface_id,
-                                                instance_id = %instance_id,
-                                                "restoring GPADLs for proxy channel");
-                                    for gpadl in r.gpadls {
-                                        if let Err(err) = self
-                                            .proxy
-                                            .create_gpadl(
-                                                id,
-                                                gpadl.request.id.0,
-                                                gpadl.request.count.into(),
-                                                gpadl.request.buf.as_bytes(),
-                                            )
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                error = &err as &dyn std::error::Error,
-                                                interface_id = %interface_id,
-                                                instance_id = %instance_id,
-                                                "failed to restore channel GPADLs in proxy"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
+                            let open_result = self.proxy.restore(id).await;
+                            if let Err(err) = open_result {
+                                tracing::error!(
+                                    error = &err as &dyn std::error::Error,
+                                    interface_id = %interface_id,
+                                    instance_id = %instance_id,
+                                    "failed to restore proxy channel: proxy IOCTL failed"
+                                );
+                            } else {
                             }
                         }
                         Err(err) => {
@@ -704,10 +662,10 @@ impl ProxyTask {
         true
     }
 
-    fn handle_saved_state_request(
+    async fn handle_saved_state_request(
         &self,
         request: Result<Option<SavedState>, mesh::RecvError>,
-        vtl: Vtl,
+        vtl: u8,
     ) -> bool {
         let request = match request {
             Ok(request) => request,
@@ -723,20 +681,80 @@ impl ProxyTask {
             }
         };
 
-        match vtl {
-            Vtl::Vtl0 => {
+        let saved_state = match vtl {
+            0 => {
                 *self.saved_state.lock() = request;
+                self.saved_state.as_ref()
             }
-            Vtl::Vtl2 => {
+            2 => {
                 *self.vtl2_saved_state.lock() = request;
+                self.vtl2_saved_state.as_ref()
             }
             _ => {
                 tracelimit::error_ratelimited!(
                     vtl = ?vtl,
                     "saved state request receive failed: Unsupported VTL"
                 );
+
+                return true;
+            }
+        };
+
+        let saved_state = { saved_state.lock().clone() };
+
+        // Restore channel state in the proxy for each channel in the SavedState.
+        if let Some(saved_state) = saved_state {
+            if let Some(channels) = saved_state.channels_iter() {
+                for channel in channels {
+                    let key = channel.key();
+                    let open_params = channel.open_request();
+                    let open_params = if let Some(params) = open_params {
+                        params
+                    } else {
+                        continue;
+                    };
+                    let _ = self
+                        .proxy
+                        .restore_state(
+                            channel.channel_id() as u64,
+                            key.interface_id.into(),
+                            key.instance_id.into(),
+                            key.subchannel_index.into(),
+                            VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS {
+                                RingBufferGpadlHandle: open_params.ring_buffer_gpadl_id.0,
+                                DownstreamRingBufferPageOffset: open_params
+                                    .downstream_ring_buffer_page_offset,
+                                NodeNumber: 0, // BUGBUG: NUMA
+                            },
+                            channel.saved_open(),
+                        )
+                        .await;
+                }
+                if let Some(gpadls) = saved_state.gpadls_iter() {
+                    for gpadl in gpadls {
+                        if let Err(err) = self
+                            .proxy
+                            .create_gpadl(
+                                gpadl.channel_id.into(),
+                                gpadl.id.into(),
+                                gpadl.count.into(),
+                                gpadl.buf.as_bytes(),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                channel_id = %gpadl.channel_id,
+                                gpadl_id = %gpadl.id,
+                                "failed to restore channel GPADLs in proxy"
+                            );
+                            break;
+                        }
+                    }
+                }
             }
         }
+
         true
     }
 
@@ -793,12 +811,12 @@ impl ProxyTask {
                         }
                     }
                     r = saved_state_requests => {
-                        if !self.handle_saved_state_request(r.unwrap(), Vtl::Vtl0) {
+                        if !self.handle_saved_state_request(r.unwrap(), 0).await {
                             saved_state_recv = None;
                         }
                     }
                     r = vtl2_saved_state_requests => {
-                        if !self.handle_saved_state_request(r.unwrap(), Vtl::Vtl2) {
+                        if !self.handle_saved_state_request(r.unwrap(), 2).await {
                             vtl2_hvsock_request_recv = None;
                         }
                     }
