@@ -370,7 +370,7 @@ impl ProxyTask {
             }
         };
 
-        // Restore GPADLs in the proxy if the requested channel is in the saved state.
+        // Restore channel in the server if the requested channel is in the saved state.
         if let Some(saved_state) = match offer.TargetVtl {
             0 => self.saved_state.lock().clone(),
             2 => self.vtl2_saved_state.lock().clone(),
@@ -388,27 +388,13 @@ impl ProxyTask {
                             }),
                         )
                         .await;
-                    match result {
-                        Ok(r) => {
-                            let open_result = self.proxy.restore(id).await;
-                            if let Err(err) = open_result {
-                                tracing::error!(
-                                    error = &err as &dyn std::error::Error,
-                                    interface_id = %interface_id,
-                                    instance_id = %instance_id,
-                                    "failed to restore proxy channel: proxy IOCTL failed"
-                                );
-                            } else {
-                            }
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                error = &err as &dyn std::error::Error,
-                                interface_id = %interface_id,
-                                instance_id = %instance_id,
-                                "failed to restore proxy channel"
-                            );
-                        }
+                    if let Err(err) = result {
+                        tracing::error!(
+                            error = &err as &dyn std::error::Error,
+                            interface_id = %interface_id,
+                            instance_id = %instance_id,
+                            "failed to restore proxy channel"
+                        );
                     }
                 }
             }
@@ -427,13 +413,16 @@ impl ProxyTask {
     }
 
     async fn handle_revoke(&self, id: u64) {
-        let response_send = self
-            .channels
-            .lock()
-            .get_mut(&id)
-            .unwrap()
-            .server_request_send
-            .take();
+        let response_send = match self.channels.lock().get_mut(&id) {
+            Some(c) => c.server_request_send.take(),
+            None => {
+                // The channel was not in the local list. This might happen when the proxy driver revokes
+                // a channel which was created in the driver on restore but was not yet restored in
+                // the vmbus server.
+                tracing::trace!(id = %id, "tried to revoke a channel not in the list");
+                return;
+            }
+        };
 
         if let Some(response_send) = response_send {
             drop(response_send);
@@ -702,8 +691,11 @@ impl ProxyTask {
 
         let saved_state = { saved_state.lock().clone() };
 
-        // Restore channel state in the proxy for each channel in the SavedState.
+        // Map the vmbus server channel ID to the newly creataed proxy channel ID
+        let mut proxy_ids: HashMap<u32, u64> = HashMap::new();
+
         if let Some(saved_state) = saved_state {
+            // Restore channel state in the proxy for each channel in the SavedState.
             if let Some(channels) = saved_state.channels_iter() {
                 for channel in channels {
                     let key = channel.key();
@@ -713,10 +705,9 @@ impl ProxyTask {
                     } else {
                         continue;
                     };
-                    let _ = self
+                    let proxy_id_result = self
                         .proxy
-                        .restore_state(
-                            channel.channel_id() as u64,
+                        .restore(
                             key.interface_id.into(),
                             key.instance_id.into(),
                             key.subchannel_index.into(),
@@ -729,13 +720,41 @@ impl ProxyTask {
                             channel.saved_open(),
                         )
                         .await;
+                    match proxy_id_result {
+                        Ok(proxy_id) => {
+                            tracing::trace!(%proxy_id, channel_id = %channel.channel_id(), "inserting channel into map");
+                            proxy_ids.insert(channel.channel_id(), proxy_id);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                channel_id = %channel.channel_id(),
+                                "failed to restore channel in proxy"
+                            );
+                            continue;
+                        }
+                    }
                 }
                 if let Some(gpadls) = saved_state.gpadls_iter() {
                     for gpadl in gpadls {
+                        let Some(proxy_id) = proxy_ids.get(&gpadl.channel_id) else {
+                            tracing::error!(
+                                channel_id = %gpadl.channel_id,
+                                gpadl_id = %gpadl.id,
+                                "failed to restore gpadl in proxy: proxy ID not found"
+                            );
+                            continue;
+                        };
+                        tracing::trace!(
+                            id = %gpadl.id,
+                            channel_id = %gpadl.channel_id,
+                            proxy_id = %proxy_id,
+                            "restoring gpadl in proxy"
+                        );
                         if let Err(err) = self
                             .proxy
                             .create_gpadl(
-                                gpadl.channel_id.into(),
+                                *proxy_id,
                                 gpadl.id.into(),
                                 gpadl.count.into(),
                                 gpadl.buf.as_bytes(),
@@ -753,6 +772,14 @@ impl ProxyTask {
                     }
                 }
             }
+        } else {
+            // The VM has started. Tell the proxy to revoke all unclaimed channels.
+            // if let Err(err) = self.proxy.revoke_unclaimed_channels().await {
+            //     tracing::error!(
+            //         error = &err as &dyn std::error::Error,
+            //         "revoke unclaimed channels ioctl failed"
+            //     );
+            // }
         }
 
         true
