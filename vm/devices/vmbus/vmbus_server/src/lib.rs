@@ -984,6 +984,7 @@ impl ServerTask {
             VmbusRequest::Restore(rpc) => rpc.handle_sync(|state| {
                 self.unstick_on_start = !state.lost_synic_bug_fixed;
                 if let Some(sender) = self.inner.saved_state_send.as_ref() {
+                    tracing::trace!("sending saved state to proxy");
                     sender.send(Some(state.server.clone()));
                 }
 
@@ -1002,12 +1003,13 @@ impl ServerTask {
                     if let Some(sender) = self.inner.saved_state_send.as_ref() {
                         // Indicate to the proxy that the server is starting and that it should
                         // clear its saved state cache.
+                        tracing::trace!("sending clear saved state message to proxy");
                         sender.send(None);
                     }
 
-                    self.server
-                        .with_notifier(&mut self.inner)
-                        .revoke_unclaimed_channels();
+                    // self.server
+                    //     .with_notifier(&mut self.inner)
+                    //     .revoke_unclaimed_channels();
                     if self.unstick_on_start {
                         tracing::info!(
                             "lost synic bug fix is not in yet, call unstick_channels to mitigate the issue."

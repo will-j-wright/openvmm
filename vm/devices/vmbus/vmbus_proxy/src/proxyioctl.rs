@@ -47,7 +47,7 @@ pub const IOCTL_VMBUS_PROXY_RUN_CHANNEL: u32 = VMBUS_PROXY_IOCTL(0xa);
 pub const IOCTL_VMBUS_PROXY_SET_VID_HANDLE: u32 = VMBUS_PROXY_IOCTL(0xb);
 pub const IOCTL_VMBUS_PROXY_TL_CONNECT_REQUEST: u32 = VMBUS_PROXY_IOCTL(0xc);
 pub const IOCTL_VMBUS_PROXY_RESTORE_CHANNEL: u32 = VMBUS_PROXY_IOCTL(0xd);
-pub const IOCTL_VMBUS_PROXY_RESTORE_STATE: u32 = VMBUS_PROXY_IOCTL(0xe);
+pub const IOCTL_VMBUS_PROXY_REVOKE_UNCLAIMED_CHANNELS: u32 = VMBUS_PROXY_IOCTL(0xe);
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -126,18 +126,16 @@ pub struct VMBUS_PROXY_OPEN_CHANNEL_OUTPUT {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct VMBUS_PROXY_RESTORE_CHANNEL_INPUT {
-    pub ChannelId: u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct VMBUS_PROXY_RESTORE_STATE_INPUT {
-    pub ChannelId: u64,
     pub InterfaceType: GUID,
     pub InterfaceInstance: GUID,
     pub SubchannelIndex: u16,
     pub OpenParameters: VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS,
     pub Open: bool,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct VMBUS_PROXY_RESTORE_CHANNEL_OUTPUT {
+    pub ChannelId: u64,
 }
 
 #[repr(C)]

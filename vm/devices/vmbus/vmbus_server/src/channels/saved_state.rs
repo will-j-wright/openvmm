@@ -1092,6 +1092,7 @@ pub struct Gpadl {
 
 impl Gpadl {
     fn save(gpadl_id: GpadlId, channel_id: ChannelId, gpadl: &super::Gpadl) -> Option<Self> {
+        tracing::info!(id = %gpadl_id.0, channel_id = %channel_id.0, "gpadl saved");
         Some(Gpadl {
             id: gpadl_id.0,
             channel_id: channel_id.0,

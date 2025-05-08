@@ -267,37 +267,37 @@ impl VmbusProxy {
         NTSTATUS(output.Status).ok()
     }
 
-    pub async fn restore(&self, id: u64) -> Result<()> {
-        unsafe {
-            self.ioctl(
-                proxyioctl::IOCTL_VMBUS_PROXY_RESTORE_CHANNEL,
-                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_INPUT { ChannelId: id }),
-                (),
-            )
-            .await
-        }
-    }
-
-    pub async fn restore_state(
+    pub async fn restore(
         &self,
-        id: u64,
         interface_type: GUID,
         interface_instance: GUID,
         subchannel_index: u16,
         open_params: VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS,
         open: bool,
-    ) -> Result<()> {
-        unsafe {
+    ) -> Result<u64> {
+        Ok(unsafe {
             self.ioctl(
-                proxyioctl::IOCTL_VMBUS_PROXY_RESTORE_STATE,
-                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_STATE_INPUT {
-                    ChannelId: id,
+                proxyioctl::IOCTL_VMBUS_PROXY_RESTORE_CHANNEL,
+                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_INPUT {
                     InterfaceType: interface_type,
                     InterfaceInstance: interface_instance,
                     SubchannelIndex: subchannel_index,
                     OpenParameters: open_params,
                     Open: open,
                 }),
+                StaticIoctlBuffer(zeroed::<proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_OUTPUT>()),
+            )
+            .await?
+            .0
+            .ChannelId
+        })
+    }
+
+    pub async fn revoke_unclaimed_channels(&self) -> Result<()> {
+        unsafe {
+            self.ioctl(
+                proxyioctl::IOCTL_VMBUS_PROXY_REVOKE_UNCLAIMED_CHANNELS,
+                (),
                 (),
             )
             .await
