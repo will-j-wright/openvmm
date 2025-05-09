@@ -1007,9 +1007,9 @@ impl ServerTask {
                         sender.send(None);
                     }
 
-                    // self.server
-                    //     .with_notifier(&mut self.inner)
-                    //     .revoke_unclaimed_channels();
+                    self.server
+                        .with_notifier(&mut self.inner)
+                        .revoke_unclaimed_channels();
                     if self.unstick_on_start {
                         tracing::info!(
                             "lost synic bug fix is not in yet, call unstick_channels to mitigate the issue."
