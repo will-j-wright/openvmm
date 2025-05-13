@@ -370,6 +370,9 @@ impl ProxyTask {
             }
         };
 
+        let mut wrapped_event = None;
+        let mut worker_result = None;
+
         // Restore channel in the server if the requested channel is in the saved state.
         if let Some(saved_state) = match offer.TargetVtl {
             0 => self.saved_state.lock().clone(),
@@ -389,13 +392,65 @@ impl ProxyTask {
                             }),
                         )
                         .await;
-                    if let Err(err) = result {
-                        tracing::error!(
-                            error = &err as &dyn std::error::Error,
-                            interface_id = %interface_id,
-                            instance_id = %instance_id,
-                            "failed to restore proxy channel"
-                        );
+                    match result {
+                        Ok(r) => {
+                            if let Some(open_request) = r.open_request {
+                                if let Some(event) = open_request.interrupt.event() {
+                                    if let Err(err) = self.proxy.set_interrupt(id, event).await {
+                                        tracing::error!(
+                                            error = &err as &dyn std::error::Error,
+                                            interface_id = %interface_id,
+                                            instance_id = %instance_id,
+                                            "failed to set channel interrupt in proxy"
+                                        );
+                                    } else {
+                                        wrapped_event = MaybeWrappedEvent::new(
+                                            &TpPool::system(),
+                                            open_request.interrupt.clone(),
+                                        )
+                                        .unwrap()
+                                        .into_wrapped();
+
+                                        // Start the worker thread for the channel.
+                                        let proxy = Arc::clone(&self.proxy);
+                                        let (send, recv) = mesh::oneshot();
+                                        std::thread::Builder::new()
+                                            .name(format!("vmbus proxy worker {:?}", id))
+                                            .spawn(move || {
+                                                if let Err(err) = proxy.run_channel(id) {
+                                                    tracing::error!(
+                                                        err = &err as &dyn std::error::Error,
+                                                        "channel worker error"
+                                                    );
+                                                }
+                                                send.send(());
+                                            })
+                                            .unwrap();
+                                        worker_result = Some(recv);
+                                    }
+                                } else {
+                                    tracing::error!(
+                                    interface_id = %interface_id,
+                                    instance_id = %instance_id,
+                                    "failed to restore proxy channel: no Event"
+                                    );
+                                };
+                            } else {
+                                tracing::error!(
+                                interface_id = %interface_id,
+                                instance_id = %instance_id,
+                                "failed to restore proxy channel: no OpenRequest"
+                                );
+                            };
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                interface_id = %interface_id,
+                                instance_id = %instance_id,
+                                "failed to restore proxy channel"
+                            );
+                        }
                     }
                 }
             }
@@ -406,10 +461,11 @@ impl ProxyTask {
             Channel {
                 server_request_send,
                 incoming_event,
-                worker_result: None,
-                wrapped_event: None,
+                worker_result,
+                wrapped_event,
             },
         );
+
         request_recv
     }
 

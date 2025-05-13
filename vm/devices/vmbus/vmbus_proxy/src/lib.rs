@@ -266,6 +266,21 @@ impl VmbusProxy {
         };
         NTSTATUS(output.Status).ok()
     }
+    pub async fn set_interrupt(&self, id: u64, event: &Event) -> Result<()> {
+        unsafe {
+            let handle = event.as_handle().as_raw_handle() as usize as u64;
+            self.ioctl(
+                proxyioctl::IOCTL_VMBUS_PROXY_SET_INTERRUPT,
+                StaticIoctlBuffer(proxyioctl::VMBUS_PROXY_SET_INTERRUPT_INPUT {
+                    ChannelId: id,
+                    VmmSignalEvent: handle,
+                }),
+                (),
+            )
+            .await?
+        };
+        Ok(())
+    }
 
     pub async fn restore(
         &self,
