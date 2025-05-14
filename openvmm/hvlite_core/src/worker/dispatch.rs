@@ -1672,7 +1672,7 @@ impl InitializedVm {
             let hvsock_channel = HvsockRelayChannel::new();
             let saved_state_channel = SavedStateRelayChannel::new();
 
-            let (vtl2_vmbus, vtl2_request_send, vtl2_saved_state_recv) =
+            let (vtl2_vmbus, vtl2_request_send, _vtl2_saved_state_recv) =
                 if let Some(vtl2_vmbus_cfg) = cfg.vtl2_vmbus {
                     let (server_request_send, server_request_recv) = mesh::channel();
                     let vtl2_hvsock_channel = HvsockRelayChannel::new();
@@ -1730,6 +1730,7 @@ impl InitializedVm {
                         .vmbus_max_version
                         .map(vmbus_core::MaxVersionInfo::new),
                 )
+                .proxy_saved_state_notify(Some(saved_state_channel.server_half))
                 .delay_max_version(matches!(cfg.load_mode, LoadMode::Uefi { .. }))
                 .enable_mnf(true)
                 .build()
@@ -1751,7 +1752,7 @@ impl InitializedVm {
                             vmbus_server::ProxyServerInfo::new(
                                 server.control().clone(),
                                 None,
-                                vtl2_saved_state_recv,
+                                _vtl2_saved_state_recv,
                             )
                         }),
                         Some(&gm),
