@@ -57,7 +57,7 @@ use vmbus_proxy::ProxyAction;
 use vmbus_proxy::VmbusProxy;
 use vmbus_proxy::vmbusioctl::VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS;
 use vmcore::interrupt::Interrupt;
-use windows::Win32::Foundation::ERROR_CANCELLED;
+use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows::core::HRESULT;
 use zerocopy::IntoBytes;
 
@@ -379,7 +379,11 @@ impl ProxyTask {
             2 => self.vtl2_saved_state.lock().clone(),
             _ => unreachable!(),
         } {
-            if saved_state.contains_channel(interface_id, instance_id, offer.SubChannelIndex) {
+            if saved_state.contains_channel_to_restore(
+                interface_id,
+                instance_id,
+                offer.SubChannelIndex,
+            ) {
                 if let Some(send) = server_request_send.as_ref() {
                     tracing::trace!(%interface_id, %instance_id, "restoring channel after offer");
                     let result = send
@@ -484,10 +488,17 @@ impl ProxyTask {
         if let Some(response_send) = response_send {
             drop(response_send);
         } else {
-            self.proxy
-                .release(id)
-                .await
-                .expect("vmbus proxy state failure");
+            if let Err(err) = self.proxy.release(id).await {
+                if err.code() == HRESULT::from(ERROR_OPERATION_ABORTED) {
+                    tracing::trace!(%id, "proxy release aborted during ioctl");
+                } else {
+                    tracing::error!(
+                        error = &err as &dyn std::error::Error,
+                        "proxy channel release failed"
+                    );
+                    panic!("vmbus proxy state failure");
+                }
+            }
 
             self.channels.lock().remove(&id);
         }
@@ -547,7 +558,7 @@ impl ProxyTask {
             let action = match action {
                 Ok(action) => action,
                 Err(e) => {
-                    if e == windows::Win32::Foundation::ERROR_OPERATION_ABORTED.into() {
+                    if e == ERROR_OPERATION_ABORTED.into() {
                         tracing::debug!("proxy cancelled");
                     } else {
                         tracing::error!(
@@ -642,7 +653,7 @@ impl ProxyTask {
                         tracing::info!(proxy_id, "closed while some gpadls are still registered");
                         for gpadl_id in gpadls {
                             if let Err(e) = self.proxy.delete_gpadl(proxy_id, gpadl_id.0).await {
-                                if e.code() == HRESULT::from(ERROR_CANCELLED) {
+                                if e.code() == HRESULT::from(ERROR_OPERATION_ABORTED) {
                                     // No further IOs will succeed if one was cancelled. This can
                                     // happen here if we're in the process of shutting down.
                                     tracing::debug!("gpadl delete cancelled");
@@ -664,10 +675,17 @@ impl ProxyTask {
                     .server_request_send
                     .is_none()
                 {
-                    self.proxy
-                        .release(proxy_id)
-                        .await
-                        .expect("vmbus proxy state failure");
+                    if let Err(err) = self.proxy.release(proxy_id).await {
+                        if err.code() == HRESULT::from(ERROR_OPERATION_ABORTED) {
+                            tracing::trace!(%proxy_id, "proxy release aborted during ioctl");
+                        } else {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                "proxy channel release failed"
+                            );
+                            panic!("vmbus proxy state failure");
+                        }
+                    }
 
                     self.channels.lock().remove(&proxy_id);
                 }
@@ -769,7 +787,7 @@ impl ProxyTask {
                         .restore(
                             key.interface_id.into(),
                             key.instance_id.into(),
-                            key.subchannel_index.into(),
+                            key.subchannel_index,
                             VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS {
                                 RingBufferGpadlHandle: open_params.ring_buffer_gpadl_id.0,
                                 DownstreamRingBufferPageOffset: open_params
@@ -781,7 +799,6 @@ impl ProxyTask {
                         .await;
                     match proxy_id_result {
                         Ok(proxy_id) => {
-                            tracing::trace!(%proxy_id, channel_id = %channel.channel_id(), "inserting channel into map");
                             proxy_ids.insert(channel.channel_id(), proxy_id);
                         }
                         Err(err) => {
@@ -797,7 +814,7 @@ impl ProxyTask {
                 if let Some(gpadls) = saved_state.gpadls_iter() {
                     for gpadl in gpadls {
                         let Some(proxy_id) = proxy_ids.get(&gpadl.channel_id) else {
-                            tracing::error!(
+                            tracing::warn!(
                                 channel_id = %gpadl.channel_id,
                                 gpadl_id = %gpadl.id,
                                 "failed to restore gpadl in proxy: proxy ID not found"

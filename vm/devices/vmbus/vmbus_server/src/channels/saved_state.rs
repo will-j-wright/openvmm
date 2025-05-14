@@ -321,7 +321,8 @@ pub struct SavedState {
 }
 
 impl SavedState {
-    pub fn contains_channel(
+    /// Returns true if the channel is in the SavedState and was not saved closed.
+    pub fn contains_channel_to_restore(
         &self,
         interface_id: Guid,
         instance_id: Guid,
@@ -336,7 +337,7 @@ impl SavedState {
                         && c.key.subchannel_index == subchannel_index
                 })
             })
-            .is_some()
+            .is_some_and(|c| !matches!(c.unwrap().state, ChannelState::Closed))
     }
 
     pub fn channels_iter(&self) -> Option<std::slice::Iter<'_, Channel>> {
