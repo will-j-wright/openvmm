@@ -322,29 +322,18 @@ pub struct SavedState {
 
 impl SavedState {
     /// Returns true if the channel is in the SavedState and was not saved closed.
-    pub fn contains_channel_to_restore(
-        &self,
-        interface_id: Guid,
-        instance_id: Guid,
-        subchannel_index: u16,
-    ) -> bool {
+    pub fn contains_channel_to_restore(&self, offer: OfferKey) -> bool {
         self.state
             .as_ref()
-            .map(|s| {
-                s.channels.iter().find(|c| {
-                    c.key.instance_id == instance_id
-                        && c.key.interface_id == interface_id
-                        && c.key.subchannel_index == subchannel_index
-                })
-            })
+            .map(|s| s.channels.iter().find(|c| c.key == offer))
             .is_some_and(|c| !matches!(c.unwrap().state, ChannelState::Closed))
     }
 
-    pub fn channels_iter(&self) -> Option<std::slice::Iter<'_, Channel>> {
+    pub fn channels(&self) -> Option<std::slice::Iter<'_, Channel>> {
         self.state.as_ref().map(|s| s.channels.iter())
     }
 
-    pub fn gpadls_iter(&self) -> Option<std::slice::Iter<'_, Gpadl>> {
+    pub fn gpadls(&self) -> Option<std::slice::Iter<'_, Gpadl>> {
         self.state.as_ref().map(|s| s.gpadls.iter())
     }
 }
@@ -610,7 +599,7 @@ impl Channel {
         let info = value.info.as_ref()?;
         let key = value.offer.key();
         if let Some(state) = ChannelState::save(&value.state) {
-            tracing::info!(%key, %state, "channel saved");
+            tracing::trace!(%key, %state, "channel saved");
             Some(Channel {
                 channel_id: info.channel_id.0,
                 offered_connection_id: info.connection_id,

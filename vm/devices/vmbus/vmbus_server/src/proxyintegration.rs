@@ -14,7 +14,6 @@ use super::ProxyHandle;
 use super::TaggedStream;
 use super::VmbusServerControl;
 use crate::HvsockRelayChannelHalf;
-use crate::SavedStateRelayChannelHalf;
 use crate::channels::SavedState;
 use crate::event::MaybeWrappedEvent;
 use crate::event::WrappedEvent;
@@ -46,6 +45,7 @@ use std::task::ready;
 use std::time::Duration;
 use vmbus_channel::bus::ChannelServerRequest;
 use vmbus_channel::bus::ChannelType;
+use vmbus_channel::bus::OfferKey;
 use vmbus_channel::bus::OfferParams;
 use vmbus_channel::bus::OpenRequest;
 use vmbus_channel::bus::OpenResult;
@@ -66,7 +66,7 @@ use zerocopy::IntoBytes;
 pub struct ProxyServerInfo {
     control: Arc<VmbusServerControl>,
     hvsock_relay: Option<HvsockRelayChannelHalf>,
-    saved_state: Option<SavedStateRelayChannelHalf>,
+    saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
 }
 
 impl ProxyServerInfo {
@@ -74,12 +74,12 @@ impl ProxyServerInfo {
     pub fn new(
         control: Arc<VmbusServerControl>,
         hvsock_relay: Option<HvsockRelayChannelHalf>,
-        saved_state: Option<SavedStateRelayChannelHalf>,
+        saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
     ) -> Self {
         Self {
             control,
             hvsock_relay,
-            saved_state,
+            saved_state_recv,
         }
     }
 }
@@ -146,6 +146,11 @@ struct Channel {
     wrapped_event: Option<WrappedEvent>,
 }
 
+struct SavedStatePair {
+    saved_state: Option<SavedState>,
+    vtl2_saved_state: Option<SavedState>,
+}
+
 struct ProxyTask {
     channels: Arc<Mutex<HashMap<u64, Channel>>>,
     gpadls: Arc<Mutex<HashMap<u64, HashSet<GpadlId>>>>,
@@ -154,8 +159,7 @@ struct ProxyTask {
     vtl2_server: Option<Arc<VmbusServerControl>>,
     hvsock_response_send: Option<mesh::Sender<HvsockConnectResult>>,
     vtl2_hvsock_response_send: Option<mesh::Sender<HvsockConnectResult>>,
-    saved_state: Arc<Mutex<Option<SavedState>>>,
-    vtl2_saved_state: Arc<Mutex<Option<SavedState>>>,
+    saved_states: Arc<Mutex<SavedStatePair>>,
 }
 
 impl ProxyTask {
@@ -174,8 +178,10 @@ impl ProxyTask {
             hvsock_response_send,
             vtl2_hvsock_response_send,
             vtl2_server,
-            saved_state: Arc::new(Mutex::new(None)),
-            vtl2_saved_state: Arc::new(Mutex::new(None)),
+            saved_states: Arc::new(Mutex::new(SavedStatePair {
+                saved_state: None,
+                vtl2_saved_state: None,
+            })),
         }
     }
 
@@ -275,38 +281,31 @@ impl ProxyTask {
             .expect("delete gpadl failed");
     }
 
-    async fn maybe_restore_channel(
+    async fn restore_open_channel_on_offer(
         &self,
         id: u64,
-        interface_id: Guid,
-        instance_id: Guid,
-        offer: &vmbus_proxy::vmbusioctl::VMBUS_CHANNEL_OFFER,
+        offer_key: OfferKey,
+        vtl: u8,
         server_request_send: Option<mesh::Sender<ChannelServerRequest>>,
         incoming_event: Event,
-    ) -> (Option<WrappedEvent>, Option<mesh::OneshotReceiver<()>>) {
-        let saved_state = match offer.TargetVtl {
-            0 => self.saved_state.lock().clone(),
-            2 => self.vtl2_saved_state.lock().clone(),
-            _ => unreachable!(),
-        };
-        if saved_state.is_none() {
-            return (None, None);
-        }
-        let saved_state = saved_state.unwrap();
+    ) -> Option<(Option<WrappedEvent>, Option<mesh::OneshotReceiver<()>>)> {
+        let saved_state = {
+            let saved_states = self.saved_states.lock();
+            match vtl {
+                0 => saved_states.saved_state.clone(),
+                2 => saved_states.vtl2_saved_state.clone(),
+                _ => unreachable!(),
+            }
+        }?;
 
-        if !saved_state.contains_channel_to_restore(
-            interface_id,
-            instance_id,
-            offer.SubChannelIndex,
-        ) {
-            return (None, None);
+        if !saved_state.contains_channel_to_restore(offer_key) {
+            return None;
         }
 
-        let send = match server_request_send.as_ref() {
-            Some(s) => s,
-            None => return (None, None),
-        };
-        tracing::trace!(%interface_id, %instance_id, "restoring channel after offer");
+        let send = server_request_send.as_ref()?;
+        tracing::trace!(interface_id = %offer_key.interface_id, 
+            instance_id = %offer_key.instance_id, 
+            "restoring channel after offer");
 
         let call_result = send
             .call_failable(
@@ -321,50 +320,34 @@ impl ProxyTask {
             Err(err) => {
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
-                    interface_id = %interface_id,
-                    instance_id = %instance_id,
+                    interface_id = %offer_key.interface_id, instance_id = %offer_key.instance_id,
                     "failed to restore proxy channel"
                 );
-                return (None, None);
+                return None;
             }
         };
-        let open_request = match open_request {
-            Some(o) => o,
-            None => {
-                tracing::error!(
-                    interface_id = %interface_id,
-                    instance_id = %instance_id,
-                    "failed to restore proxy channel: no OpenRequest"
-                );
-                return (None, None);
-            }
+        let Some(open_request) = open_request else {
+            tracing::error!(
+            interface_id = %offer_key.interface_id, 
+            instance_id = %offer_key.instance_id,
+            "failed to restore proxy channel: no OpenRequest"
+            );
+            return None;
         };
 
-        let event = match open_request.interrupt.event() {
-            Some(e) => e,
-            None => {
-                tracing::error!(
-                    interface_id = %interface_id,
-                    instance_id = %instance_id,
-                    "failed to restore proxy channel: no Event"
-                );
-                return (None, None);
-            }
-        };
-        if let Err(err) = self.proxy.set_interrupt(id, event).await {
+        let maybe_wrapped =
+            MaybeWrappedEvent::new(&TpPool::system(), open_request.interrupt.clone())
+                .unwrap();
+
+        if let Err(err) = self.proxy.set_interrupt(id, maybe_wrapped.event()).await {
             tracing::error!(
                 error = &err as &dyn std::error::Error,
-                interface_id = %interface_id,
-                instance_id = %instance_id,
+                interface_id = %offer_key.interface_id, 
+                instance_id = %offer_key.instance_id,
                 "failed to set channel interrupt in proxy"
             );
-            return (None, None);
+            return None;
         }
-
-        let wrapped_event =
-            MaybeWrappedEvent::new(&TpPool::system(), open_request.interrupt.clone())
-                .unwrap()
-                .into_wrapped();
 
         let proxy = Arc::clone(&self.proxy);
         let (send, recv) = mesh::oneshot();
@@ -378,7 +361,7 @@ impl ProxyTask {
             })
             .unwrap();
 
-        (wrapped_event, Some(recv))
+        Some((maybe_wrapped.into_wrapped(), Some(recv)))
     }
 
     async fn handle_offer(
@@ -476,16 +459,20 @@ impl ProxyTask {
             }
         };
 
-        let (wrapped_event, worker_result) = self
-            .maybe_restore_channel(
+        let restore_result = self
+            .restore_open_channel_on_offer(
                 id,
-                interface_id,
-                instance_id,
-                &offer,
+                OfferKey { interface_id, instance_id, subchannel_index: offer.SubChannelIndex },
+                offer.TargetVtl,
                 server_request_send.clone(),
                 incoming_event.clone(),
             )
             .await;
+
+        let (wrapped_event, worker_result) = match restore_result {
+            Some((wrapped_event, restore_result)) => (wrapped_event, restore_result),
+            None => (None, None)
+        };
 
         self.channels.lock().insert(
             id,
@@ -771,27 +758,27 @@ impl ProxyTask {
                 return false;
             }
         };
+        let saved_state = {
+            let mut saved_states = self.saved_states.lock();
+            match vtl {
+                0 => {
+                    saved_states.saved_state = request;
+                    saved_states.saved_state.clone()
+                }
+                2 => {
+                    saved_states.vtl2_saved_state = request;
+                    saved_states.vtl2_saved_state.clone()
+                }
+                _ => {
+                    tracelimit::error_ratelimited!(
+                        vtl = ?vtl,
+                        "saved state request receive failed: Unsupported VTL"
+                    );
 
-        let saved_state = match vtl {
-            0 => {
-                *self.saved_state.lock() = request;
-                self.saved_state.as_ref()
-            }
-            2 => {
-                *self.vtl2_saved_state.lock() = request;
-                self.vtl2_saved_state.as_ref()
-            }
-            _ => {
-                tracelimit::error_ratelimited!(
-                    vtl = ?vtl,
-                    "saved state request receive failed: Unsupported VTL"
-                );
-
-                return true;
+                    return true;
+                }
             }
         };
-
-        let saved_state = { saved_state.lock().clone() };
 
         // Map the vmbus server channel ID to the newly created proxy channel ID
         let mut proxy_ids: HashMap<u32, u64> = HashMap::new();
@@ -799,7 +786,7 @@ impl ProxyTask {
         if let Some(saved_state) = saved_state {
             tracing::trace!("restoring channels...");
             // Restore channel state in the proxy for each channel in the SavedState.
-            if let Some(channels) = saved_state.channels_iter() {
+            if let Some(channels) = saved_state.channels() {
                 for channel in channels {
                     tracing::trace!(?channel, "restoring channel");
                     let key = channel.key();
@@ -838,7 +825,7 @@ impl ProxyTask {
                         }
                     }
                 }
-                if let Some(gpadls) = saved_state.gpadls_iter() {
+                if let Some(gpadls) = saved_state.gpadls() {
                     for gpadl in gpadls {
                         let Some(proxy_id) = proxy_ids.get(&gpadl.channel_id) else {
                             tracing::warn!(
@@ -893,8 +880,8 @@ impl ProxyTask {
         mut recv: mesh::Receiver<TaggedStream<u64, mesh::Receiver<ChannelRequest>>>,
         mut hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
         mut vtl2_hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
-        mut saved_state_recv: Option<SavedStateRelayChannelHalf>,
-        mut vtl2_saved_state_recv: Option<SavedStateRelayChannelHalf>,
+        mut saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
+        mut vtl2_saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
     ) {
         let mut channel_requests = SelectAll::new();
 
@@ -985,7 +972,7 @@ async fn proxy_thread(
                 .hvsock_relay
                 .map(|relay| (relay.request_receive, relay.response_send))
                 .unzip();
-            let vtl2_saved_state_recv = server.saved_state;
+            let vtl2_saved_state_recv = server.saved_state_recv;
             (
                 Some(server.control),
                 vtl2_hvsock_request_recv,
@@ -1011,7 +998,7 @@ async fn proxy_thread(
         recv,
         hvsock_request_recv,
         vtl2_hvsock_request_recv,
-        server.saved_state,
+        server.saved_state_recv,
         vtl2_saved_state_recv,
     );
 
