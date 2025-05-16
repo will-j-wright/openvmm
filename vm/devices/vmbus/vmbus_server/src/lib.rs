@@ -1003,13 +1003,10 @@ impl ServerTask {
                         // Indicate to the proxy that the server is starting and that it should
                         // clear its saved state cache.
                         tracing::trace!("sending clear saved state message to proxy");
-                        if let Err(err) = sender.call(SavedStateRequest::Clear, ()).await {
-                            tracing::warn!(
-                                err = &err as &dyn std::error::Error,
-                                "failed to clear proxy saved state"
-                            );
-                            self.inner.saved_state_notify = None;
-                        }
+                        sender
+                            .call(SavedStateRequest::Clear, ())
+                            .await
+                            .expect("failed to clear proxy saved state");
                     }
 
                     self.server

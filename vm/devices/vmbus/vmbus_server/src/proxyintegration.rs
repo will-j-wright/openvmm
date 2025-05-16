@@ -72,12 +72,6 @@ pub struct ProxyServerInfo {
     saved_state_recv: Option<mesh::Receiver<SavedStateRequest>>,
 }
 
-/// The ID of a channel in the proxy which may or may not exist.
-enum ProxyId {
-    Active(u64),
-    Inactive,
-}
-
 impl ProxyServerInfo {
     /// Creates a new `ProxyServerInfo` instance.
     pub fn new(
@@ -303,7 +297,7 @@ impl ProxyTask {
         server_request_send: Option<mesh::Sender<ChannelServerRequest>>,
         incoming_event: Event,
     ) -> Option<(Option<WrappedEvent>, mesh::OneshotReceiver<()>)> {
-        let channel_saved_close = {
+        let channel_saved_open = {
             let saved_states = self.saved_states.lock().await;
             match vtl {
                 0 => saved_states.saved_state.as_ref(),
@@ -311,62 +305,56 @@ impl ProxyTask {
                 _ => unreachable!(),
             }?
             .find_channel(offer_key)?
-            .saved_closed()
+            .saved_open()
         };
 
         let send = server_request_send.as_ref()?;
-        tracing::trace!(interface_id = %offer_key.interface_id, 
-            instance_id = %offer_key.instance_id, 
+        tracing::trace!(interface_id = %offer_key.interface_id,
+            instance_id = %offer_key.instance_id,
             "restoring channel after offer");
 
-        let call_result = send
+        let restore_result = match send
             .call_failable(
                 ChannelServerRequest::Restore,
-                if channel_saved_close {
-                    None
-                } else {
-                    Some(OpenResult {
-                        guest_to_host_interrupt: Interrupt::from_event(incoming_event.clone()),
-                    })
-                },
+                channel_saved_open.then(|| OpenResult {
+                    guest_to_host_interrupt: Interrupt::from_event(incoming_event.clone()),
+                }),
             )
-            .await;
-        let open_request = match call_result {
-            Ok(r) => r.open_request,
+            .await
+        {
+            Ok(result) => result,
             Err(err) => {
-                tracing::error!(
-                    error = &err as &dyn std::error::Error,
-                    interface_id = %offer_key.interface_id, instance_id = %offer_key.instance_id,
-                    "failed to restore proxy channel"
+                tracing::warn!(
+                    err = &err as &dyn std::error::Error,
+                    interface_id = %offer_key.interface_id,
+                    instance_id = %offer_key.instance_id,
+                    "failed to restore channel"
                 );
                 return None;
             }
         };
-        let Some(open_request) = open_request else {
-            tracing::error!(
-            interface_id = %offer_key.interface_id,
-            instance_id = %offer_key.instance_id,
-            "failed to restore proxy channel: no OpenRequest"
-            );
-            return None;
+
+        let Some(open_request) = restore_result.open_request else {
+            if channel_saved_open {
+                panic!("failed to restore channel {}: no OpenRequest", offer_key);
+            } else {
+                // The channel was not saved open. There is no more work to do.
+                return None;
+            }
         };
 
         let maybe_wrapped =
             MaybeWrappedEvent::new(&TpPool::system(), open_request.interrupt.clone()).unwrap();
 
-        if let Err(err) = self
-            .proxy
+        self.proxy
             .set_interrupt(proxy_id, maybe_wrapped.event())
             .await
-        {
-            tracing::error!(
-                error = &err as &dyn std::error::Error,
-                interface_id = %offer_key.interface_id,
-                instance_id = %offer_key.instance_id,
-                "failed to set channel interrupt in proxy"
-            );
-            return None;
-        }
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to set interrupt in proxy for channel {}: {:?}",
+                    offer_key, e
+                )
+            });
 
         let recv = self.create_worker_thread(proxy_id);
 
@@ -501,16 +489,13 @@ impl ProxyTask {
     }
 
     async fn handle_revoke(&self, proxy_id: u64) {
-        let response_send = match self.channels.lock().get_mut(&proxy_id) {
-            Some(c) => c.server_request_send.take(),
-            None => {
-                // The channel was not in the local list. This might happen when the proxy driver revokes
-                // a channel which was created in the driver on restore but was not yet restored in
-                // the vmbus server.
-                tracing::warn!(id = %proxy_id, "tried to revoke a channel not in the list");
-                return;
-            }
-        };
+        let response_send = self
+            .channels
+            .lock()
+            .get_mut(&proxy_id)
+            .unwrap()
+            .server_request_send
+            .take();
 
         if let Some(response_send) = response_send {
             drop(response_send);
@@ -789,7 +774,7 @@ impl ProxyTask {
         match request {
             SavedStateRequest::Set(rpc) => {
                 // Map the vmbus server channel ID to the newly created proxy channel ID
-                let mut proxy_ids: HashMap<u32, ProxyId> = HashMap::new();
+                let mut proxy_ids: HashMap<u32, u64> = HashMap::new();
                 tracing::trace!("restoring channels...");
 
                 rpc.handle_failable(async |saved_state: SavedState| {
@@ -800,10 +785,9 @@ impl ProxyTask {
                             let key = channel.key();
                             let open_params = channel.open_request();
                             let Some(open_params) = open_params else {
-                                proxy_ids.insert(channel.channel_id(), ProxyId::Inactive);
                                 continue;
                             };
-                            let proxy_id_result = self
+                            let proxy_id = self
                                 .proxy
                                 .restore(
                                     key.interface_id.into(),
@@ -817,39 +801,22 @@ impl ProxyTask {
                                     },
                                     channel.saved_open(),
                                 )
-                                .await;
-                            match proxy_id_result {
-                                Ok(proxy_id) => {
-                                    proxy_ids
-                                        .insert(channel.channel_id(), ProxyId::Active(proxy_id));
-                                }
-                                Err(err) => {
-                                    tracing::error!(
-                                        error = &err as &dyn std::error::Error,
-                                        channel_id = %channel.channel_id(),
-                                        "failed to restore channel in proxy"
-                                    );
-                                    return Err(anyhow!("Failed to restore channel in proxy"));
-                                }
-                            }
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "Failed to restore channel {} in proxy",
+                                        channel.channel_id()
+                                    )
+                                })?;
+
+                            proxy_ids.insert(channel.channel_id(), proxy_id);
                         }
                         if let Some(gpadls) = saved_state.gpadls() {
                             for gpadl in gpadls {
                                 if gpadl.is_tearing_down() {
                                     continue;
                                 }
-                                let Some(proxy_state) = proxy_ids.get(&gpadl.channel_id) else {
-                                    tracing::warn!(
-                                        gpadl = ?gpadl,
-                                        channel_id = %gpadl.channel_id,
-                                        gpadl_id = %gpadl.id,
-                                        "failed to restore gpadl in proxy: proxy ID not found"
-                                    );
-                                    return Err(anyhow!(
-                                        "Failed to restore gpadl in proxy: proxy ID not found"
-                                    ));
-                                };
-                                let ProxyId::Active(proxy_id) = proxy_state else {
+                                let Some(proxy_id) = proxy_ids.get(&gpadl.channel_id) else {
                                     continue;
                                 };
                                 tracing::trace!(
@@ -858,25 +825,19 @@ impl ProxyTask {
                                     proxy_id = %proxy_id,
                                     "restoring gpadl in proxy"
                                 );
-                                if let Err(err) = self
-                                    .handle_gpadl_create(
-                                        *proxy_id,
-                                        GpadlId(gpadl.id),
-                                        gpadl.count,
-                                        gpadl.buf.as_slice(),
+                                self.handle_gpadl_create(
+                                    *proxy_id,
+                                    GpadlId(gpadl.id),
+                                    gpadl.count,
+                                    gpadl.buf.as_slice(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to restore GPADLs ID {} for channel {} in proxy",
+                                        gpadl.channel_id, gpadl.id
                                     )
-                                    .await
-                                {
-                                    tracing::error!(
-                                        error = ?err,
-                                        channel_id = %gpadl.channel_id,
-                                        gpadl_id = %gpadl.id,
-                                        "failed to restore channel GPADLs in proxy"
-                                    );
-                                    return Err(anyhow!(
-                                        "failed to restore channel GPADLs in proxy"
-                                    ));
-                                }
+                                })?;
                             }
                         }
                     } else {

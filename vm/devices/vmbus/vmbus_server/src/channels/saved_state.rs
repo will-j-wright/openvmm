@@ -641,10 +641,6 @@ impl Channel {
         matches!(self.state, ChannelState::Open { .. })
     }
 
-    pub fn saved_closed(&self) -> bool {
-        matches!(self.state, ChannelState::Closed)
-    }
-
     pub fn key(&self) -> OfferKey {
         self.key
     }
