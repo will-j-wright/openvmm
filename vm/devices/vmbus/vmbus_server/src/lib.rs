@@ -9,7 +9,7 @@ pub mod channels;
 pub mod event;
 pub mod hvsock;
 mod monitor;
-mod proxyintegration;
+pub mod proxyintegration;
 
 /// The GUID type used for vmbus channel identifiers.
 pub type Guid = guid::Guid;
@@ -122,7 +122,7 @@ pub struct VmbusServerBuilder<'a, T: Spawn> {
     vtl: Vtl,
     hvsock_notify: Option<HvsockServerChannelHalf>,
     server_relay: Option<VmbusServerChannelHalf>,
-    saved_state_notify: Option<mesh::Sender<Option<channels::SavedState>>>,
+    saved_state_notify: Option<mesh::Sender<proxyintegration::SavedStateRequest>>,
     external_server: Option<mesh::Sender<InitiateContactRequest>>,
     external_requests: Option<mesh::Receiver<InitiateContactRequest>>,
     use_message_redirect: bool,
@@ -305,7 +305,7 @@ impl<'a, T: Spawn> VmbusServerBuilder<'a, T> {
     /// Sets a send channel used to enlighten ProxyIntegration about saved channels.
     pub fn saved_state_notify(
         mut self,
-        saved_state_notify: Option<mesh::Sender<Option<channels::SavedState>>>,
+        saved_state_notify: Option<mesh::Sender<proxyintegration::SavedStateRequest>>,
     ) -> Self {
         self.saved_state_notify = saved_state_notify;
         self
@@ -650,7 +650,7 @@ struct ServerTaskInner {
     message_port: Box<dyn GuestMessagePort>,
     hvsock_requests: usize,
     hvsock_send: mesh::Sender<HvsockConnectRequest>,
-    saved_state_notify: Option<mesh::Sender<Option<channels::SavedState>>>,
+    saved_state_notify: Option<mesh::Sender<proxyintegration::SavedStateRequest>>,
     channels: HashMap<OfferId, Channel>,
     channel_responses: FuturesUnordered<
         Pin<Box<dyn Send + Future<Output = (OfferId, u64, Result<ChannelResponse, RpcError>)>>>,
@@ -927,7 +927,7 @@ impl ServerTask {
         Ok(result)
     }
 
-    fn handle_request(&mut self, request: VmbusRequest) {
+    async fn handle_request(&mut self, request: VmbusRequest) {
         tracing::debug!(?request, "handle_request");
         match request {
             VmbusRequest::Reset(rpc) => self.handle_reset(rpc),
@@ -961,17 +961,32 @@ impl ServerTask {
                 server: self.server.save(),
                 lost_synic_bug_fixed: true,
             }),
-            VmbusRequest::Restore(rpc) => rpc.handle_sync(|state| {
-                self.unstick_on_start = !state.lost_synic_bug_fixed;
-                if let Some(sender) = self.inner.saved_state_notify.as_ref() {
-                    tracing::trace!("sending saved state to proxy");
-                    sender.send(Some(state.server.clone()));
-                }
+            VmbusRequest::Restore(rpc) => {
+                rpc.handle(async |state: SavedState| {
+                    self.unstick_on_start = !state.lost_synic_bug_fixed;
+                    if let Some(sender) = &self.inner.saved_state_notify {
+                        tracing::trace!("sending saved state to proxy");
+                        if let Err(err) = sender
+                            .call_failable(
+                                proxyintegration::SavedStateRequest::Set,
+                                state.server.clone(),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                err = &err as &dyn std::error::Error,
+                                "failed to restore proxy saved state"
+                            );
+                            return Err(RestoreError::ServerError(err.into()));
+                        }
+                    }
 
-                self.server
-                    .with_notifier(&mut self.inner)
-                    .restore(state.server)
-            }),
+                    self.server
+                        .with_notifier(&mut self.inner)
+                        .restore(state.server)
+                })
+                .await
+            }
             VmbusRequest::Stop(rpc) => rpc.handle_sync(|()| {
                 if self.inner.running {
                     self.inner.running = false;
@@ -984,7 +999,16 @@ impl ServerTask {
                         // Indicate to the proxy that the server is starting and that it should
                         // clear its saved state cache.
                         tracing::trace!("sending clear saved state message to proxy");
-                        sender.send(None);
+                        if let Err(err) = sender
+                            .call(proxyintegration::SavedStateRequest::Clear, ())
+                            .await
+                        {
+                            tracing::warn!(
+                                err = &err as &dyn std::error::Error,
+                                "failed to clear proxy saved state"
+                            );
+                            self.inner.saved_state_notify = None;
+                        }
                     }
 
                     self.server
@@ -1111,7 +1135,7 @@ impl ServerTask {
             futures::select! { // merge semantics
                 r = self.task_recv.recv().fuse() => {
                     if let Ok(request) = r {
-                        self.handle_request(request);
+                        self.handle_request(request).await;
                     } else {
                         break;
                     }

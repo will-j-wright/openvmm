@@ -18,6 +18,7 @@ use crate::channels::SavedState;
 use crate::event::MaybeWrappedEvent;
 use crate::event::WrappedEvent;
 use anyhow::Context;
+use futures::lock::Mutex as AsyncMutex;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::OptionFuture;
@@ -60,13 +61,21 @@ use vmcore::interrupt::Interrupt;
 use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows::core::HRESULT;
 use zerocopy::IntoBytes;
+use mesh::rpc::FailableRpc;
+use anyhow::anyhow;
 
 /// Provides access to a vmbus server, its optional hvsocket relay, and
 /// a channel to received saved state information.
 pub struct ProxyServerInfo {
     control: Arc<VmbusServerControl>,
     hvsock_relay: Option<HvsockRelayChannelHalf>,
-    saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
+    saved_state_recv: Option<mesh::Receiver<SavedStateRequest>>,
+}
+
+/// The ID of a channel in the proxy which may or may not exist.
+enum ProxyId {
+    Active(u64),
+    Inactive,
 }
 
 impl ProxyServerInfo {
@@ -74,7 +83,7 @@ impl ProxyServerInfo {
     pub fn new(
         control: Arc<VmbusServerControl>,
         hvsock_relay: Option<HvsockRelayChannelHalf>,
-        saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
+        saved_state_recv: Option<mesh::Receiver<SavedStateRequest>>,
     ) -> Self {
         Self {
             control,
@@ -82,6 +91,12 @@ impl ProxyServerInfo {
             saved_state_recv,
         }
     }
+}
+
+#[derive(mesh::MeshPayload)]
+pub enum SavedStateRequest {
+    Set(FailableRpc<SavedState, ()>),
+    Clear(Rpc<(), ()>),
 }
 
 pub struct ProxyIntegration {
@@ -159,7 +174,7 @@ struct ProxyTask {
     vtl2_server: Option<Arc<VmbusServerControl>>,
     hvsock_response_send: Option<mesh::Sender<HvsockConnectResult>>,
     vtl2_hvsock_response_send: Option<mesh::Sender<HvsockConnectResult>>,
-    saved_states: Arc<Mutex<SavedStatePair>>,
+    saved_states: Arc<AsyncMutex<SavedStatePair>>,
 }
 
 impl ProxyTask {
@@ -178,11 +193,27 @@ impl ProxyTask {
             hvsock_response_send,
             vtl2_hvsock_response_send,
             vtl2_server,
-            saved_states: Arc::new(Mutex::new(SavedStatePair {
+            saved_states: Arc::new(AsyncMutex::new(SavedStatePair {
                 saved_state: None,
                 vtl2_saved_state: None,
             })),
         }
+    }
+    
+    fn create_worker_thread(&self, proxy_id: u64) -> mesh::OneshotReceiver<()> {
+        let proxy = Arc::clone(&self.proxy);
+        let (send, recv) = mesh::oneshot();
+        std::thread::Builder::new()
+            .name(format!("vmbus proxy worker {:?}", proxy_id))
+            .spawn(move || {
+                if let Err(err) = proxy.run_channel(proxy_id) {
+                    tracing::error!(err = &err as &dyn std::error::Error, "channel worker error");
+                }
+                send.send(());
+            })
+            .unwrap();
+
+        recv
     }
 
     async fn handle_open(
@@ -206,18 +237,7 @@ impl ProxyTask {
             .await
             .context("failed to open channel")?;
 
-        // Start the worker thread for the channel.
-        let proxy = Arc::clone(&self.proxy);
-        let (send, recv) = mesh::oneshot();
-        std::thread::Builder::new()
-            .name(format!("vmbus proxy worker {:?}", proxy_id))
-            .spawn(move || {
-                if let Err(err) = proxy.run_channel(proxy_id) {
-                    tracing::error!(err = &err as &dyn std::error::Error, "channel worker error");
-                }
-                send.send(());
-            })
-            .unwrap();
+        let recv = self.create_worker_thread(proxy_id);
 
         let mut channels = self.channels.lock();
         let channel = channels.get_mut(&proxy_id).unwrap();
@@ -283,24 +303,20 @@ impl ProxyTask {
 
     async fn restore_open_channel_on_offer(
         &self,
-        id: u64,
+        proxy_id: u64,
         offer_key: OfferKey,
         vtl: u8,
         server_request_send: Option<mesh::Sender<ChannelServerRequest>>,
         incoming_event: Event,
-    ) -> Option<(Option<WrappedEvent>, Option<mesh::OneshotReceiver<()>>)> {
-        let saved_state = {
-            let saved_states = self.saved_states.lock();
+    ) -> Option<(Option<WrappedEvent>, mesh::OneshotReceiver<()>)> {
+        let channel_saved_close = {
+            let saved_states = self.saved_states.lock().await;
             match vtl {
-                0 => saved_states.saved_state.clone(),
-                2 => saved_states.vtl2_saved_state.clone(),
+                0 => saved_states.saved_state.as_ref(),
+                2 => saved_states.vtl2_saved_state.as_ref(),
                 _ => unreachable!(),
-            }
-        }?;
-
-        if !saved_state.contains_channel_to_restore(offer_key) {
-            return None;
-        }
+            }?.find_channel(offer_key)?.saved_closed()
+        };
 
         let send = server_request_send.as_ref()?;
         tracing::trace!(interface_id = %offer_key.interface_id, 
@@ -310,9 +326,13 @@ impl ProxyTask {
         let call_result = send
             .call_failable(
                 ChannelServerRequest::Restore,
-                Some(OpenResult {
-                    guest_to_host_interrupt: Interrupt::from_event(incoming_event.clone()),
-                }),
+                if channel_saved_close {
+                    None
+                } else {
+                    Some(OpenResult {
+                        guest_to_host_interrupt: Interrupt::from_event(incoming_event.clone()),
+                    })
+                },
             )
             .await;
         let open_request = match call_result {
@@ -328,7 +348,7 @@ impl ProxyTask {
         };
         let Some(open_request) = open_request else {
             tracing::error!(
-            interface_id = %offer_key.interface_id, 
+            interface_id = %offer_key.interface_id,
             instance_id = %offer_key.instance_id,
             "failed to restore proxy channel: no OpenRequest"
             );
@@ -336,37 +356,26 @@ impl ProxyTask {
         };
 
         let maybe_wrapped =
-            MaybeWrappedEvent::new(&TpPool::system(), open_request.interrupt.clone())
-                .unwrap();
+            MaybeWrappedEvent::new(&TpPool::system(), open_request.interrupt.clone()).unwrap();
 
-        if let Err(err) = self.proxy.set_interrupt(id, maybe_wrapped.event()).await {
+        if let Err(err) = self.proxy.set_interrupt(proxy_id, maybe_wrapped.event()).await {
             tracing::error!(
                 error = &err as &dyn std::error::Error,
-                interface_id = %offer_key.interface_id, 
+                interface_id = %offer_key.interface_id,
                 instance_id = %offer_key.instance_id,
                 "failed to set channel interrupt in proxy"
             );
             return None;
         }
 
-        let proxy = Arc::clone(&self.proxy);
-        let (send, recv) = mesh::oneshot();
-        std::thread::Builder::new()
-            .name(format!("vmbus proxy worker {:?}", id))
-            .spawn(move || {
-                if let Err(err) = proxy.run_channel(id) {
-                    tracing::error!(err = &err as &dyn std::error::Error, "channel worker error");
-                }
-                send.send(());
-            })
-            .unwrap();
+        let recv = self.create_worker_thread(proxy_id);
 
-        Some((maybe_wrapped.into_wrapped(), Some(recv)))
+        Some((maybe_wrapped.into_wrapped(), recv))
     }
 
     async fn handle_offer(
         &self,
-        id: u64,
+        proxy_id: u64,
         offer: vmbus_proxy::vmbusioctl::VMBUS_CHANNEL_OFFER,
         incoming_event: Event,
     ) -> Option<mesh::Receiver<ChannelRequest>> {
@@ -429,7 +438,7 @@ impl ProxyTask {
                 .ChannelFlags
                 .request_monitored_notification()
                 .then(|| Duration::from_nanos(offer.InterruptLatencyIn100nsUnits * 100)),
-            offer_order: id.try_into().ok(),
+            offer_order: proxy_id.try_into().ok(),
             allow_confidential_external_memory: false,
         };
         let (request_send, request_recv) = mesh::channel();
@@ -461,8 +470,12 @@ impl ProxyTask {
 
         let restore_result = self
             .restore_open_channel_on_offer(
-                id,
-                OfferKey { interface_id, instance_id, subchannel_index: offer.SubChannelIndex },
+                proxy_id,
+                OfferKey {
+                    interface_id,
+                    instance_id,
+                    subchannel_index: offer.SubChannelIndex,
+                },
                 offer.TargetVtl,
                 server_request_send.clone(),
                 incoming_event.clone(),
@@ -470,12 +483,12 @@ impl ProxyTask {
             .await;
 
         let (wrapped_event, worker_result) = match restore_result {
-            Some((wrapped_event, restore_result)) => (wrapped_event, restore_result),
-            None => (None, None)
+            Some((wrapped_event, restore_result)) => (wrapped_event, Some(restore_result)),
+            None => (None, None),
         };
 
         self.channels.lock().insert(
-            id,
+            proxy_id,
             Channel {
                 server_request_send,
                 incoming_event,
@@ -487,14 +500,14 @@ impl ProxyTask {
         request_recv
     }
 
-    async fn handle_revoke(&self, id: u64) {
-        let response_send = match self.channels.lock().get_mut(&id) {
+    async fn handle_revoke(&self, proxy_id: u64) {
+        let response_send = match self.channels.lock().get_mut(&proxy_id) {
             Some(c) => c.server_request_send.take(),
             None => {
                 // The channel was not in the local list. This might happen when the proxy driver revokes
                 // a channel which was created in the driver on restore but was not yet restored in
                 // the vmbus server.
-                tracing::warn!(id = %id, "tried to revoke a channel not in the list");
+                tracing::warn!(id = %proxy_id, "tried to revoke a channel not in the list");
                 return;
             }
         };
@@ -502,9 +515,9 @@ impl ProxyTask {
         if let Some(response_send) = response_send {
             drop(response_send);
         } else {
-            if let Err(err) = self.proxy.release(id).await {
+            if let Err(err) = self.proxy.release(proxy_id).await {
                 if err.code() == HRESULT::from(ERROR_OPERATION_ABORTED) {
-                    tracing::trace!(%id, "proxy release aborted during ioctl");
+                    tracing::trace!(%proxy_id, "proxy release aborted during ioctl");
                 } else {
                     tracing::error!(
                         error = &err as &dyn std::error::Error,
@@ -514,7 +527,7 @@ impl ProxyTask {
                 }
             }
 
-            self.channels.lock().remove(&id);
+            self.channels.lock().remove(&proxy_id);
         }
     }
 
@@ -742,7 +755,7 @@ impl ProxyTask {
 
     async fn handle_saved_state_request(
         &self,
-        request: Result<Option<SavedState>, mesh::RecvError>,
+        request: Result<SavedStateRequest, mesh::RecvError>,
         vtl: u8,
     ) -> bool {
         let request = match request {
@@ -758,117 +771,136 @@ impl ProxyTask {
                 return false;
             }
         };
-        let saved_state = {
-            let mut saved_states = self.saved_states.lock();
-            match vtl {
-                0 => {
-                    saved_states.saved_state = request;
-                    saved_states.saved_state.clone()
-                }
-                2 => {
-                    saved_states.vtl2_saved_state = request;
-                    saved_states.vtl2_saved_state.clone()
-                }
-                _ => {
-                    tracelimit::error_ratelimited!(
-                        vtl = ?vtl,
-                        "saved state request receive failed: Unsupported VTL"
-                    );
 
-                    return true;
-                }
+        let mut saved_states = self.saved_states.lock().await;
+        let saved_state_option = match vtl {
+            0 => {
+                &mut saved_states.saved_state
+            }
+            2 => {
+                &mut saved_states.vtl2_saved_state
+            }
+            _ => {
+                tracelimit::error_ratelimited!(
+                    vtl = ?vtl,
+                    "saved state request receive failed: Unsupported VTL"
+                );
+
+                return true;
             }
         };
 
-        // Map the vmbus server channel ID to the newly created proxy channel ID
-        let mut proxy_ids: HashMap<u32, u64> = HashMap::new();
+        match request {
+            SavedStateRequest::Set(rpc) => {
+                // Map the vmbus server channel ID to the newly created proxy channel ID
+                let mut proxy_ids: HashMap<u32, ProxyId> = HashMap::new();
+                tracing::trace!("restoring channels...");
 
-        if let Some(saved_state) = saved_state {
-            tracing::trace!("restoring channels...");
-            // Restore channel state in the proxy for each channel in the SavedState.
-            if let Some(channels) = saved_state.channels() {
-                for channel in channels {
-                    tracing::trace!(?channel, "restoring channel");
-                    let key = channel.key();
-                    let open_params = channel.open_request();
-                    let open_params = if let Some(params) = open_params {
-                        params
+                rpc.handle_failable(async |saved_state: SavedState| {
+                    // Restore channel state in the proxy for each channel in the SavedState.
+                    if let Some(channels) = saved_state.channels() {
+                        for channel in channels {
+                            tracing::trace!(?channel, "restoring channel");
+                            let key = channel.key();
+                            let open_params = channel.open_request();
+                            let Some(open_params) = open_params else {
+                                proxy_ids.insert(channel.channel_id(), ProxyId::Inactive);
+                                continue;
+                            };
+                            let proxy_id_result = self
+                                .proxy
+                                .restore(
+                                    key.interface_id.into(),
+                                    key.instance_id.into(),
+                                    key.subchannel_index,
+                                    VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS {
+                                        RingBufferGpadlHandle: open_params.ring_buffer_gpadl_id.0,
+                                        DownstreamRingBufferPageOffset: open_params
+                                            .downstream_ring_buffer_page_offset,
+                                        NodeNumber: 0, // BUGBUG: NUMA
+                                    },
+                                    channel.saved_open(),
+                                )
+                                .await;
+                            match proxy_id_result {
+                                Ok(proxy_id) => {
+                                    proxy_ids.insert(channel.channel_id(), ProxyId::Active(proxy_id));
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        error = &err as &dyn std::error::Error,
+                                        channel_id = %channel.channel_id(),
+                                        "failed to restore channel in proxy"
+                                    );
+                                    return Err(anyhow!("Failed to restore channel in proxy"));
+                                }
+                            }
+                        }
+                        if let Some(gpadls) = saved_state.gpadls() {
+                            for gpadl in gpadls {
+                                if gpadl.is_tearing_down() {
+                                    continue;
+                                }
+                                let Some(proxy_state) = proxy_ids.get(&gpadl.channel_id) else {
+                                    tracing::warn!(
+                                        gpadl = ?gpadl,
+                                        channel_id = %gpadl.channel_id,
+                                        gpadl_id = %gpadl.id,
+                                        "failed to restore gpadl in proxy: proxy ID not found"
+                                    );
+                                    return Err(anyhow!("Failed to restore gpadl in proxy: proxy ID not found"));
+                                };
+                                let ProxyId::Active(proxy_id) = proxy_state else {
+                                    continue;
+                                };
+                                tracing::trace!(
+                                    id = %gpadl.id,
+                                    channel_id = %gpadl.channel_id,
+                                    proxy_id = %proxy_id,
+                                    "restoring gpadl in proxy"
+                                );
+                                if let Err(err) = self
+                                    .handle_gpadl_create(
+                                        *proxy_id,
+                                        GpadlId(gpadl.id),
+                                        gpadl.count,
+                                        gpadl.buf.as_slice(),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        error = ?err,
+                                        channel_id = %gpadl.channel_id,
+                                        gpadl_id = %gpadl.id,
+                                        "failed to restore channel GPADLs in proxy"
+                                    );
+                                    return Err(anyhow!("failed to restore channel GPADLs in proxy"));
+                                }
+                            }
+                        }
                     } else {
-                        continue;
-                    };
-                    let proxy_id_result = self
-                        .proxy
-                        .restore(
-                            key.interface_id.into(),
-                            key.instance_id.into(),
-                            key.subchannel_index,
-                            VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS {
-                                RingBufferGpadlHandle: open_params.ring_buffer_gpadl_id.0,
-                                DownstreamRingBufferPageOffset: open_params
-                                    .downstream_ring_buffer_page_offset,
-                                NodeNumber: 0, // BUGBUG: NUMA
-                            },
-                            channel.saved_open(),
-                        )
-                        .await;
-                    match proxy_id_result {
-                        Ok(proxy_id) => {
-                            proxy_ids.insert(channel.channel_id(), proxy_id);
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                error = &err as &dyn std::error::Error,
-                                channel_id = %channel.channel_id(),
-                                "failed to restore channel in proxy"
-                            );
-                            continue;
-                        }
+                        return Err(anyhow!("No channels exist in the saved state"));
                     }
-                }
-                if let Some(gpadls) = saved_state.gpadls() {
-                    for gpadl in gpadls {
-                        let Some(proxy_id) = proxy_ids.get(&gpadl.channel_id) else {
-                            tracing::warn!(
-                                channel_id = %gpadl.channel_id,
-                                gpadl_id = %gpadl.id,
-                                "failed to restore gpadl in proxy: proxy ID not found"
-                            );
-                            continue;
-                        };
-                        tracing::trace!(
-                            id = %gpadl.id,
-                            channel_id = %gpadl.channel_id,
-                            proxy_id = %proxy_id,
-                            "restoring gpadl in proxy"
+
+                    *saved_state_option = Some(saved_state);
+                    Ok(())
+                }).await;
+            },
+            SavedStateRequest::Clear(rpc) => {
+                rpc.handle(async |()| {
+                    if saved_state_option.is_some() {
+                    // The VM has started. Tell the proxy to revoke all unclaimed channels.
+                    if let Err(err) = self.proxy.revoke_unclaimed_channels().await {
+                        tracing::error!(
+                            error = &err as &dyn std::error::Error,
+                            "revoke unclaimed channels ioctl failed"
                         );
-                        if let Err(err) = self
-                            .handle_gpadl_create(
-                                *proxy_id,
-                                GpadlId(gpadl.id),
-                                gpadl.count,
-                                gpadl.buf.as_slice(),
-                            )
-                            .await
-                        {
-                            tracing::error!(
-                                error = ?err,
-                                channel_id = %gpadl.channel_id,
-                                gpadl_id = %gpadl.id,
-                                "failed to restore channel GPADLs in proxy"
-                            );
-                            break;
-                        }
                     }
                 }
-            }
-        } else {
-            // The VM has started. Tell the proxy to revoke all unclaimed channels.
-            if let Err(err) = self.proxy.revoke_unclaimed_channels().await {
-                tracing::error!(
-                    error = &err as &dyn std::error::Error,
-                    "revoke unclaimed channels ioctl failed"
-                );
-            }
+                }).await;
+                
+                *saved_state_option = None;
+            },
         }
 
         true
@@ -880,8 +912,8 @@ impl ProxyTask {
         mut recv: mesh::Receiver<TaggedStream<u64, mesh::Receiver<ChannelRequest>>>,
         mut hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
         mut vtl2_hvsock_request_recv: Option<mesh::Receiver<HvsockConnectRequest>>,
-        mut saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
-        mut vtl2_saved_state_recv: Option<mesh::Receiver<Option<SavedState>>>,
+        mut saved_state_recv: Option<mesh::Receiver<SavedStateRequest>>,
+        mut vtl2_saved_state_recv: Option<mesh::Receiver<SavedStateRequest>>,
     ) {
         let mut channel_requests = SelectAll::new();
 

@@ -321,12 +321,11 @@ pub struct SavedState {
 }
 
 impl SavedState {
-    /// Returns true if the channel is in the SavedState and was not saved closed.
-    pub fn contains_channel_to_restore(&self, offer: OfferKey) -> bool {
+    /// Finds a channel in the saved state.
+    pub fn find_channel(&self, offer: OfferKey) -> Option<&Channel> {
         self.state
             .as_ref()
-            .map(|s| s.channels.iter().find(|c| c.key == offer))
-            .is_some_and(|c| !matches!(c.unwrap().state, ChannelState::Closed))
+            .map(|s| s.channels.iter().find(|c| c.key == offer))?
     }
 
     pub fn channels(&self) -> Option<std::slice::Iter<'_, Channel>> {
@@ -639,7 +638,11 @@ impl Channel {
     }
 
     pub fn saved_open(&self) -> bool {
-        self.state.is_open()
+        matches!(self.state, ChannelState::Open { .. })
+    }
+
+    pub fn saved_closed(&self) -> bool {
+        matches!(self.state, ChannelState::Closed)
     }
 
     pub fn key(&self) -> OfferKey {
@@ -1045,10 +1048,6 @@ impl ChannelState {
             }
         })
     }
-
-    fn is_open(&self) -> bool {
-        matches!(self, ChannelState::Open { .. })
-    }
 }
 
 impl Display for ChannelState {
@@ -1082,7 +1081,7 @@ pub struct Gpadl {
 
 impl Gpadl {
     fn save(gpadl_id: GpadlId, channel_id: ChannelId, gpadl: &super::Gpadl) -> Option<Self> {
-        tracing::info!(id = %gpadl_id.0, channel_id = %channel_id.0, "gpadl saved");
+        tracing::trace!(id = %gpadl_id.0, channel_id = %channel_id.0, "gpadl saved");
         Some(Gpadl {
             id: gpadl_id.0,
             channel_id: channel_id.0,
@@ -1127,11 +1126,15 @@ impl Gpadl {
             state,
         })
     }
+
+    pub fn is_tearing_down(&self) -> bool {
+        self.state == GpadlState::TearingDown
+    }
 }
 
 #[derive(Debug, Clone, Protobuf, PartialEq, Eq)]
 #[mesh(package = "vmbus.server.channels")]
-enum GpadlState {
+pub enum GpadlState {
     #[mesh(1)]
     InProgress,
     #[mesh(2)]
