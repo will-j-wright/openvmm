@@ -14,14 +14,16 @@ use super::ProxyHandle;
 use super::TaggedStream;
 use super::VmbusServerControl;
 use crate::HvsockRelayChannelHalf;
+use crate::SavedStateRequest;
 use crate::channels::SavedState;
 use crate::event::MaybeWrappedEvent;
 use crate::event::WrappedEvent;
 use anyhow::Context;
-use futures::lock::Mutex as AsyncMutex;
+use anyhow::anyhow;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::OptionFuture;
+use futures::lock::Mutex as AsyncMutex;
 use futures::stream::SelectAll;
 use guestmem::GuestMemory;
 use mesh::Cancel;
@@ -61,8 +63,6 @@ use vmcore::interrupt::Interrupt;
 use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use windows::core::HRESULT;
 use zerocopy::IntoBytes;
-use mesh::rpc::FailableRpc;
-use anyhow::anyhow;
 
 /// Provides access to a vmbus server, its optional hvsocket relay, and
 /// a channel to received saved state information.
@@ -91,12 +91,6 @@ impl ProxyServerInfo {
             saved_state_recv,
         }
     }
-}
-
-#[derive(mesh::MeshPayload)]
-pub enum SavedStateRequest {
-    Set(FailableRpc<SavedState, ()>),
-    Clear(Rpc<(), ()>),
 }
 
 pub struct ProxyIntegration {
@@ -199,7 +193,7 @@ impl ProxyTask {
             })),
         }
     }
-    
+
     fn create_worker_thread(&self, proxy_id: u64) -> mesh::OneshotReceiver<()> {
         let proxy = Arc::clone(&self.proxy);
         let (send, recv) = mesh::oneshot();
@@ -315,7 +309,9 @@ impl ProxyTask {
                 0 => saved_states.saved_state.as_ref(),
                 2 => saved_states.vtl2_saved_state.as_ref(),
                 _ => unreachable!(),
-            }?.find_channel(offer_key)?.saved_closed()
+            }?
+            .find_channel(offer_key)?
+            .saved_closed()
         };
 
         let send = server_request_send.as_ref()?;
@@ -358,7 +354,11 @@ impl ProxyTask {
         let maybe_wrapped =
             MaybeWrappedEvent::new(&TpPool::system(), open_request.interrupt.clone()).unwrap();
 
-        if let Err(err) = self.proxy.set_interrupt(proxy_id, maybe_wrapped.event()).await {
+        if let Err(err) = self
+            .proxy
+            .set_interrupt(proxy_id, maybe_wrapped.event())
+            .await
+        {
             tracing::error!(
                 error = &err as &dyn std::error::Error,
                 interface_id = %offer_key.interface_id,
@@ -774,12 +774,8 @@ impl ProxyTask {
 
         let mut saved_states = self.saved_states.lock().await;
         let saved_state_option = match vtl {
-            0 => {
-                &mut saved_states.saved_state
-            }
-            2 => {
-                &mut saved_states.vtl2_saved_state
-            }
+            0 => &mut saved_states.saved_state,
+            2 => &mut saved_states.vtl2_saved_state,
             _ => {
                 tracelimit::error_ratelimited!(
                     vtl = ?vtl,
@@ -824,7 +820,8 @@ impl ProxyTask {
                                 .await;
                             match proxy_id_result {
                                 Ok(proxy_id) => {
-                                    proxy_ids.insert(channel.channel_id(), ProxyId::Active(proxy_id));
+                                    proxy_ids
+                                        .insert(channel.channel_id(), ProxyId::Active(proxy_id));
                                 }
                                 Err(err) => {
                                     tracing::error!(
@@ -848,7 +845,9 @@ impl ProxyTask {
                                         gpadl_id = %gpadl.id,
                                         "failed to restore gpadl in proxy: proxy ID not found"
                                     );
-                                    return Err(anyhow!("Failed to restore gpadl in proxy: proxy ID not found"));
+                                    return Err(anyhow!(
+                                        "Failed to restore gpadl in proxy: proxy ID not found"
+                                    ));
                                 };
                                 let ProxyId::Active(proxy_id) = proxy_state else {
                                     continue;
@@ -874,7 +873,9 @@ impl ProxyTask {
                                         gpadl_id = %gpadl.id,
                                         "failed to restore channel GPADLs in proxy"
                                     );
-                                    return Err(anyhow!("failed to restore channel GPADLs in proxy"));
+                                    return Err(anyhow!(
+                                        "failed to restore channel GPADLs in proxy"
+                                    ));
                                 }
                             }
                         }
@@ -884,23 +885,25 @@ impl ProxyTask {
 
                     *saved_state_option = Some(saved_state);
                     Ok(())
-                }).await;
-            },
+                })
+                .await;
+            }
             SavedStateRequest::Clear(rpc) => {
                 rpc.handle(async |()| {
                     if saved_state_option.is_some() {
-                    // The VM has started. Tell the proxy to revoke all unclaimed channels.
-                    if let Err(err) = self.proxy.revoke_unclaimed_channels().await {
-                        tracing::error!(
-                            error = &err as &dyn std::error::Error,
-                            "revoke unclaimed channels ioctl failed"
-                        );
+                        // The VM has started. Tell the proxy to revoke all unclaimed channels.
+                        if let Err(err) = self.proxy.revoke_unclaimed_channels().await {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                "revoke unclaimed channels ioctl failed"
+                            );
+                        }
                     }
-                }
-                }).await;
-                
+                })
+                .await;
+
                 *saved_state_option = None;
-            },
+            }
         }
 
         true
