@@ -648,34 +648,18 @@ impl ConnectionAction {
 #[mesh(package = "vmbus.server.channels")]
 pub struct Channel {
     #[mesh(1)]
-    key: OfferKey,
+    pub key: OfferKey,
     #[mesh(2)]
-    channel_id: u32,
+    pub channel_id: u32,
     #[mesh(3)]
-    offered_connection_id: u32,
+    pub offered_connection_id: u32,
     #[mesh(4)]
-    state: ChannelState,
+    pub state: ChannelState,
     #[mesh(5)]
-    monitor_id: Option<u8>,
+    pub monitor_id: Option<u8>,
 }
 
 impl Channel {
-    fn new(
-        key: OfferKey,
-        channel_id: u32,
-        offered_connection_id: u32,
-        state: ChannelState,
-        monitor_id: Option<u8>,
-    ) -> Self {
-        Self {
-            key,
-            channel_id,
-            offered_connection_id,
-            state,
-            monitor_id,
-        }
-    }
-
     fn save(value: &super::Channel) -> Option<Self> {
         let info = value.info.as_ref()?;
         let key = value.offer.key();
