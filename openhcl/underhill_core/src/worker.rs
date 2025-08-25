@@ -3454,16 +3454,6 @@ async fn load_firmware(
         .await
         .context("failed to set initial registers")?;
 
-    // For compatibility reasons, APs' VTL0 is in the running state at startup.
-    // Send INIT to put them into startup suspend (wait for SIPI) state.
-    #[cfg(guest_arch = "x86_64")]
-    for vp in processor_topology.vps_arch().skip(1) {
-        partition.request_msi(
-            Vtl::Vtl0,
-            MsiRequest::new_x86(virt::irqcon::DeliveryMode::INIT, vp.apic_id, false, 0, true),
-        );
-    }
-
     Ok(())
 }
 
