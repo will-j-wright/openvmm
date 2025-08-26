@@ -9318,6 +9318,7 @@ dependencies = [
  "mesh",
  "mesh_rpc",
  "nvme_resources",
+ "nvme_spec",
  "pal",
  "pal_async",
  "petri",
