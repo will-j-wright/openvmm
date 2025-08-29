@@ -7843,6 +7843,7 @@ dependencies = [
  "fs-err",
  "futures",
  "futures-concurrency",
+ "gdma_defs",
  "get_helpers",
  "get_protocol",
  "getrandom 0.3.3",
@@ -7951,6 +7952,7 @@ dependencies = [
  "vmsocket",
  "vnc_worker_defs",
  "vpci",
+ "vpci_relay",
  "watchdog_core",
  "watchdog_vmgs_format",
  "x86defs",
@@ -9318,6 +9320,7 @@ dependencies = [
  "kmsg",
  "mesh",
  "mesh_rpc",
+ "net_backend_resources",
  "nvme_resources",
  "nvme_spec",
  "pal",
@@ -9333,6 +9336,7 @@ dependencies = [
  "tmk_tests",
  "tracing",
  "unix_socket",
+ "virtio_resources",
  "vm_resource",
  "vmm_test_macros",
  "vtl2_settings_proto",
@@ -9489,6 +9493,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "vpci_client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chipset_device",
+ "closeable_mutex",
+ "futures",
+ "futures-concurrency",
+ "guestmem",
+ "guid",
+ "inspect",
+ "mesh",
+ "pal_async",
+ "parking_lot",
+ "pci_core",
+ "slab",
+ "task_control",
+ "test_with_tracing",
+ "thiserror 2.0.16",
+ "tracelimit",
+ "tracing",
+ "vmbus_async",
+ "vmbus_channel",
+ "vmbus_ring",
+ "vmcore",
+ "vpci",
+ "vpci_protocol",
+ "zerocopy 0.8.25",
+]
+
+[[package]]
 name = "vpci_protocol"
 version = "0.0.0"
 dependencies = [
@@ -9496,6 +9531,34 @@ dependencies = [
  "guid",
  "open_enum",
  "zerocopy 0.8.25",
+]
+
+[[package]]
+name = "vpci_relay"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chipset_device",
+ "fs-err",
+ "futures",
+ "hcl",
+ "hvdef",
+ "inspect",
+ "memory_range",
+ "mesh",
+ "pci_core",
+ "slab",
+ "sparse_mmap",
+ "state_unit",
+ "tracelimit",
+ "tracing",
+ "user_driver",
+ "vmbus_client",
+ "vmbus_server",
+ "vmcore",
+ "vmotherboard",
+ "vpci",
+ "vpci_client",
 ]
 
 [[package]]
