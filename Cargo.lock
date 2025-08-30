@@ -4766,7 +4766,6 @@ dependencies = [
  "chipset_device",
  "device_emulators",
  "disk_backend",
- "event-listener",
  "futures",
  "futures-concurrency",
  "guestmem",
