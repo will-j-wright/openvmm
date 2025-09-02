@@ -358,6 +358,7 @@ async fn reboot<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> Result<(), any
 /// Basic boot test without agent
 // TODO: investigate why the shutdown ic doesn't work reliably with hyper-v
 // in our ubuntu image
+// TODO: re-enable TDX ubuntu tests once issues are resolved (here and below)
 #[vmm_test_no_agent(
     openvmm_linux_direct_x64,
     openvmm_openhcl_linux_direct_x64,
@@ -378,8 +379,11 @@ async fn reboot<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> Result<(), any
     hyperv_openhcl_uefi_x64(vhd(windows_datacenter_core_2022_x64)),
     // hyperv_openhcl_uefi_x64(vhd(ubuntu_2204_server_x64)),
     hyperv_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[vbs](vhd(ubuntu_2404_server_x64)),
     hyperv_openhcl_uefi_x64[tdx](vhd(windows_datacenter_core_2025_x64)),
-    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64))
+    // hyperv_openhcl_uefi_x64[tdx](vhd(ubuntu_2404_server_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(ubuntu_2404_server_x64))
 )]
 async fn boot_no_agent<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Result<()> {
     let mut vm = config.run_without_agent().await?;
@@ -393,8 +397,11 @@ async fn boot_no_agent<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow:
     openvmm_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2022_x64)),
     openvmm_openhcl_uefi_x64[vbs](vhd(ubuntu_2204_server_x64)),
     hyperv_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[vbs](vhd(ubuntu_2404_server_x64)),
     hyperv_openhcl_uefi_x64[tdx](vhd(windows_datacenter_core_2025_x64)),
-    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64))
+    // hyperv_openhcl_uefi_x64[tdx](vhd(ubuntu_2404_server_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(ubuntu_2404_server_x64))
 )]
 async fn boot_no_agent_heavy<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Result<()> {
     let mut vm = config
@@ -497,8 +504,11 @@ async fn vmbus_relay_heavy<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> any
     openvmm_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2022_x64)),
     openvmm_openhcl_uefi_x64[vbs](vhd(ubuntu_2204_server_x64)),
     hyperv_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[vbs](vhd(ubuntu_2404_server_x64)),
     hyperv_openhcl_uefi_x64[tdx](vhd(windows_datacenter_core_2025_x64)),
-    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64))
+    // hyperv_openhcl_uefi_x64[tdx](vhd(ubuntu_2404_server_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(ubuntu_2404_server_x64))
 )]
 async fn boot_no_agent_single_proc<T: PetriVmmBackend>(
     config: PetriVmBuilder<T>,
@@ -531,8 +541,11 @@ async fn boot_no_agent_single_proc<T: PetriVmmBackend>(
     openvmm_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2022_x64)),
     openvmm_openhcl_uefi_x64[vbs](vhd(ubuntu_2204_server_x64)),
     hyperv_openhcl_uefi_x64[vbs](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[vbs](vhd(ubuntu_2404_server_x64)),
     hyperv_openhcl_uefi_x64[tdx](vhd(windows_datacenter_core_2025_x64)),
-    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64))
+    // hyperv_openhcl_uefi_x64[tdx](vhd(ubuntu_2404_server_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(windows_datacenter_core_2025_x64)),
+    hyperv_openhcl_uefi_x64[snp](vhd(ubuntu_2404_server_x64))
 )]
 async fn reboot_no_agent<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyhow::Result<()> {
     let mut vm = config.run_without_agent().await?;
