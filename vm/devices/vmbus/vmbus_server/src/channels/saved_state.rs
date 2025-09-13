@@ -371,6 +371,7 @@ mod inner {
 }
 
 /// Represents either connected or disconnected saved state.
+#[derive(Debug, Clone)]
 pub enum SavedConnectionState {
     Connected(ConnectedState),
     Disconnected(DisconnectedState),
@@ -378,6 +379,7 @@ pub enum SavedConnectionState {
 
 /// Alternative representation of the saved state that ensures that all code paths deal with either
 /// the connected or disconnected state, and cannot neglect one.
+#[derive(Debug, Clone)]
 pub struct SavedStateData {
     pub state: SavedConnectionState,
     pub pending_messages: Vec<OutgoingMessage>,
