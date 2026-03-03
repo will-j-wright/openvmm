@@ -8,8 +8,10 @@
 
 // Use mimalloc instead of the system malloc for performance.
 // For memory profiling, DHAT allocator is needed.
+// When "sanitizer" is active, omit the #[global_allocator] entirely
+// so ASAN's instrumented allocator (via musl malloc) is used.
 #[global_allocator]
-#[cfg(not(feature = "mem-profile-tracing"))]
+#[cfg(not(any(feature = "mem-profile-tracing", feature = "sanitizer")))]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 #[cfg(feature = "mem-profile-tracing")]
@@ -17,9 +19,10 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 // musl's memcpy implementation is slow on x86_64, so we use memcpy crate to
 // provide an optimized implementation.
+// When "sanitizer" is active, skip this so ASAN can intercept memcpy.
 //
 // xtask-fmt allow-target-arch sys-crate
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "sanitizer")))]
 use fast_memcpy as _;
 
 // OpenVMM-HCL only needs libcrypto from openssl, not libssl.
