@@ -641,20 +641,20 @@ Examples:
     # Attach to root port rc0rp0 with default socket
     --pcie-remote rc0rp0
 
-    # Attach with custom socket path
-    --pcie-remote rc0rp0,socket=/tmp/custom.sock
+    # Attach with custom socket address
+    --pcie-remote rc0rp0,socket=0.0.0.0:48914
 
     # Specify HU and controller identifiers
     --pcie-remote rc0rp0,hu=1,controller=0
 
     # Multiple devices on different ports
-    --pcie-remote rc0rp0,socket=/tmp/dev0.sock
-    --pcie-remote rc0rp1,socket=/tmp/dev1.sock
+    --pcie-remote rc0rp0,socket=0.0.0.0:48914
+    --pcie-remote rc0rp1,socket=0.0.0.0:48915
 
 Syntax: <port_name>[,opt=arg,...]
 
 Options:
-    `socket=<path>`                 Unix socket path (default: /tmp/qemu-pci-remote-0-ep.sock)
+    `socket=<address>`              TCP socket (default: localhost:48914)
     `hu=<value>`                    Hardware unit identifier (default: 0)
     `controller=<value>`            Controller identifier (default: 0)
 "#)]
@@ -1674,8 +1674,8 @@ impl FromStr for GenericPcieSwitchCli {
 pub struct PcieRemoteCli {
     /// Name of the PCIe downstream port to attach to.
     pub port_name: String,
-    /// Unix socket path for the remote simulator.
-    pub socket_path: Option<String>,
+    /// TCP socket address for the remote simulator.
+    pub socket_addr: Option<String>,
     /// Hardware unit identifier for plug request.
     pub hu: u16,
     /// Controller identifier for plug request.
@@ -1692,7 +1692,7 @@ impl FromStr for PcieRemoteCli {
             anyhow::bail!("must provide a port name");
         }
 
-        let mut socket_path = None;
+        let mut socket_addr = None;
         let mut hu = 0u16;
         let mut controller = 0u16;
 
@@ -1703,14 +1703,14 @@ impl FromStr for PcieRemoteCli {
 
             match key {
                 "socket" => {
-                    let path = value.context("socket requires a path")?;
+                    let addr = value.context("socket requires an address")?;
                     if let Some(extra) = kv.next() {
                         anyhow::bail!("unexpected token: '{extra}'")
                     }
-                    if path.is_empty() {
-                        anyhow::bail!("socket path cannot be empty");
+                    if addr.is_empty() {
+                        anyhow::bail!("socket address cannot be empty");
                     }
-                    socket_path = Some(path.to_string());
+                    socket_addr = Some(addr.to_string());
                 }
                 "hu" => {
                     let val = value.context("hu requires a value")?;
@@ -1732,7 +1732,7 @@ impl FromStr for PcieRemoteCli {
 
         Ok(PcieRemoteCli {
             port_name: port_name.to_string(),
-            socket_path,
+            socket_addr,
             hu,
             controller,
         })
@@ -2487,18 +2487,18 @@ mod tests {
             PcieRemoteCli::from_str("rc0rp0").unwrap(),
             PcieRemoteCli {
                 port_name: "rc0rp0".to_string(),
-                socket_path: None,
+                socket_addr: None,
                 hu: 0,
                 controller: 0,
             }
         );
 
-        // With socket path
+        // With socket address
         assert_eq!(
-            PcieRemoteCli::from_str("rc0rp0,socket=/tmp/custom.sock").unwrap(),
+            PcieRemoteCli::from_str("rc0rp0,socket=localhost:22567").unwrap(),
             PcieRemoteCli {
                 port_name: "rc0rp0".to_string(),
-                socket_path: Some("/tmp/custom.sock".to_string()),
+                socket_addr: Some("localhost:22567".to_string()),
                 hu: 0,
                 controller: 0,
             }
@@ -2506,10 +2506,10 @@ mod tests {
 
         // With all options
         assert_eq!(
-            PcieRemoteCli::from_str("myport,socket=/tmp/dev.sock,hu=1,controller=2").unwrap(),
+            PcieRemoteCli::from_str("myport,socket=localhost:22568,hu=1,controller=2").unwrap(),
             PcieRemoteCli {
                 port_name: "myport".to_string(),
-                socket_path: Some("/tmp/dev.sock".to_string()),
+                socket_addr: Some("localhost:22568".to_string()),
                 hu: 1,
                 controller: 2,
             }
@@ -2520,7 +2520,7 @@ mod tests {
             PcieRemoteCli::from_str("port0,hu=5,controller=3").unwrap(),
             PcieRemoteCli {
                 port_name: "port0".to_string(),
-                socket_path: None,
+                socket_addr: None,
                 hu: 5,
                 controller: 3,
             }
