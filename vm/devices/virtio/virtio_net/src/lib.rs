@@ -17,12 +17,8 @@ pub mod resolver;
 #[cfg(test)]
 mod tests;
 
-// use anyhow::Context;
 use crate::buffers::VirtioWorkPool;
 use bitfield_struct::bitfield;
-use futures::FutureExt;
-use futures::StreamExt;
-use futures_concurrency::future::Race;
 use guestmem::GuestMemory;
 use inspect::Inspect;
 use inspect::InspectMut;
@@ -229,13 +225,8 @@ pub struct Device {
     registers: NetConfig,
     memory: GuestMemory,
     coordinator: TaskControl<CoordinatorState, Coordinator>,
-    coordinator_send: Option<mesh::Sender<CoordinatorMessage>>,
     adapter: Arc<Adapter>,
     driver_source: VmTaskDriverSource,
-}
-
-impl Drop for Device {
-    fn drop(&mut self) {}
 }
 
 impl VirtioDevice for Device {
@@ -338,19 +329,26 @@ impl VirtioDevice for Device {
             });
         }
 
-        let (tx, rx) = mesh::channel();
-        self.coordinator_send = Some(tx);
-        self.insert_coordinator(rx, workers.len() as u16);
+        self.insert_coordinator(workers.len() as u16);
         for (i, virtio_state) in workers.into_iter().enumerate() {
             self.insert_worker(virtio_state, i);
         }
         self.coordinator.start();
     }
 
-    fn poll_disable(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
-        if let Some(send) = self.coordinator_send.take() {
-            send.send(CoordinatorMessage::Disable);
+    fn poll_disable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // Stop the coordinator task.
+        let _ = std::task::ready!(self.coordinator.poll_stop(cx));
+        // Stop all workers (coordinator may not have stopped them if it was
+        // cancelled before reaching its own stop_workers call).
+        if let Some(coordinator) = self.coordinator.state_mut() {
+            for worker in &mut coordinator.workers {
+                let _ = std::task::ready!(worker.poll_stop(cx));
+            }
         }
+        // Remove the coordinator state so that a subsequent enable() can
+        // re-insert it.
+        let _ = self.coordinator.remove();
         Poll::Ready(())
     }
 }
@@ -481,7 +479,6 @@ impl NicBuilder {
             registers,
             memory,
             coordinator,
-            coordinator_send: None,
             adapter,
             driver_source: driver_source.clone(),
         }
@@ -501,12 +498,11 @@ impl InspectMut for Device {
 }
 
 impl Device {
-    fn insert_coordinator(&mut self, recv: mesh::Receiver<CoordinatorMessage>, num_queues: u16) {
+    fn insert_coordinator(&mut self, num_queues: u16) {
         self.coordinator.insert(
             &self.adapter.driver,
             "virtio-net-coordinator".to_string(),
             Coordinator {
-                recv,
                 workers: (0..self.adapter.max_queues)
                     .map(|_| TaskControl::new(NetQueue { state: None }))
                     .collect(),
@@ -546,13 +542,7 @@ impl Device {
     }
 }
 
-#[derive(PartialEq)]
-enum CoordinatorMessage {
-    Disable,
-}
-
 struct Coordinator {
-    recv: mesh::Receiver<CoordinatorMessage>,
     workers: Vec<TaskControl<NetQueue, Worker>>,
     num_queues: u16,
     restart: bool,
@@ -619,37 +609,16 @@ impl Coordinator {
                 self.restart = false;
             }
             self.start_workers();
-            enum Message {
-                Internal(CoordinatorMessage),
-                ChannelDisconnected,
-                UpdateFromEndpoint(EndpointAction),
-            }
-            let message = {
-                let wait_for_message = async {
-                    let internal_msg = self
-                        .recv
-                        .next()
-                        .map(|x| x.map_or(Message::ChannelDisconnected, Message::Internal));
-                    let endpoint_restart = state
-                        .endpoint
-                        .wait_for_endpoint_action()
-                        .map(Message::UpdateFromEndpoint);
-                    (internal_msg, endpoint_restart).race().await
-                };
-                stop.until_stopped(wait_for_message).await?
-            };
-            match message {
-                Message::UpdateFromEndpoint(EndpointAction::RestartRequired) => self.restart = true,
-                Message::UpdateFromEndpoint(EndpointAction::LinkStatusNotify(_)) => {
+            match stop
+                .until_stopped(state.endpoint.wait_for_endpoint_action())
+                .await?
+            {
+                EndpointAction::RestartRequired => self.restart = true,
+                EndpointAction::LinkStatusNotify(_) => {
                     tracing::error!("unexpected link status notification")
                 }
-                Message::Internal(CoordinatorMessage::Disable) | Message::ChannelDisconnected => {
-                    stop.until_stopped(self.stop_workers()).await?;
-                    break;
-                }
-            };
+            }
         }
-        Ok(())
     }
 
     async fn stop_workers(&mut self) {
