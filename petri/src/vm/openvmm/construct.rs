@@ -85,6 +85,8 @@ use uidevices_resources::SynthVideoHandle;
 use unix_socket::UnixListener;
 use unix_socket::UnixStream;
 use video_core::SharedFramebufferHandle;
+use virtio_resources::VirtioPciDeviceHandle;
+use virtio_resources::blk::VirtioBlkHandle;
 use vm_manifest_builder::VmChipsetResult;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::IntoResource;
@@ -1127,6 +1129,38 @@ fn vmbus_storage_controllers_to_openvmm(
                     }
                     .into_resource(),
                 });
+            }
+            VmbusStorageType::VirtioBlk => {
+                // Each virtio-blk drive needs a unique VPCI instance ID.
+                // Use a fixed template GUID with data1 set to the LUN.
+                const VIRTIO_BLK_INSTANCE_ID_TEMPLATE: Guid = Guid {
+                    data1: 0,
+                    data2: 0x1234,
+                    data3: 0x5678,
+                    data4: [0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89],
+                };
+                for (lun, Drive { disk, is_dvd }) in &controller.drives {
+                    if *is_dvd {
+                        anyhow::bail!("dvd not supported with virtio-blk");
+                    }
+                    let Some(disk) = disk else {
+                        anyhow::bail!("empty drive not supported with virtio-blk");
+                    };
+                    let mut drive_id = VIRTIO_BLK_INSTANCE_ID_TEMPLATE;
+                    drive_id.data1 = *lun;
+                    vpci_devices.push(VpciDeviceConfig {
+                        vtl,
+                        instance_id: drive_id,
+                        resource: VirtioPciDeviceHandle(
+                            VirtioBlkHandle {
+                                disk: petri_disk_to_openvmm(disk)?,
+                                read_only: false,
+                            }
+                            .into_resource(),
+                        )
+                        .into_resource(),
+                    });
+                }
             }
         }
     }
