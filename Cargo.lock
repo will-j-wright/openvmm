@@ -9049,11 +9049,11 @@ name = "virtio_pmem"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "event-listener",
  "fs-err",
+ "futures",
  "guestmem",
  "inspect",
+ "pal_async",
  "sparse_mmap",
  "task_control",
  "tracing",
