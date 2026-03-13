@@ -5449,6 +5449,7 @@ dependencies = [
  "virtio_net",
  "virtio_p9",
  "virtio_pmem",
+ "virtio_rng",
  "virtiofs",
  "vm_resource",
  "vmbfs",
@@ -9078,6 +9079,27 @@ dependencies = [
  "mesh",
  "net_backend_resources",
  "vm_resource",
+]
+
+[[package]]
+name = "virtio_rng"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "getrandom 0.3.3",
+ "guestmem",
+ "inspect",
+ "mesh",
+ "pal_async",
+ "pal_event",
+ "task_control",
+ "test_with_tracing",
+ "tracelimit",
+ "virtio",
+ "virtio_resources",
+ "vm_resource",
+ "vmcore",
 ]
 
 [[package]]
