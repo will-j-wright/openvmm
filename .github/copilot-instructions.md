@@ -85,6 +85,8 @@ cargo nextest run -p <package-name>
 - Mark tests requiring special setup with `#[ignore]`.
 - Update `Guide/` docs when adding features or changing behavior
   (see `.github/instructions/doc-code-sync.instructions.md` for the mapping)
+- **CI failures** — to investigate failing CI checks on a PR, load the
+  `openvmm-ci-investigation` skill.
 
 ## Common Pitfalls
 
