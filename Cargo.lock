@@ -8954,7 +8954,6 @@ dependencies = [
  "bitfield-struct 0.11.0",
  "chipset_device",
  "device_emulators",
- "event-listener",
  "futures",
  "guestmem",
  "inspect",
