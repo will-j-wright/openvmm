@@ -174,7 +174,10 @@ impl UdpConnection {
                     self.last_activity = Instant::now();
                 }
                 Poll::Ready(Err(err)) => {
-                    tracing::error!(error = &err as &dyn std::error::Error, "recv error");
+                    tracelimit::error_ratelimited!(
+                        error = &err as &dyn std::error::Error,
+                        "recv error"
+                    );
                     break false;
                 }
                 Poll::Pending => break true,
@@ -191,8 +194,8 @@ impl<T: Client> Access<'_, T> {
         self.inner.udp.connections.retain(|dst_addr, conn| {
             // Check if connection has timed out
             if now.duration_since(conn.last_activity) > timeout {
-                tracing::warn!(
-                    addr = %format!("{}:{}", dst_addr.ip(), dst_addr.port()),
+                tracing::debug!(
+                    addr = %dst_addr,
                     "UDP connection timed out"
                 );
                 return false;
