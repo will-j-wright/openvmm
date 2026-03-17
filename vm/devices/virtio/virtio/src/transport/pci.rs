@@ -49,10 +49,6 @@ use std::task::Poll;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::interrupt::Interrupt;
 use vmcore::line_interrupt::LineInterrupt;
-use vmcore::save_restore::NoSavedState;
-use vmcore::save_restore::RestoreError;
-use vmcore::save_restore::SaveError;
-use vmcore::save_restore::SaveRestore;
 
 /// What kind of PCI interrupts [`VirtioPciDevice`] should use.
 pub enum PciInterruptModel<'a> {
@@ -756,15 +752,140 @@ impl ChipsetDevice for VirtioPciDevice {
     }
 }
 
-impl SaveRestore for VirtioPciDevice {
-    type SavedState = NoSavedState; // TODO
+mod saved_state {
+    mod state {
+        use crate::transport::saved_state::state::CommonQueueState;
+        use crate::transport::saved_state::state::CommonSavedState;
+        use mesh::payload::Protobuf;
+        use vmcore::save_restore::SavedStateRoot;
 
-    fn save(&mut self) -> Result<Self::SavedState, SaveError> {
-        Ok(NoSavedState)
+        #[derive(Protobuf)]
+        #[mesh(package = "virtio.transport.pci")]
+        pub struct SavedQueueState {
+            #[mesh(1)]
+            pub common: CommonQueueState,
+            #[mesh(2)]
+            pub msix_vector: u16,
+        }
+
+        #[derive(Protobuf, SavedStateRoot)]
+        #[mesh(package = "virtio.transport.pci")]
+        pub struct SavedState {
+            #[mesh(1)]
+            pub common: CommonSavedState,
+            #[mesh(2)]
+            pub msix_config_vector: u16,
+            #[mesh(3)]
+            pub queues: Vec<SavedQueueState>,
+        }
     }
 
-    fn restore(&mut self, NoSavedState: Self::SavedState) -> Result<(), RestoreError> {
-        Ok(())
+    use super::*;
+    use crate::transport::saved_state::state as common_state;
+    use vmcore::save_restore::RestoreError;
+    use vmcore::save_restore::SaveError;
+    use vmcore::save_restore::SaveRestore;
+
+    impl SaveRestore for VirtioPciDevice {
+        type SavedState = state::SavedState;
+
+        fn save(&mut self) -> Result<Self::SavedState, SaveError> {
+            if !self.device.supports_save_restore() {
+                return Err(SaveError::NotSupported);
+            }
+
+            Ok(state::SavedState {
+                common: common_state::CommonSavedState {
+                    device_status: self.device_status.into(),
+                    driver_feature_banks: (0..self.device_feature.len())
+                        .map(|i| self.driver_feature.bank(i))
+                        .collect(),
+                    device_feature_select: self.device_feature_select,
+                    driver_feature_select: self.driver_feature_select,
+                    queue_select: self.queue_select,
+                    config_generation: self.config_generation,
+                    interrupt_status: *self.interrupt_status.lock(),
+                },
+                msix_config_vector: self.msix_config_vector,
+                queues: self
+                    .queues
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| state::SavedQueueState {
+                        common: common_state::CommonQueueState {
+                            size: q.size,
+                            enable: q.enable,
+                            desc_addr: q.desc_addr,
+                            avail_addr: q.avail_addr,
+                            used_addr: q.used_addr,
+                            queue_state: self.saved_queue_states[i],
+                        },
+                        msix_vector: self.msix_vectors[i],
+                    })
+                    .collect(),
+            })
+        }
+
+        fn restore(&mut self, state: Self::SavedState) -> Result<(), RestoreError> {
+            if !self.device.supports_save_restore() {
+                return Err(RestoreError::SavedStateNotSupported);
+            }
+
+            let common = &state.common;
+
+            crate::transport::saved_state::validate_restore(
+                common,
+                &self.device_feature,
+                state
+                    .queues
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| (i, q.common.size)),
+                self.queues.len(),
+                state.queues.len(),
+                QUEUE_MAX_SIZE,
+            )?;
+
+            let new_status = VirtioDeviceStatus::from(common.device_status);
+
+            // Restore transport fields.
+            self.driver_feature = VirtioDeviceFeatures::new();
+            for (i, &bank) in common.driver_feature_banks.iter().enumerate() {
+                self.driver_feature.set_bank(i, bank);
+            }
+            self.device_feature_select = common.device_feature_select;
+            self.driver_feature_select = common.driver_feature_select;
+            self.queue_select = common.queue_select;
+            self.config_generation = common.config_generation;
+            *self.interrupt_status.lock() = common.interrupt_status;
+            if let InterruptKind::IntX(line) = &self.interrupt_kind {
+                line.set_level(common.interrupt_status != 0);
+            }
+            self.msix_config_vector = state.msix_config_vector;
+
+            // Restore per-queue transport parameters.
+            for (i, sq) in state.queues.iter().enumerate() {
+                self.queues[i] = QueueParams {
+                    size: sq.common.size,
+                    enable: sq.common.enable,
+                    desc_addr: sq.common.desc_addr,
+                    avail_addr: sq.common.avail_addr,
+                    used_addr: sq.common.used_addr,
+                };
+                self.msix_vectors[i] = sq.msix_vector;
+                self.saved_queue_states[i] = sq.common.queue_state;
+            }
+
+            self.device_status = new_status;
+
+            // Reset ephemeral runtime state.
+            self.disabling = false;
+            self.disable_index = 0;
+            self.poll_waker = None;
+            self.doorbells.clear();
+
+            Ok(())
+        }
     }
 }
 
