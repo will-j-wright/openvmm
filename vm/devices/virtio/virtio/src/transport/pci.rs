@@ -654,9 +654,9 @@ impl VirtioPciDevice {
 }
 
 impl VirtioPciDevice {
-    fn read_bar_u32(&mut self, bar: u8, offset: u16) -> u32 {
+    fn read_bar_u32(&mut self, bar: u8, offset: u64) -> u32 {
         match bar {
-            0 => self.read_u32(offset),
+            0 => self.read_u32(offset as u16),
             2 => {
                 if let InterruptKind::Msix(msix) = &self.interrupt_kind {
                     msix.read_u32(offset)
@@ -668,9 +668,9 @@ impl VirtioPciDevice {
         }
     }
 
-    fn write_bar_u32(&mut self, address: u64, bar: u8, offset: u16, value: u32) {
+    fn write_bar_u32(&mut self, address: u64, bar: u8, offset: u64, value: u32) {
         match bar {
-            0 => self.write_u32(address, offset, value),
+            0 => self.write_u32(address, offset as u16, value),
             2 => {
                 if let InterruptKind::Msix(msix) = &mut self.interrupt_kind {
                     msix.write_u32(offset, value)
