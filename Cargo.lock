@@ -5176,10 +5176,15 @@ dependencies = [
  "build_rs_guest_arch",
  "cache_topology",
  "cfg-if",
+ "chipset_device",
  "chipset_device_resources",
  "chipset_device_worker",
  "chipset_legacy",
+<<<<<<< HEAD
  "crc32fast",
+=======
+ "closeable_mutex",
+>>>>>>> 7879af1c7 (pcie: add _OSC in SSDT, petri hotplug test, and test infrastructure)
  "debug_ptr",
  "disk_backend",
  "fdt",
@@ -5217,6 +5222,7 @@ dependencies = [
  "pal_async",
  "pci_bus",
  "pci_core",
+ "pci_resources",
  "pcie",
  "range_map_vec",
  "scsi_core",
