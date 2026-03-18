@@ -603,7 +603,7 @@ struct LoadedVmInner {
     automatic_guest_reset: bool,
     pcie_host_bridges: Vec<PcieHostBridge>,
     pcie_root_complexes: Vec<Arc<closeable_mutex::CloseableMutex<GenericPcieRootComplex>>>,
-    pcie_hotplug_devices: Vec<vmotherboard::DynamicDeviceUnit>,
+    pcie_hotplug_devices: Vec<(String, vmotherboard::DynamicDeviceUnit)>,
 }
 
 fn choose_hypervisor() -> anyhow::Result<Hypervisor> {
@@ -2900,7 +2900,7 @@ impl LoadedVm {
                                 "hotplug-device",
                                 bus_device,
                             )?;
-                            self.inner.pcie_hotplug_devices.push(unit);
+                            self.inner.pcie_hotplug_devices.push((port_name.clone(), unit));
                             self.state_units.start_stopped_units().await;
                             anyhow::Ok(())
                         })
@@ -2908,13 +2908,22 @@ impl LoadedVm {
                     }
                     VmRpc::RemovePcieDevice(rpc) => {
                         rpc.handle_failable(async |port_name: String| {
-                            for rc in &self.inner.pcie_root_complexes {
-                                let mut rc_guard = rc.lock();
-                                if rc_guard.hotplug_remove_device(&port_name).is_ok() {
-                                    return anyhow::Ok(());
-                                }
+                            // Find the root complex containing the target port
+                            let rc = self.inner.pcie_root_complexes.iter()
+                                .find(|rc| {
+                                    rc.lock().downstream_ports().iter().any(|(_, name)| name.as_ref() == port_name.as_str())
+                                })
+                                .ok_or_else(|| anyhow::anyhow!("port '{}' not found in any root complex", port_name))?;
+
+                            rc.lock().hotplug_remove_device(&port_name)?;
+
+                            // Remove and stop the corresponding device unit
+                            if let Some(idx) = self.inner.pcie_hotplug_devices.iter().position(|(name, _)| name == &port_name) {
+                                let (_, unit) = self.inner.pcie_hotplug_devices.remove(idx);
+                                unit.remove().await;
                             }
-                            anyhow::bail!("port '{}' not found in any root complex", port_name);
+
+                            anyhow::Ok(())
                         })
                         .await
                     }
@@ -3316,8 +3325,7 @@ impl pci_bus::GenericPciBusDevice for WeakMutexPciBusDevice {
             self.0
                 .upgrade()?
                 .lock()
-                .supports_pci()
-                .expect("device supports PCI")
+                .supports_pci()?
                 .pci_cfg_read(offset, value),
         )
     }
@@ -3327,8 +3335,7 @@ impl pci_bus::GenericPciBusDevice for WeakMutexPciBusDevice {
             self.0
                 .upgrade()?
                 .lock()
-                .supports_pci()
-                .expect("device supports PCI")
+                .supports_pci()?
                 .pci_cfg_write(offset, value),
         )
     }
@@ -3343,8 +3350,7 @@ impl pci_bus::GenericPciBusDevice for WeakMutexPciBusDevice {
         self.0
             .upgrade()?
             .lock()
-            .supports_pci()
-            .expect("device supports PCI")
+            .supports_pci()?
             .pci_cfg_read_forward(bus, device_function, offset, value)
     }
 
@@ -3358,8 +3364,7 @@ impl pci_bus::GenericPciBusDevice for WeakMutexPciBusDevice {
         self.0
             .upgrade()?
             .lock()
-            .supports_pci()
-            .expect("device supports PCI")
+            .supports_pci()?
             .pci_cfg_write_forward(bus, device_function, offset, value)
     }
 }

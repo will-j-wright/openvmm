@@ -49,8 +49,9 @@ async fn parse_guest_pci_devices(
                 else {
                     continue;
                 };
+                let vendor_output = vendor_output.trim();
                 let Ok(vendor_id) = u16::from_str_radix(
-                    vendor_output.strip_prefix("0x").unwrap_or(&vendor_output),
+                    vendor_output.strip_prefix("0x").unwrap_or(vendor_output),
                     16,
                 ) else {
                     continue;
@@ -60,8 +61,9 @@ async fn parse_guest_pci_devices(
                 else {
                     continue;
                 };
+                let device_output = device_output.trim();
                 let Ok(device_id) = u16::from_str_radix(
-                    device_output.strip_prefix("0x").unwrap_or(&device_output),
+                    device_output.strip_prefix("0x").unwrap_or(device_output),
                     16,
                 ) else {
                     continue;
@@ -71,8 +73,9 @@ async fn parse_guest_pci_devices(
                 else {
                     continue;
                 };
+                let class_output = class_output.trim();
                 let Ok(class_code) = u32::from_str_radix(
-                    class_output.strip_prefix("0x").unwrap_or(&class_output),
+                    class_output.strip_prefix("0x").unwrap_or(class_output),
                     16,
                 ) else {
                     continue;

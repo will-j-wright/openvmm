@@ -165,7 +165,8 @@ impl Ssdt {
         });
 
         // If (LEqual(Arg0, ToUUID("33DB4D5B-1FF7-401C-9657-7441C03DD766")))
-        let uuid_buffer = encode_uuid_buffer("33DB4D5B-1FF7-401C-9657-7441C03DD766");
+        let pcie_osc_uuid = guid::guid!("33DB4D5B-1FF7-401C-9657-7441C03DD766");
+        let uuid_buffer = Buffer(pcie_osc_uuid.as_bytes()).to_bytes();
         let lequal = LEqualOp {
             left: encode_arg(0),
             right: uuid_buffer,
