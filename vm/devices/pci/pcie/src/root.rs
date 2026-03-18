@@ -535,7 +535,14 @@ mod tests {
 
         let mut register_mmio = TestPcieMmioRegistration {};
         let ecam = MemoryRange::new(0..ecam_size_from_bus_numbers(start_bus, end_bus));
-        GenericPcieRootComplex::new(&mut register_mmio, start_bus, end_bus, ecam, port_defs, None)
+        GenericPcieRootComplex::new(
+            &mut register_mmio,
+            start_bus,
+            end_bus,
+            ecam,
+            port_defs,
+            None,
+        )
     }
 
     #[test]

@@ -348,9 +348,7 @@ impl PciExpressCapability {
 
         // Update Data Link Layer Link Active in Link Status to match presence.
         // The pciehp driver checks this (via DLLLA) when LLActRep is advertised.
-        state.link_status = state
-            .link_status
-            .with_data_link_layer_link_active(present);
+        state.link_status = state.link_status.with_data_link_layer_link_active(present);
     }
 
     /// Set the RW1C changed bits in Slot Status to signal a hotplug event.
@@ -369,12 +367,11 @@ impl PciExpressCapability {
         }
 
         let mut state = self.state.lock();
-        state.slot_status = state
-            .slot_status
-            .with_presence_detect_state(if present { 1 } else { 0 });
-        state.link_status = state
-            .link_status
-            .with_data_link_layer_link_active(present);
+        state.slot_status =
+            state
+                .slot_status
+                .with_presence_detect_state(if present { 1 } else { 0 });
+        state.link_status = state.link_status.with_data_link_layer_link_active(present);
         state.slot_status.set_presence_detect_changed(true);
         state.slot_status.set_data_link_layer_state_changed(true);
     }

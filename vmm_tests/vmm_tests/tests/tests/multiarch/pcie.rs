@@ -45,24 +45,36 @@ async fn parse_guest_pci_devices(
 
                 // Device may disappear between ls and cat (e.g., during hotplug
                 // removal), so skip devices whose sysfs files can't be read.
-                let Ok(vendor_output) = cmd!(sh, "cat {device_sysfs_path}/vendor").read().await else {
+                let Ok(vendor_output) = cmd!(sh, "cat {device_sysfs_path}/vendor").read().await
+                else {
                     continue;
                 };
-                let Ok(vendor_id) = u16::from_str_radix(vendor_output.strip_prefix("0x").unwrap_or(&vendor_output), 16) else {
-                    continue;
-                };
-
-                let Ok(device_output) = cmd!(sh, "cat {device_sysfs_path}/device").read().await else {
-                    continue;
-                };
-                let Ok(device_id) = u16::from_str_radix(device_output.strip_prefix("0x").unwrap_or(&device_output), 16) else {
+                let Ok(vendor_id) = u16::from_str_radix(
+                    vendor_output.strip_prefix("0x").unwrap_or(&vendor_output),
+                    16,
+                ) else {
                     continue;
                 };
 
-                let Ok(class_output) = cmd!(sh, "cat {device_sysfs_path}/class").read().await else {
+                let Ok(device_output) = cmd!(sh, "cat {device_sysfs_path}/device").read().await
+                else {
                     continue;
                 };
-                let Ok(class_code) = u32::from_str_radix(class_output.strip_prefix("0x").unwrap_or(&class_output), 16) else {
+                let Ok(device_id) = u16::from_str_radix(
+                    device_output.strip_prefix("0x").unwrap_or(&device_output),
+                    16,
+                ) else {
+                    continue;
+                };
+
+                let Ok(class_output) = cmd!(sh, "cat {device_sysfs_path}/class").read().await
+                else {
+                    continue;
+                };
+                let Ok(class_code) = u32::from_str_radix(
+                    class_output.strip_prefix("0x").unwrap_or(&class_output),
+                    16,
+                ) else {
                     continue;
                 };
 
@@ -194,10 +206,7 @@ async fn pcie_root_emulation(config: PetriVmBuilder<OpenVmmPetriBackend>) -> any
 
 /// Test PCIe hotplug: hot-add a device to a hotplug-capable port, verify the
 /// guest sees it, then hot-remove it and verify it's gone.
-#[openvmm_test(
-    linux_direct_x64,
-    uefi_x64(vhd(windows_datacenter_core_2022_x64))
-)]
+#[openvmm_test(linux_direct_x64, uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
 async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     const ECAM_SIZE: u64 = 256 * 1024 * 1024;
     const LOW_MMIO_SIZE: u64 = 64 * 1024 * 1024;
@@ -263,10 +272,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
     let mut found = false;
     for attempt in 0..30 {
         let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
-        let endpoints = devices
-            .iter()
-            .filter(|d| d.class_code != 0x060400)
-            .count();
+        let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
         if endpoints >= 1 {
             tracing::info!(?devices, attempt, "device appeared after hotplug");
             found = true;
@@ -301,10 +307,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
         let mut removed = false;
         for attempt in 0..30 {
             let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
-            let endpoints = devices
-                .iter()
-                .filter(|d| d.class_code != 0x060400)
-                .count();
+            let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
             if endpoints == 0 {
                 tracing::info!(attempt, "device removed after hot-remove");
                 removed = true;
