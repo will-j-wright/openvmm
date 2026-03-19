@@ -190,4 +190,60 @@ mod tests {
         let bytes = op.to_bytes();
         verify_expected_bytes(&bytes, &[0xa4, b'S', b'T', b'A', b'_']);
     }
+
+    #[test]
+    fn verify_if_operation() {
+        // If with a simple predicate (byte 0x01 = One) and empty body
+        let op = IfOp {
+            predicate: vec![0x01],
+            body: vec![],
+        };
+        let bytes = op.to_bytes();
+        // 0xa0 = IfOp, 0x02 = PkgLen (1 byte predicate + 0 body + 1 len byte), 0x01 = predicate
+        verify_expected_bytes(&bytes, &[0xa0, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn verify_else_operation() {
+        // Else with a Return(One) body
+        let body = ReturnOp { result: vec![0x01] }.to_bytes();
+        let op = ElseOp { body };
+        let bytes = op.to_bytes();
+        // 0xa1 = ElseOp, 0x03 = PkgLen, 0xa4 = Return, 0x01 = One
+        verify_expected_bytes(&bytes, &[0xa1, 0x03, 0xa4, 0x01]);
+    }
+
+    #[test]
+    fn verify_store_operation() {
+        let op = StoreOp {
+            source: encode_integer(0),
+            destination: vec![b'S', b'T', b'S', b'0'],
+        };
+        let bytes = op.to_bytes();
+        // 0x70 = StoreOp, 0x00 = Zero, STS0 = destination
+        verify_expected_bytes(&bytes, &[0x70, 0x00, b'S', b'T', b'S', b'0']);
+    }
+
+    #[test]
+    fn verify_lequal_operation() {
+        let op = LEqualOp {
+            left: vec![0x68],  // Arg0
+            right: vec![0x01], // One
+        };
+        let bytes = op.to_bytes();
+        // 0x93 = LEqualOp, 0x68 = Arg0, 0x01 = One
+        verify_expected_bytes(&bytes, &[0x93, 0x68, 0x01]);
+    }
+
+    #[test]
+    fn verify_create_dword_field_operation() {
+        let op = CreateDWordFieldOp {
+            source_buffer: vec![0x6b], // Arg3
+            byte_index: encode_integer(0),
+            field_name: *b"STS0",
+        };
+        let bytes = op.to_bytes();
+        // 0x8a = CreateDWordFieldOp, 0x6b = Arg3, 0x00 = Zero (index), STS0 = name
+        verify_expected_bytes(&bytes, &[0x8a, 0x6b, 0x00, b'S', b'T', b'S', b'0']);
+    }
 }

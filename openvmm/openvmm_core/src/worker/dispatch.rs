@@ -603,7 +603,11 @@ struct LoadedVmInner {
     automatic_guest_reset: bool,
     pcie_host_bridges: Vec<PcieHostBridge>,
     pcie_root_complexes: Vec<Arc<closeable_mutex::CloseableMutex<GenericPcieRootComplex>>>,
-    pcie_hotplug_devices: Vec<(String, vmotherboard::DynamicDeviceUnit)>,
+    pcie_hotplug_devices: Vec<(
+        String,
+        vmotherboard::DynamicDeviceUnit,
+        Arc<closeable_mutex::CloseableMutex<chipset_device_resources::ErasedChipsetDevice>>,
+    )>,
 }
 
 fn choose_hypervisor() -> anyhow::Result<Hypervisor> {
@@ -2896,8 +2900,9 @@ impl LoadedVm {
                                 msi_conn.connect(target);
                             }
 
-                            // Wrap the device as a GenericPciBusDevice for the port
-                            let weak_dev: std::sync::Weak<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>> = Arc::downgrade(&(device as Arc<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>>));
+                            // Wrap the device as a GenericPciBusDevice for the port.
+                            // Keep a strong Arc to the device so the Weak stays valid.
+                            let weak_dev: std::sync::Weak<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>> = Arc::downgrade(&(device.clone() as Arc<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>>));
                             let bus_device = Box::new(WeakMutexPciBusDevice(weak_dev));
 
                             if let Err(e) = rc.lock().hotplug_add_device(
@@ -2909,7 +2914,7 @@ impl LoadedVm {
                                 unit.remove().await;
                                 return Err(e);
                             }
-                            self.inner.pcie_hotplug_devices.push((port_name.clone(), unit));
+                            self.inner.pcie_hotplug_devices.push((port_name.clone(), unit, device));
                             self.state_units.start_stopped_units().await;
                             anyhow::Ok(())
                         })
@@ -2922,7 +2927,7 @@ impl LoadedVm {
                             // and removing them would leave their state unit/MMIO
                             // registrations running.
                             let idx = self.inner.pcie_hotplug_devices.iter()
-                                .position(|(name, _)| name == &port_name)
+                                .position(|(name, _, _)| name == &port_name)
                                 .ok_or_else(|| anyhow::anyhow!(
                                     "no hot-added device on port '{}' (only dynamically added devices can be hot-removed)",
                                     port_name
@@ -2938,7 +2943,7 @@ impl LoadedVm {
                             rc.lock().hotplug_remove_device(&port_name)?;
 
                             // Remove and stop the device unit
-                            let (_, unit) = self.inner.pcie_hotplug_devices.remove(idx);
+                            let (_, unit, _device) = self.inner.pcie_hotplug_devices.remove(idx);
                             unit.remove().await;
 
                             anyhow::Ok(())

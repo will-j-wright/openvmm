@@ -148,7 +148,7 @@ impl Ssdt {
         // Method(_OSC, 4) {
         //   CreateDWordField(Arg3, 0, STS0)
         //   If (LEqual(Arg0, ToUUID("33DB4D5B-1FF7-401C-9657-7441C03DD766"))) {
-        //     // Grant everything — return Arg3 unchanged (status = 0 = success)
+        //     Store(0, STS0)  // clear status — grant everything
         //   } Else {
         //     Or(STS0, 0x04, STS0)  // unrecognized UUID
         //   }
@@ -182,12 +182,14 @@ impl Ssdt {
             body: or_op.to_bytes(),
         };
 
-        // If block with empty body (grant everything), followed by Else
-        let if_body = Vec::new();
-        // Empty If body — success path does nothing (Arg3 returned unchanged)
+        // If block: UUID matches — clear status and grant everything
+        let store_zero = StoreOp {
+            source: encode_integer(0),
+            destination: b"STS0".to_vec(),
+        };
         let if_op = IfOp {
             predicate: lequal.to_bytes(),
-            body: if_body.clone(),
+            body: store_zero.to_bytes(),
         };
         osc_method.add_operation(&if_op);
         osc_method.add_operation(&else_body);
