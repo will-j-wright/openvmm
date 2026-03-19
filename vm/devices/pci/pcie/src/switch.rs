@@ -115,6 +115,7 @@ impl DownstreamSwitchPort {
             DevicePortType::DownstreamSwitchPort,
             multi_function,
             hotplug_slot_number,
+            None, // Switches don't have MSI wired yet
         );
 
         Self { port }

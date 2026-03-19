@@ -10,8 +10,7 @@ use pci_bus::GenericPciBusDevice;
 use pci_core::capabilities::msi_cap::MsiCapability;
 use pci_core::capabilities::pci_express::PciExpressCapability;
 use pci_core::cfg_space_emu::ConfigSpaceType1Emulator;
-use pci_core::msi::MsiConnection;
-use pci_core::msi::SignalMsi;
+use pci_core::msi::MsiTarget;
 use pci_core::spec::caps::pci_express::DevicePortType;
 use pci_core::spec::hwid::HardwareIds;
 use std::sync::Arc;
@@ -31,11 +30,6 @@ pub struct PcieDownstreamPort {
     /// The connected device, if any.
     #[inspect(skip)]
     pub link: Option<(Arc<str>, Box<dyn GenericPciBusDevice>)>,
-
-    /// The MSI connection for this port's interrupt capability.
-    /// Stored to allow connecting the MSI signal after construction.
-    #[inspect(skip)]
-    msi_connection: MsiConnection,
 }
 
 impl PcieDownstreamPort {
@@ -47,12 +41,14 @@ impl PcieDownstreamPort {
     /// * `port_type` - The PCIe port type (root port, downstream switch port, etc.)
     /// * `multi_function` - Whether this port should have the multi-function flag set
     /// * `hotplug_slot_number` - The slot number for hotplug support. `Some(slot_number)` enables hotplug, `None` disables it
+    /// * `msi_target` - Optional MSI target for interrupt delivery. If provided, the port's MSI capability will signal through this target.
     pub fn new(
         name: impl Into<String>,
         hardware_ids: HardwareIds,
         port_type: DevicePortType,
         multi_function: bool,
         hotplug_slot_number: Option<u32>,
+        msi_target: Option<&MsiTarget>,
     ) -> Self {
         let port_name = name.into();
 
@@ -61,9 +57,14 @@ impl PcieDownstreamPort {
             None => (false, None),
         };
 
-        let msi_conn = MsiConnection::new();
-        // Create MSI capability with 1 message (multiple_message_capable=0), 64-bit addressing, no per-vector masking
-        let msi_capability = MsiCapability::new(0, true, false, msi_conn.target());
+        let msi_capability = if let Some(target) = msi_target {
+            MsiCapability::new(0, true, false, target)
+        } else {
+            // No MSI target provided — create a disconnected capability.
+            // MSI interrupts will be silently dropped.
+            let disconnected = pci_core::msi::MsiConnection::new();
+            MsiCapability::new(0, true, false, disconnected.target())
+        };
 
         let pcie_cap = if hotplug {
             let slot_num = slot_number.unwrap_or(0);
@@ -82,17 +83,7 @@ impl PcieDownstreamPort {
             name: port_name,
             cfg_space,
             link: None,
-            msi_connection: msi_conn,
         }
-    }
-
-    /// Connect the port's MSI capability to the platform's interrupt controller.
-    ///
-    /// This must be called after construction to enable MSI delivery for
-    /// hotplug events. Without this, MSI interrupts from this port will
-    /// be silently dropped.
-    pub fn connect_msi(&self, signal: Arc<dyn SignalMsi>) {
-        self.msi_connection.connect(signal);
     }
 
     /// Notify the guest of a hotplug event via MSI.
@@ -379,6 +370,7 @@ mod tests {
             DevicePortType::RootPort,
             false,
             Some(1), // Enable hotplug with slot number 1
+            None,
         );
 
         // Initially, presence detect state should be 0
@@ -428,6 +420,7 @@ mod tests {
             DevicePortType::RootPort,
             false,
             None, // No hotplug
+            None,
         );
 
         // Add a device to the port (should not panic even without hotplug support)

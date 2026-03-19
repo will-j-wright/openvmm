@@ -164,46 +164,6 @@ pub fn encode_local(n: u8) -> Vec<u8> {
     vec![0x60 + n]
 }
 
-/// Encode a UUID in ACPI's byte-swapped format as an AML Buffer.
-///
-/// ACPI stores UUIDs with the first three groups byte-swapped (little-endian)
-/// and the last two groups in network order. Input format: "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-pub fn encode_uuid_buffer(uuid: &str) -> Vec<u8> {
-    let hex: Vec<u8> = uuid.bytes().filter(|b| *b != b'-').collect();
-    assert_eq!(hex.len(), 32, "UUID must be 32 hex characters");
-
-    let parse_byte = |i: usize| -> u8 { char_to_hex(hex[i]) << 4 | char_to_hex(hex[i + 1]) };
-
-    // ACPI UUID byte order: first 3 groups are LE, last 2 are BE
-    let bytes: [u8; 16] = [
-        // Group 1 (4 bytes, LE)
-        parse_byte(6),
-        parse_byte(4),
-        parse_byte(2),
-        parse_byte(0),
-        // Group 2 (2 bytes, LE)
-        parse_byte(10),
-        parse_byte(8),
-        // Group 3 (2 bytes, LE)
-        parse_byte(14),
-        parse_byte(12),
-        // Group 4 (2 bytes, BE)
-        parse_byte(16),
-        parse_byte(18),
-        // Group 5 (6 bytes, BE)
-        parse_byte(20),
-        parse_byte(22),
-        parse_byte(24),
-        parse_byte(26),
-        parse_byte(28),
-        parse_byte(30),
-    ];
-
-    use super::objects::AmlObject;
-    use super::objects::Buffer;
-    Buffer(bytes).to_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
