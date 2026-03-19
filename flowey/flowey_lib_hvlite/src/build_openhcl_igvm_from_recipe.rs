@@ -66,6 +66,9 @@ pub struct OpenhclIgvmRecipeDetails {
     pub with_interactive: bool,
     pub with_sidecar: bool,
     pub max_trace_level: MaxTraceLevel,
+    /// Additional in-tree rootfs config files (relative to `openhcl/`)
+    /// to include beyond the base `rootfs.config`.
+    pub extra_rootfs_configs: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -89,6 +92,7 @@ pub enum OpenhclIgvmRecipe {
     X64TestLinuxDirectDevkern,
     X64Cvm,
     X64CvmDevkern,
+    X64Asan,
     Aarch64,
     Aarch64Devkern,
 }
@@ -139,6 +143,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive,
                 with_sidecar: true,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
             Self::X64Devkern => OpenhclIgvmRecipeDetails {
                 local_only: None,
@@ -151,6 +156,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive,
                 with_sidecar: true,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
             Self::X64CvmDevkern => OpenhclIgvmRecipeDetails {
                 local_only: None,
@@ -166,6 +172,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive,
                 with_sidecar: false,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
             Self::X64TestLinuxDirect => OpenhclIgvmRecipeDetails {
                 local_only: None,
@@ -181,6 +188,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive,
                 with_sidecar: true,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
             Self::X64TestLinuxDirectDevkern => OpenhclIgvmRecipeDetails {
                 local_only: None,
@@ -196,6 +204,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive,
                 with_sidecar: true,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
             Self::X64Cvm => OpenhclIgvmRecipeDetails {
                 local_only: None,
@@ -211,7 +220,25 @@ impl OpenhclIgvmRecipe {
                 with_interactive,
                 with_sidecar: false,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
+            Self::X64Asan => {
+                let mut features = base_openvmm_hcl_features();
+                features.insert(OpenvmmHclFeature::Sanitizer);
+                OpenhclIgvmRecipeDetails {
+                    local_only: None,
+                    igvm_manifest: IgvmManifestPath::InTree("openhcl-x64-asan.json".into()),
+                    openhcl_kernel_package: OpenhclKernelPackage::Dev,
+                    openvmm_hcl_features: features,
+                    target: CommonTriple::X86_64_LINUX_MUSL,
+                    vtl0_kernel_type: None,
+                    with_uefi: true,
+                    with_interactive: true,
+                    with_sidecar: false,
+                    max_trace_level: MaxTraceLevel::Trace,
+                    extra_rootfs_configs: vec!["rootfs.asan.config".into()],
+                }
+            }
             Self::Aarch64 => OpenhclIgvmRecipeDetails {
                 local_only: None,
                 igvm_manifest: in_repo_template(
@@ -226,6 +253,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive: false, // #1234
                 with_sidecar: false,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
             Self::Aarch64Devkern => OpenhclIgvmRecipeDetails {
                 local_only: None,
@@ -241,6 +269,7 @@ impl OpenhclIgvmRecipe {
                 with_interactive: false, // #1234
                 with_sidecar: false,
                 max_trace_level,
+                extra_rootfs_configs: vec![],
             },
         }
     }
@@ -275,6 +304,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::resolve_openvmm_deps::Node>();
         ctx.import::<crate::download_uefi_mu_msvm::Node>();
         ctx.import::<crate::git_checkout_openvmm_repo::Node>();
+        ctx.import::<crate::init_openvmm_magicpath_openhcl_sysroot::Node>();
         ctx.import::<crate::run_igvmfilegen::Node>();
         ctx.import::<crate::run_split_debug_info::Node>();
     }
@@ -302,6 +332,7 @@ impl SimpleFlowNode for Node {
             with_interactive,
             with_sidecar,
             max_trace_level,
+            extra_rootfs_configs,
         } = recipe.recipe_details(release_cfg);
 
         let OpenhclIgvmRecipeDetailsLocalOnly {
@@ -451,6 +482,9 @@ impl SimpleFlowNode for Node {
             None
         };
 
+        // Check for sanitizer before features are moved into the build request
+        let is_sanitizer = openvmm_hcl_features.contains(&OpenvmmHclFeature::Sanitizer);
+
         // build openvmm_hcl bin
         let openvmm_hcl_bin = ctx.reqv(|v| {
             crate::build_openvmm_hcl::Request {
@@ -555,6 +589,9 @@ impl SimpleFlowNode for Node {
         let initrd = {
             let rootfs_config = [openvmm_repo_path.map(ctx, |p| p.join("openhcl/rootfs.config"))]
                 .into_iter()
+                .chain(extra_rootfs_configs.into_iter().map(|name| {
+                    openvmm_repo_path.map(ctx, move |p| p.join(format!("openhcl/{name}")))
+                }))
                 .chain(
                     custom_extra_rootfs
                         .into_iter()
@@ -563,12 +600,33 @@ impl SimpleFlowNode for Node {
                 .collect();
             let openvmm_hcl_bin = openvmm_hcl_bin.map(ctx, |o| o.bin);
 
+            let initrd_extra_env = if is_sanitizer {
+                use crate::init_openvmm_magicpath_openhcl_sysroot::OpenvmmSysrootArch;
+                let sysroot_path =
+                    ctx.reqv(|v| crate::init_openvmm_magicpath_openhcl_sysroot::Request {
+                        arch: match arch {
+                            CommonArch::X86_64 => OpenvmmSysrootArch::X64,
+                            CommonArch::Aarch64 => OpenvmmSysrootArch::Aarch64,
+                        },
+                        path: v,
+                    });
+                Some(sysroot_path.map(ctx, |p| {
+                    [(
+                        "OPENHCL_SYSROOT_LIB".to_string(),
+                        p.join("lib").display().to_string(),
+                    )]
+                    .into()
+                }))
+            } else {
+                None
+            };
+
             ctx.reqv(|v| crate::build_openhcl_initrd::Request {
                 interactive: with_interactive,
                 arch,
                 extra_params: openhcl_initrd_extra_params,
                 rootfs_config,
-                extra_env: None,
+                extra_env: initrd_extra_env,
                 kernel_package_root: vtl2_kernel_package_root.clone(),
                 kernel_modules: vtl2_kernel_modules,
                 kernel_metadata: vtl2_kernel_metadata,

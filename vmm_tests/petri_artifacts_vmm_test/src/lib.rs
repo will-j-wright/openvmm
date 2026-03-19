@@ -170,6 +170,8 @@ pub mod artifacts {
             LATEST_LINUX_DIRECT_TEST_X64,
             /// OpenHCL IGVM last release (using a linux direct-boot test image instead of UEFI)
             LATEST_RELEASE_LINUX_DIRECT_X64,
+            /// OpenHCL IGVM (with AddressSanitizer instrumentation)
+            LATEST_ASAN_X64,
             /// OpenHCL IGVM (standard AARCH64)
             LATEST_STANDARD_AARCH64,
             /// OpenHCL IGVM last release (standard AARCH64)
@@ -207,6 +209,11 @@ pub mod artifacts {
             const ARCH: MachineArch = MachineArch::X86_64;
         }
         impl IsOpenhclIgvm for LATEST_RELEASE_LINUX_DIRECT_X64 {}
+
+        impl IsLoadable for LATEST_ASAN_X64 {
+            const ARCH: MachineArch = MachineArch::X86_64;
+        }
+        impl IsOpenhclIgvm for LATEST_ASAN_X64 {}
 
         impl IsLoadable for LATEST_STANDARD_AARCH64 {
             const ARCH: MachineArch = MachineArch::Aarch64;

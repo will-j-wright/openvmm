@@ -15,6 +15,10 @@ use std::collections::BTreeSet;
 pub enum OpenvmmHclFeature {
     Gdb,
     Tpm,
+    /// Disable mimalloc and fast_memcpy for AddressSanitizer (ASAN) builds.
+    /// When set, the build will also inject ASAN-specific RUSTFLAGS and
+    /// RUSTC_BOOTSTRAP=1.
+    Sanitizer,
     LocalOnlyCustom(String),
 }
 
@@ -146,16 +150,44 @@ impl FlowNode for Node {
                 }));
             }
 
+            let is_sanitizer = features.contains(&OpenvmmHclFeature::Sanitizer);
+
             let mut features = features
                 .into_iter()
                 .map(|f| match f {
                     OpenvmmHclFeature::Gdb => "gdb".into(),
                     OpenvmmHclFeature::Tpm => "tpm".into(),
+                    OpenvmmHclFeature::Sanitizer => "sanitizer".into(),
                     OpenvmmHclFeature::LocalOnlyCustom(s) => s,
                 })
                 .collect::<Vec<String>>();
 
             features.extend(max_trace_level.features());
+
+            let extra_env = if is_sanitizer {
+                let is_x86_64 = matches!(arch, CommonArch::X86_64);
+                Some(ctx.emit_rust_stepv("set ASAN env vars", |_ctx| {
+                    move |_rt| {
+                        let mut env = BTreeMap::new();
+                        let mut rustflags = vec![
+                            "-Zsanitizer=address",
+                            "-Cforce-unwind-tables=yes",
+                            "-Ctarget-feature=-crt-static",
+                            "-Clink-self-contained=n",
+                            "-Cforce-frame-pointers=yes",
+                            "-Csymbol-mangling-version=v0",
+                        ];
+                        if is_x86_64 {
+                            rustflags.push("-Clink-arg=-Wl,-z,pack-relative-relocs");
+                        }
+                        env.insert("RUSTFLAGS".into(), rustflags.join(" "));
+                        env.insert("RUSTC_BOOTSTRAP".into(), "1".into());
+                        Ok(env)
+                    }
+                }))
+            } else {
+                None
+            };
 
             let output = ctx.reqv(|v| crate::run_cargo_build::Request {
                 crate_name: "openvmm_hcl".into(),
@@ -173,7 +205,7 @@ impl FlowNode for Node {
                 features: CargoFeatureSet::Specific(features),
                 target,
                 no_split_dbg_info,
-                extra_env: None,
+                extra_env,
                 pre_build_deps,
                 output: v,
             });

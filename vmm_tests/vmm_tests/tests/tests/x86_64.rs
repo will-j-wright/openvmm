@@ -3,6 +3,7 @@
 
 //! Integration tests for x86_64 guests.
 
+mod openhcl_asan;
 mod openhcl_linux_direct;
 mod openhcl_uefi;
 mod storage;

@@ -745,6 +745,7 @@ impl IntoPipeline for CheckinGatesCli {
                     OpenhclIgvmRecipe::X64TestLinuxDirect,
                     OpenhclIgvmRecipe::X64TestLinuxDirectDevkern,
                     OpenhclIgvmRecipe::X64Cvm,
+                    OpenhclIgvmRecipe::X64Asan,
                 ],
                 CommonArch::Aarch64 => {
                     vec![
