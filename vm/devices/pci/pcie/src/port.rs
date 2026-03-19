@@ -41,14 +41,14 @@ impl PcieDownstreamPort {
     /// * `port_type` - The PCIe port type (root port, downstream switch port, etc.)
     /// * `multi_function` - Whether this port should have the multi-function flag set
     /// * `hotplug_slot_number` - The slot number for hotplug support. `Some(slot_number)` enables hotplug, `None` disables it
-    /// * `msi_target` - Optional MSI target for interrupt delivery. If provided, the port's MSI capability will signal through this target.
+    /// * `msi_target` - MSI target for interrupt delivery
     pub fn new(
         name: impl Into<String>,
         hardware_ids: HardwareIds,
         port_type: DevicePortType,
         multi_function: bool,
         hotplug_slot_number: Option<u32>,
-        msi_target: Option<&MsiTarget>,
+        msi_target: &MsiTarget,
     ) -> Self {
         let port_name = name.into();
 
@@ -57,14 +57,7 @@ impl PcieDownstreamPort {
             None => (false, None),
         };
 
-        let msi_capability = if let Some(target) = msi_target {
-            MsiCapability::new(0, true, false, target)
-        } else {
-            // No MSI target provided — create a disconnected capability.
-            // MSI interrupts will be dropped with a rate-limited warning.
-            let disconnected = pci_core::msi::MsiConnection::new();
-            MsiCapability::new(0, true, false, disconnected.target())
-        };
+        let msi_capability = MsiCapability::new(0, true, false, msi_target);
 
         let pcie_cap = if hotplug {
             let slot_num = slot_number.unwrap_or(0);
@@ -374,13 +367,14 @@ mod tests {
             type0_sub_system_id: 0,
         };
 
+        let msi_conn = pci_core::msi::MsiConnection::new();
         let mut port = PcieDownstreamPort::new(
             "test-port",
             hardware_ids,
             DevicePortType::RootPort,
             false,
             Some(1), // Enable hotplug with slot number 1
-            None,
+            msi_conn.target(),
         );
 
         // Initially, presence detect state should be 0
@@ -424,13 +418,14 @@ mod tests {
             type0_sub_system_id: 0,
         };
 
+        let msi_conn = pci_core::msi::MsiConnection::new();
         let mut port = PcieDownstreamPort::new(
             "test-port",
             hardware_ids,
             DevicePortType::RootPort,
             false,
             None, // No hotplug
-            None,
+            msi_conn.target(),
         );
 
         // Add a device to the port (should not panic even without hotplug support)

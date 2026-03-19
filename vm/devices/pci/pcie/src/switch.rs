@@ -109,13 +109,15 @@ impl DownstreamSwitchPort {
             type0_sub_system_id: 0,
         };
 
+        // TODO: Wire MSI for switch downstream ports to enable hotplug.
+        let disconnected = pci_core::msi::MsiConnection::new();
         let port = PcieDownstreamPort::new(
             name.into().to_string(),
             hardware_ids,
             DevicePortType::DownstreamSwitchPort,
             multi_function,
             hotplug_slot_number,
-            None, // Switches don't have MSI wired yet
+            disconnected.target(),
         );
 
         Self { port }
