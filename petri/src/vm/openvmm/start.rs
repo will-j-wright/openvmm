@@ -39,6 +39,8 @@ impl PetriVmConfigOpenVmm {
 
             openvmm_log_file,
 
+            memory_backing_file,
+
             ged,
             framebuffer_view,
         } = self;
@@ -83,7 +85,19 @@ impl PetriVmConfigOpenVmm {
         let host = Self::openvmm_host(&mut resources, &mesh, openvmm_log_file, log_env)
             .await
             .context("failed to create host process")?;
-        let (worker, halt_notif) = Worker::launch(&host, config)
+        // If a memory backing file was requested, open/create it and size
+        // it to match the configured guest RAM.
+        let shared_memory = memory_backing_file
+            .as_ref()
+            .map(|mem_path| {
+                openvmm_helpers::shared_memory::open_memory_backing_file(
+                    mem_path,
+                    config.memory.mem_size,
+                )
+            })
+            .transpose()?;
+
+        let (worker, halt_notif) = Worker::launch(&host, config, shared_memory)
             .await
             .context("failed to launch vm worker")?;
 
