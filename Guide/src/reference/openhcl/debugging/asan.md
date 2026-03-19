@@ -8,8 +8,8 @@ ASAN support is implemented via the `sanitizer` cargo feature and a dedicated IG
 
 | Component | What it does |
 |-----------|-------------|
-| `openhcl/underhill_entry/Cargo.toml` | Defines the `sanitizer` feature; makes `mimalloc` and `fast_memcpy` optional |
-| `openhcl/underhill_entry/src/lib.rs` | Gates out mimalloc global allocator and fast_memcpy when `sanitizer` is active |
+| `openhcl/underhill_entry/Cargo.toml` | Defines the `sanitizer` feature |
+| `openhcl/underhill_entry/src/lib.rs` | Gates out mimalloc global allocator and fast_memcpy via `#[cfg]` when `sanitizer` is active |
 | `openhcl/openvmm_hcl/Cargo.toml` | Forwards `sanitizer` feature to `underhill_entry` |
 | `vm/loader/manifests/openhcl-x64-asan.json` | Sets `memory_page_count` to 524288 (2 GB) for ASAN overhead |
 | `openhcl/rootfs.asan.config` | Adds musl shared libraries (libc.so, libgcc_s.so.1, ld-musl symlink) |
@@ -61,8 +61,6 @@ If you need to build manually (e.g., with a custom openvmm_hcl binary), follow t
 ### Step 1: Build the ASAN binary
 
 ```bash
-cd openhcl/openvmm_hcl
-
 RUSTFLAGS="-Zsanitizer=address \
   -Cforce-unwind-tables=yes \
   -Ctarget-feature=-crt-static \
@@ -71,11 +69,7 @@ RUSTFLAGS="-Zsanitizer=address \
   -Csymbol-mangling-version=v0 \
   -Clink-arg=-Wl,-z,pack-relative-relocs" \
 RUSTC_BOOTSTRAP=1 \
-cargo build --features sanitizer --target x86_64-unknown-linux-musl
-```
-
-```admonish note
-You must run `cargo build` from the `openhcl/openvmm_hcl` directory (not the repo root), because `--features` cannot be used with `-p <package>` for packages outside the current workspace.
+cargo build -p openvmm_hcl --features sanitizer --target x86_64-unknown-linux-musl
 ```
 
 The binary will be at:
@@ -87,12 +81,11 @@ target/x86_64-unknown-linux-musl/debug/openvmm_hcl
 ### Step 2: Build the IGVM
 
 ```bash
-OPENHCL_SYSROOT_LIB=.packages/extracted/x86_64-sysroot/lib \
-cargo xflowey build-igvm x64 \
+cargo xflowey build-igvm x64-asan \
   --custom-openvmm-hcl target/x86_64-unknown-linux-musl/debug/openvmm_hcl
 ```
 
-The `OPENHCL_SYSROOT_LIB` environment variable tells the rootfs builder where to find the musl shared libraries (`libc.so`, `libgcc_s.so.1`) that the dynamically-linked ASAN binary needs.
+The `x64-asan` recipe automatically uses the ASAN manifest (2 GB VTL2 memory), includes `rootfs.asan.config` (musl shared libs), and sets `OPENHCL_SYSROOT_LIB`.
 
 ### Step 3: Use the IGVM
 
@@ -110,7 +103,7 @@ file /lib/libgcc_s.so.1        ${OPENHCL_SYSROOT_LIB}/libgcc_s.so.1    0755 0 0
 slink /lib/ld-musl-x86_64.so.1 /lib/libc.so 0755 0 0
 ```
 
-When building manually, `OPENHCL_SYSROOT_LIB` must point to `.packages/extracted/x86_64-sysroot/lib`. The flowey `build-igvm x64-asan` recipe sets this automatically.
+The `OPENHCL_SYSROOT_LIB` environment variable is set automatically by the `build-igvm x64-asan` recipe.
 
 ---
 
