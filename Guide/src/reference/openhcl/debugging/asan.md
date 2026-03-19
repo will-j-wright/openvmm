@@ -38,7 +38,7 @@ This handles all RUSTFLAGS, feature flags, sysroot configuration, and rootfs sha
 
 The output IGVM will be at:
 
-```
+```text
 flowey-out/artifacts/build-igvm/debug/x64-asan/openhcl-x64-asan.bin
 ```
 
@@ -80,7 +80,7 @@ You must run `cargo build` from the `openhcl/openvmm_hcl` directory (not the rep
 
 The binary will be at:
 
-```
+```text
 target/x86_64-unknown-linux-musl/debug/openvmm_hcl
 ```
 
@@ -104,7 +104,7 @@ Pass the resulting IGVM to your VM configuration in place of the standard OpenHC
 
 The `rootfs.asan.config` (included automatically by the `X64Asan` recipe) contains entries for the musl shared libraries needed by the dynamically-linked ASAN binary:
 
-```
+```text
 file /lib/libc.so              ${OPENHCL_SYSROOT_LIB}/libc.so          0755 0 0
 file /lib/libgcc_s.so.1        ${OPENHCL_SYSROOT_LIB}/libgcc_s.so.1    0755 0 0
 slink /lib/ld-musl-x86_64.so.1 /lib/libc.so 0755 0 0
