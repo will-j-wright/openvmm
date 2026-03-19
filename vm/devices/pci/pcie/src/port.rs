@@ -61,7 +61,7 @@ impl PcieDownstreamPort {
             MsiCapability::new(0, true, false, target)
         } else {
             // No MSI target provided — create a disconnected capability.
-            // MSI interrupts will be silently dropped.
+            // MSI interrupts will be dropped with a rate-limited warning.
             let disconnected = pci_core::msi::MsiConnection::new();
             MsiCapability::new(0, true, false, disconnected.target())
         };
@@ -291,6 +291,16 @@ impl PcieDownstreamPort {
 
     /// Hot-remove the device from this port at runtime.
     pub fn hotplug_remove_device(&mut self) -> anyhow::Result<()> {
+        let is_hotplug_capable = self
+            .cfg_space
+            .capabilities()
+            .iter()
+            .find_map(|cap| cap.as_pci_express())
+            .is_some_and(|pcie| pcie.slot_capabilities().hot_plug_capable());
+
+        if !is_hotplug_capable {
+            bail!("port '{}' is not hotplug capable", self.name);
+        }
         if self.link.is_none() {
             bail!("port '{}' is empty", self.name);
         }

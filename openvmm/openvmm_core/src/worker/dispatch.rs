@@ -2913,6 +2913,17 @@ impl LoadedVm {
                     }
                     VmRpc::RemovePcieDevice(rpc) => {
                         rpc.handle_failable(async |port_name: String| {
+                            // Only allow removing dynamically hot-added devices.
+                            // Statically-attached devices don't have a tracked unit
+                            // and removing them would leave their state unit/MMIO
+                            // registrations running.
+                            let idx = self.inner.pcie_hotplug_devices.iter()
+                                .position(|(name, _)| name == &port_name)
+                                .ok_or_else(|| anyhow::anyhow!(
+                                    "no hot-added device on port '{}' (only dynamically added devices can be hot-removed)",
+                                    port_name
+                                ))?;
+
                             // Find the root complex containing the target port
                             let rc = self.inner.pcie_root_complexes.iter()
                                 .find(|rc| {
@@ -2922,11 +2933,9 @@ impl LoadedVm {
 
                             rc.lock().hotplug_remove_device(&port_name)?;
 
-                            // Remove and stop the corresponding device unit
-                            if let Some(idx) = self.inner.pcie_hotplug_devices.iter().position(|(name, _)| name == &port_name) {
-                                let (_, unit) = self.inner.pcie_hotplug_devices.remove(idx);
-                                unit.remove().await;
-                            }
+                            // Remove and stop the device unit
+                            let (_, unit) = self.inner.pcie_hotplug_devices.remove(idx);
+                            unit.remove().await;
 
                             anyhow::Ok(())
                         })
