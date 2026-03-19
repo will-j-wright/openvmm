@@ -557,7 +557,7 @@ struct LoadedVmInner {
     hypervisor: Hypervisor,
     partition_unit: PartitionUnit,
     partition: Arc<dyn HvlitePartition>,
-    _chipset_devices: ChipsetDevices,
+    chipset_devices: ChipsetDevices,
     _vmtime: SpawnedUnit<VmTimeKeeper>,
     _scsi_devices: Vec<SpawnedUnit<ChannelUnit<storvsp::StorageDevice>>>,
     memory_manager: GuestMemoryManager,
@@ -2309,7 +2309,7 @@ impl InitializedVm {
                 hypervisor,
                 partition_unit,
                 partition,
-                _chipset_devices: devices,
+                chipset_devices: devices,
                 _vmtime: vmtime,
                 _scsi_devices: scsi_devices,
                 memory_manager,
@@ -2854,10 +2854,18 @@ impl LoadedVm {
                     }
                     VmRpc::AddPcieDevice(rpc) => {
                         rpc.handle_failable(async |(port_name, resource)| {
+                            // Validate the port exists before creating the device
+                            // to avoid leaking a DynamicDeviceUnit on error.
+                            let rc = self.inner.pcie_root_complexes.iter()
+                                .find(|rc| {
+                                    rc.lock().downstream_ports().iter().any(|(_, name)| name.as_ref() == port_name.as_str())
+                                })
+                                .ok_or_else(|| anyhow::anyhow!("port '{}' not found in any root complex", port_name))?;
+
                             let msi_conn = pci_core::msi::MsiConnection::new();
                             let signal_msi = self.inner.partition.clone().into_signal_msi(Vtl::Vtl0);
 
-                            let (unit, device) = self.inner._chipset_devices.add_dyn_device(
+                            let (unit, device) = self.inner.chipset_devices.add_dyn_device(
                                 &self.inner.driver_source,
                                 &self.state_units,
                                 format!("pcie-hotplug:{}", port_name),
@@ -2888,18 +2896,15 @@ impl LoadedVm {
                             let weak_dev: std::sync::Weak<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>> = Arc::downgrade(&(device as Arc<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>>));
                             let bus_device = Box::new(WeakMutexPciBusDevice(weak_dev));
 
-                            // Find the root complex containing the target port
-                            let rc = self.inner.pcie_root_complexes.iter()
-                                .find(|rc| {
-                                    rc.lock().downstream_ports().iter().any(|(_, name)| name.as_ref() == port_name.as_str())
-                                })
-                                .ok_or_else(|| anyhow::anyhow!("port '{}' not found in any root complex", port_name))?;
-
-                            rc.lock().hotplug_add_device(
+                            if let Err(e) = rc.lock().hotplug_add_device(
                                 &port_name,
                                 "hotplug-device",
                                 bus_device,
-                            )?;
+                            ) {
+                                // Clean up the device unit on failure
+                                unit.remove().await;
+                                return Err(e);
+                            }
                             self.inner.pcie_hotplug_devices.push((port_name.clone(), unit));
                             self.state_units.start_stopped_units().await;
                             anyhow::Ok(())
