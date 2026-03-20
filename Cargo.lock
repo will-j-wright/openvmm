@@ -414,6 +414,7 @@ dependencies = [
  "anyhow",
  "build_rs_git_info",
  "clap",
+ "futures",
  "jiff",
  "openvmm_defs",
  "pal_async",
@@ -426,6 +427,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "windows 0.62.0",
 ]
 
 [[package]]
