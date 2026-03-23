@@ -90,47 +90,60 @@ async fn parse_guest_pci_devices(
             }
         }
         OsFlavor::Windows => {
-            let sh = agent.windows_shell();
-            let output = cmd!(
-                sh,
-                "pnputil.exe /enum-devices /bus PCI /connected /properties"
-            )
-            .read()
-            .await?;
+            devs = pnputil_parse_pci_devices(agent, &["/connected"]).await?;
+        }
+        _ => unreachable!(),
+    }
 
-            let lines = output.as_str().lines();
-            let mut parsing_hwids = false;
-            for line in lines {
-                if parsing_hwids {
-                    // Find one matching PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ
-                    let mut toks = line.trim().split('_');
-                    if let (Some(tok0), Some(tok1), Some(tok2), Some(tok3)) =
-                        (toks.next(), toks.next(), toks.next(), toks.next())
-                    {
-                        if tok0.ends_with("VEN")
-                            && tok1.ends_with("DEV")
-                            && tok2.ends_with("CC")
-                            && tok3.len() == 6
-                        {
-                            let vendor_id = u16::from_str_radix(&tok1[..4], 16)?;
-                            let device_id = u16::from_str_radix(&tok2[..4], 16)?;
-                            let class_code = u32::from_str_radix(&tok3[..6], 16)?;
-                            devs.push(ParsedPciDevice {
-                                vendor_id,
-                                device_id,
-                                class_code,
-                            });
-                            parsing_hwids = false;
-                        }
+    Ok(devs)
+}
+
+/// Run `pnputil.exe /enum-devices /bus PCI /properties` with additional
+/// filter flags and parse PCI device hardware IDs from the output.
+async fn pnputil_parse_pci_devices(
+    agent: &PipetteClient,
+    extra_args: &[&str],
+) -> anyhow::Result<Vec<ParsedPciDevice>> {
+    let sh = agent.windows_shell();
+    let extra = extra_args.join(" ");
+    let output = cmd!(sh, "pnputil.exe /enum-devices /bus PCI {extra} /properties")
+        .read()
+        .await?;
+
+    let mut devs = vec![];
+    let lines = output.as_str().lines();
+    let mut parsing_hwids = false;
+    for line in lines {
+        if parsing_hwids {
+            // Find one matching PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ
+            let mut toks = line.trim().split('_');
+            if let (Some(tok0), Some(tok1), Some(tok2), Some(tok3)) =
+                (toks.next(), toks.next(), toks.next(), toks.next())
+            {
+                if tok0.ends_with("VEN")
+                    && tok1.ends_with("DEV")
+                    && tok2.ends_with("CC")
+                    && tok3.len() == 6
+                {
+                    if let (Ok(vendor_id), Ok(device_id), Ok(class_code)) = (
+                        u16::from_str_radix(&tok1[..4], 16),
+                        u16::from_str_radix(&tok2[..4], 16),
+                        u32::from_str_radix(&tok3[..6], 16),
+                    ) {
+                        devs.push(ParsedPciDevice {
+                            vendor_id,
+                            device_id,
+                            class_code,
+                        });
                     }
-                } else if line.contains("DEVPKEY_Device_HardwareIds") {
-                    parsing_hwids = true;
-                } else if line.contains("DEVPKEY") {
                     parsing_hwids = false;
                 }
             }
+        } else if line.contains("DEVPKEY_Device_HardwareIds") {
+            parsing_hwids = true;
+        } else if line.contains("DEVPKEY") {
+            parsing_hwids = false;
         }
-        _ => unreachable!(),
     }
 
     Ok(devs)
@@ -289,26 +302,36 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
     // Hot-remove the device
     vm.remove_pcie_device("rp0".into()).await?;
 
-    // Verify the device is gone (Linux only).
-    //
-    // Windows PnP does not automatically remove surprise-removed devices
-    // from its device tree — pnputil /enum-devices /connected still lists
-    // them. A full Windows hot-remove requires an Eject or Safe Removal
-    // flow that is not yet implemented. For now, we verify that the remove
-    // RPC succeeds and skip the device-gone check on Windows.
-    if matches!(os_flavor, OsFlavor::Linux) {
-        let mut removed = false;
-        for attempt in 0..30 {
-            let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
-            let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
-            if endpoints == 0 {
-                tracing::info!(attempt, "device removed after hot-remove");
-                removed = true;
-                break;
+    // Verify the device is gone.
+    match os_flavor {
+        OsFlavor::Linux => {
+            // On Linux, pciehp removes the device from sysfs promptly.
+            let mut removed = false;
+            for attempt in 0..30 {
+                let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
+                let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
+                if endpoints == 0 {
+                    tracing::info!(attempt, "device removed after hot-remove");
+                    removed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
-            std::thread::sleep(Duration::from_millis(500));
+            assert!(removed, "expected endpoint to disappear after hot-remove");
         }
-        assert!(removed, "expected endpoint to disappear after hot-remove");
+        OsFlavor::Windows => {
+            // TODO: Windows hot-remove is not yet working. The MSI fires
+            // with correct Slot Status bits (presence=0, DLLLA=0,
+            // presence_detect_changed=1, data_link_layer_state_changed=1)
+            // and MSI is enabled in both Slot Control and MSI Capability,
+            // but Windows pci.sys does not process the removal event.
+            // Hot-add works correctly via the same MSI path.
+            // The device stays in pnputil /connected indefinitely (tested
+            // for 120 seconds). Needs investigation at the interrupt
+            // delivery / APIC level.
+            tracing::info!("skipping Windows removal verification (not yet working)");
+        }
+        _ => unreachable!(),
     }
 
     agent.power_off().await?;

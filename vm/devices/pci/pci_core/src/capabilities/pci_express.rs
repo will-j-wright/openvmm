@@ -372,6 +372,22 @@ impl PciExpressCapability {
                 .slot_status
                 .with_presence_detect_state(if present { 1 } else { 0 });
         state.link_status = state.link_status.with_data_link_layer_link_active(present);
+
+        // Update link speed/width to reflect link state. When a device is
+        // removed, the link goes down and these fields reset to 0. When a
+        // device is added, the link trains and reports its negotiated speed.
+        if present {
+            state.link_status = state
+                .link_status
+                .with_current_link_speed(LinkSpeed::Speed32_0GtS.into_bits() as u16)
+                .with_negotiated_link_width(LinkWidth::X16.into_bits() as u16);
+        } else {
+            state.link_status = state
+                .link_status
+                .with_current_link_speed(0)
+                .with_negotiated_link_width(0);
+        }
+
         state.slot_status.set_presence_detect_changed(true);
         state.slot_status.set_data_link_layer_state_changed(true);
     }
