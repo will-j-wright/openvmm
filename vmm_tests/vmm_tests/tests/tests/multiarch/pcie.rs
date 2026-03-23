@@ -10,6 +10,7 @@ use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
 use pipette_client::PipetteClient;
 use std::fmt;
+use std::time::Duration;
 use vmm_test_macros::openvmm_test;
 
 struct ParsedPciDevice {
@@ -281,18 +282,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
             found = true;
             break;
         }
-        // Guest-side sleep between polls
-        match os_flavor {
-            OsFlavor::Linux => {
-                let sh = agent.unix_shell();
-                cmd!(sh, "sleep 0.5").run().await?;
-            }
-            OsFlavor::Windows => {
-                let sh = agent.windows_shell();
-                cmd!(sh, "ping -n 2 127.0.0.1").run().await?;
-            }
-            _ => unreachable!(),
-        }
+        std::thread::sleep(Duration::from_millis(500));
     }
     assert!(found, "expected NVMe endpoint to appear after hot-add");
 
@@ -316,8 +306,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
                 removed = true;
                 break;
             }
-            let sh = agent.unix_shell();
-            cmd!(sh, "sleep 0.5").run().await?;
+            std::thread::sleep(Duration::from_millis(500));
         }
         assert!(removed, "expected endpoint to disappear after hot-remove");
     }
