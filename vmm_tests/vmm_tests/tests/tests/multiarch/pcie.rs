@@ -306,6 +306,9 @@ async fn pcie_hotplug(
     }
     assert!(found, "expected NVMe endpoint to appear after hot-add");
 
+    // Wait for the guest to fully process the add event before removing.
+    timer.sleep(Duration::from_secs(5)).await;
+
     // Hot-remove the device
     vm.remove_pcie_device("rp0".into()).await?;
 
@@ -327,16 +330,13 @@ async fn pcie_hotplug(
             assert!(removed, "expected endpoint to disappear after hot-remove");
         }
         OsFlavor::Windows => {
-            // TODO: Windows hot-remove is not yet working. The MSI fires
-            // with correct Slot Status bits (presence=0, DLLLA=0,
-            // presence_detect_changed=1, data_link_layer_state_changed=1)
-            // and MSI is enabled in both Slot Control and MSI Capability,
-            // but Windows pci.sys does not process the removal event.
-            // Hot-add works correctly via the same MSI path.
-            // The device stays in pnputil /connected indefinitely (tested
-            // for 120 seconds). Needs investigation at the interrupt
-            // delivery / APIC level.
-            tracing::info!("skipping Windows removal verification (not yet working)");
+            // TODO: Windows hot-remove is not working yet. The MSI
+            // fires correctly and pci.sys ISR reads the DLLSC status, but
+            // the device is never surprise-removed. Investigation of the
+            // shows the hotplug state machine should handle
+            // this, but something prevents it from completing. Tracked as
+            // a follow-up to the initial hotplug implementation.
+            tracing::info!("skipping Windows removal verification (known issue)");
         }
         _ => unreachable!(),
     }
