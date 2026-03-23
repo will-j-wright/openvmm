@@ -6,6 +6,8 @@ use crate::multiarch::cmd;
 use memory_range::MemoryRange;
 use openvmm_defs::config::PcieRootComplexConfig;
 use openvmm_defs::config::PcieRootPortConfig;
+use pal_async::DefaultDriver;
+use pal_async::timer::PolledTimer;
 use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
 use pipette_client::PipetteClient;
@@ -224,7 +226,11 @@ async fn pcie_root_emulation(config: PetriVmBuilder<OpenVmmPetriBackend>) -> any
 /// Test PCIe hotplug: hot-add a device to a hotplug-capable port, verify the
 /// guest sees it, then hot-remove it and verify it's gone.
 #[openvmm_test(linux_direct_x64, uefi_x64(vhd(windows_datacenter_core_2022_x64)))]
-async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+async fn pcie_hotplug(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
     const ECAM_SIZE: u64 = 256 * 1024 * 1024;
     const LOW_MMIO_SIZE: u64 = 64 * 1024 * 1024;
     const HIGH_MMIO_SIZE: u64 = 1024 * 1024 * 1024;
@@ -286,6 +292,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
     vm.add_pcie_device("rp0".into(), nvme_resource).await?;
 
     // Wait for the guest to enumerate the device (poll with retries)
+    let mut timer = PolledTimer::new(&driver);
     let mut found = false;
     for attempt in 0..30 {
         let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
@@ -295,7 +302,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
             found = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        timer.sleep(Duration::from_millis(500)).await;
     }
     assert!(found, "expected NVMe endpoint to appear after hot-add");
 
@@ -315,7 +322,7 @@ async fn pcie_hotplug(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Re
                     removed = true;
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                timer.sleep(Duration::from_millis(500)).await;
             }
             assert!(removed, "expected endpoint to disappear after hot-remove");
         }
