@@ -2436,6 +2436,7 @@ dependencies = [
  "memory_range",
  "pal_async",
  "pci_bus",
+ "pci_core",
  "pcie",
  "vmcore",
  "xtask_fuzz",
