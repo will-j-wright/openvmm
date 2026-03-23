@@ -332,8 +332,8 @@ async fn pcie_hotplug(
         OsFlavor::Windows => {
             // TODO: Windows hot-remove is not working yet. The MSI
             // fires correctly and pci.sys ISR reads the DLLSC status, but
-            // the device is never surprise-removed. Investigation of the
-            // shows the hotplug state machine should handle
+            // the device is never surprise-removed. Investigation
+            // shows that the hotplug state machine should handle
             // this, but something prevents it from completing. Tracked as
             // a follow-up to the initial hotplug implementation.
             tracing::info!("skipping Windows removal verification (known issue)");
