@@ -101,6 +101,7 @@ impl FlowNode for Node {
                         .into_iter()
                         .collect(),
                 )),
+                extra_cargo_config: vec![],
                 pre_build_deps,
                 output: v,
             });

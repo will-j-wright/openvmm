@@ -164,29 +164,46 @@ impl FlowNode for Node {
 
             features.extend(max_trace_level.features());
 
+            // For ASAN builds, only RUSTC_BOOTSTRAP goes in extra_env.
+            // ASAN-specific rustflags are passed via --config to avoid
+            // overwriting the flags from .cargo/config.toml.
             let extra_env = if is_sanitizer {
-                let is_x86_64 = matches!(arch, CommonArch::X86_64);
                 Some(ctx.emit_rust_stepv("set ASAN env vars", |_ctx| {
                     move |_rt| {
                         let mut env = BTreeMap::new();
-                        let mut rustflags = vec![
-                            "-Zsanitizer=address",
-                            "-Cforce-unwind-tables=yes",
-                            "-Ctarget-feature=-crt-static",
-                            "-Clink-self-contained=n",
-                            "-Cforce-frame-pointers=yes",
-                            "-Csymbol-mangling-version=v0",
-                        ];
-                        if is_x86_64 {
-                            rustflags.push("-Clink-arg=-Wl,-z,pack-relative-relocs");
-                        }
-                        env.insert("RUSTFLAGS".into(), rustflags.join(" "));
                         env.insert("RUSTC_BOOTSTRAP".into(), "1".into());
                         Ok(env)
                     }
                 }))
             } else {
                 None
+            };
+
+            // Build the ASAN rustflags as --config overrides for the musl
+            // target. This replaces the [target.'cfg(target_env = "musl")']
+            // section in .cargo/config.toml with ASAN-compatible flags, while
+            // preserving all other target config sections.
+            let extra_cargo_config = if is_sanitizer {
+                let is_x86_64 = matches!(arch, CommonArch::X86_64);
+                let mut flags = vec![
+                    "-Zsanitizer=address".to_string(),
+                    "-Cforce-unwind-tables=yes".to_string(),
+                    "-Ctarget-feature=-crt-static".to_string(),
+                    "-Clink-self-contained=n".to_string(),
+                ];
+                if is_x86_64 {
+                    flags.push("-Clink-arg=-Wl,-z,pack-relative-relocs".to_string());
+                }
+                let flags_toml = flags
+                    .iter()
+                    .map(|f| format!("\"{f}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                vec![format!(
+                    "target.'cfg(target_env = \"musl\")'.rustflags = [{flags_toml}]"
+                )]
+            } else {
+                vec![]
             };
 
             let output = ctx.reqv(|v| crate::run_cargo_build::Request {
@@ -206,6 +223,7 @@ impl FlowNode for Node {
                 target,
                 no_split_dbg_info,
                 extra_env,
+                extra_cargo_config,
                 pre_build_deps,
                 output: v,
             });

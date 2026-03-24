@@ -80,6 +80,7 @@ impl SimpleFlowNode for Node {
             target: target.as_triple(),
             no_split_dbg_info: false,
             extra_env: None,
+            extra_cargo_config: vec![],
             pre_build_deps,
             output: v,
         });
