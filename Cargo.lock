@@ -5182,11 +5182,8 @@ dependencies = [
  "chipset_device_resources",
  "chipset_device_worker",
  "chipset_legacy",
-<<<<<<< HEAD
- "crc32fast",
-=======
  "closeable_mutex",
->>>>>>> 7879af1c7 (pcie: add _OSC in SSDT, petri hotplug test, and test infrastructure)
+ "crc32fast",
  "debug_ptr",
  "disk_backend",
  "fdt",
