@@ -2905,17 +2905,25 @@ impl LoadedVm {
                             let weak_dev: std::sync::Weak<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>> = Arc::downgrade(&(device.clone() as Arc<closeable_mutex::CloseableMutex<dyn chipset_device::ChipsetDevice>>));
                             let bus_device = Box::new(WeakMutexPciBusDevice(weak_dev));
 
+                            self.inner.pcie_hotplug_devices.push((port_name.clone(), unit, device));
+
+                            // Start the device unit before firing the hotplug
+                            // MSI. The guest may begin probing config space
+                            // immediately after receiving the interrupt, so
+                            // the device must be ready first.
+                            self.state_units.start_stopped_units().await;
+
+                            // Now attach the device and notify the guest.
                             if let Err(e) = rc.lock().hotplug_add_device(
                                 &port_name,
                                 "hotplug-device",
                                 bus_device,
                             ) {
                                 // Clean up the device unit on failure
+                                let (_, unit, _) = self.inner.pcie_hotplug_devices.pop().unwrap();
                                 unit.remove().await;
                                 return Err(e);
                             }
-                            self.inner.pcie_hotplug_devices.push((port_name.clone(), unit, device));
-                            self.state_units.start_stopped_units().await;
                             anyhow::Ok(())
                         })
                         .await
