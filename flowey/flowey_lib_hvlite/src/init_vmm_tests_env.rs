@@ -368,7 +368,6 @@ impl SimpleFlowNode for Node {
                             OpenhclIgvmRecipe::X64TestLinuxDirect => {
                                 "openhcl-x64-test-linux-direct.bin"
                             }
-                            OpenhclIgvmRecipe::X64Asan => "openhcl-x64-asan.bin",
                             OpenhclIgvmRecipe::Aarch64 => "openhcl-aarch64.bin",
                             OpenhclIgvmRecipe::Aarch64Devkern => "openhcl-aarch64-devkern.bin",
                             _ => {

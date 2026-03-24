@@ -81,6 +81,8 @@ rustflags = [
   "-Ctarget-feature=+lse,+neon",
 ]
 
+# NOTE: When modifying this section, also update the ASAN rustflags override
+# in build_openvmm_hcl.rs, which replaces these flags for ASAN builds.
 [target.'cfg(target_env = "musl")']
 rustflags = [
   # Use the musl from the sysroot, not from the Rust distribution.

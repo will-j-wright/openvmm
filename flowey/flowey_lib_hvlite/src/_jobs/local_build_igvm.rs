@@ -40,6 +40,7 @@ pub struct Customizations {
     pub with_debuginfo: bool,
     pub with_perf_tools: bool,
     pub with_sidecar: bool,
+    pub with_asan: bool,
 }
 
 flowey_request! {
@@ -95,6 +96,7 @@ impl SimpleFlowNode for Node {
             with_debuginfo,
             with_perf_tools,
             with_sidecar,
+            with_asan,
             custom_extra_rootfs,
         } = customizations;
 
@@ -111,6 +113,16 @@ impl SimpleFlowNode for Node {
             OpenvmmHclBuildProfile::Debug
         };
         let mut recipe_details = base_recipe.recipe_details(release_cfg);
+
+        if with_asan {
+            recipe_details
+                .openvmm_hcl_features
+                .insert(OpenvmmHclFeature::Sanitizer);
+            recipe_details.igvm_manifest = IgvmManifestPath::InTree("openhcl-x64-asan.json".into());
+            recipe_details
+                .extra_rootfs_configs
+                .push("rootfs.asan.config".into());
+        }
 
         {
             let OpenhclIgvmRecipeDetails {
@@ -315,7 +327,6 @@ pub fn non_production_build_igvm_tool_out_name(recipe: &OpenhclIgvmRecipe) -> &'
         OpenhclIgvmRecipe::X64TestLinuxDirectDevkern => "x64-test-linux-direct-devkern",
         OpenhclIgvmRecipe::X64Cvm => "x64-cvm",
         OpenhclIgvmRecipe::X64CvmDevkern => "x64-cvm-devkern",
-        OpenhclIgvmRecipe::X64Asan => "x64-asan",
         OpenhclIgvmRecipe::Aarch64 => "aarch64",
         OpenhclIgvmRecipe::Aarch64Devkern => "aarch64-devkern",
         OpenhclIgvmRecipe::LocalOnlyCustom(_) => unreachable!(),

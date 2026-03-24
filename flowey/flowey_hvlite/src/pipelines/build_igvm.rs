@@ -31,8 +31,6 @@ pub enum OpenhclRecipeCli {
     X64,
     /// X64 OpenHCL, using the dev kernel in VTL2
     X64Devkern,
-    /// X64 OpenHCL with AddressSanitizer (ASAN) enabled
-    X64Asan,
 }
 
 /// Build OpenHCL IGVM files for local development. DO NOT USE IN CI.
@@ -167,6 +165,12 @@ pub struct BuildIgvmCliCustomizations {
     /// (experimental) Include the AP kernel in the IGVM file
     #[clap(long)]
     pub with_sidecar: bool,
+
+    /// Build with AddressSanitizer (ASAN) instrumentation.
+    /// Enables the `sanitizer` feature, uses the ASAN manifest (2 GB VTL2
+    /// memory), and includes musl shared libs in the rootfs for dynamic linking.
+    #[clap(long)]
+    pub with_asan: bool,
 
     /// (experimental) Path to custom sidecar kernel binary, none means sidecar
     /// will be built.
@@ -306,6 +310,7 @@ impl IntoPipeline for BuildIgvmCli {
                     custom_layer,
                     custom_directory,
                     with_sidecar,
+                    with_asan,
                     custom_sidecar,
                     mut custom_extra_rootfs,
                     max_trace_level,
@@ -330,8 +335,7 @@ impl IntoPipeline for BuildIgvmCli {
             | OpenhclRecipeCli::X64Cvm
             | OpenhclRecipeCli::X64CvmDevkern
             | OpenhclRecipeCli::X64TestLinuxDirect
-            | OpenhclRecipeCli::X64TestLinuxDirectDevkern
-            | OpenhclRecipeCli::X64Asan => CommonArch::X86_64,
+            | OpenhclRecipeCli::X64TestLinuxDirectDevkern => CommonArch::X86_64,
             OpenhclRecipeCli::Aarch64 | OpenhclRecipeCli::Aarch64Devkern => CommonArch::Aarch64,
         };
 
@@ -424,7 +428,6 @@ impl IntoPipeline for BuildIgvmCli {
                 }
                 OpenhclRecipeCli::X64Cvm => OpenhclIgvmRecipe::X64Cvm,
                 OpenhclRecipeCli::X64CvmDevkern => OpenhclIgvmRecipe::X64CvmDevkern,
-                OpenhclRecipeCli::X64Asan => OpenhclIgvmRecipe::X64Asan,
                 OpenhclRecipeCli::Aarch64 => OpenhclIgvmRecipe::Aarch64,
                 OpenhclRecipeCli::Aarch64Devkern => OpenhclIgvmRecipe::Aarch64Devkern,
             },
@@ -446,6 +449,7 @@ impl IntoPipeline for BuildIgvmCli {
                     KernelPackageKindCli::CvmDev => OpenhclKernelPackage::CvmDev,
                 }),
                 with_sidecar,
+                with_asan,
                 custom_extra_rootfs,
                 override_openvmm_hcl_feature,
                 custom_sidecar,

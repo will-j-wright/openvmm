@@ -11,8 +11,10 @@ use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use flowey_lib_common::git_checkout::RepoSource;
 use flowey_lib_hvlite::_jobs::build_and_publish_openhcl_igvm_from_recipe::OpenhclIgvmBuildParams;
+use flowey_lib_hvlite::build_openhcl_igvm_from_recipe::IgvmManifestPath;
 use flowey_lib_hvlite::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipe;
 use flowey_lib_hvlite::build_openvmm_hcl::OpenvmmHclBuildProfile;
+use flowey_lib_hvlite::build_openvmm_hcl::OpenvmmHclFeature;
 use flowey_lib_hvlite::run_cargo_build::common::CommonArch;
 use flowey_lib_hvlite::run_cargo_build::common::CommonPlatform;
 use flowey_lib_hvlite::run_cargo_build::common::CommonProfile;
@@ -739,14 +741,27 @@ impl IntoPipeline for CheckinGatesCli {
                 }
             }
             let igvm_recipes = match arch {
-                CommonArch::X86_64 => vec![
-                    OpenhclIgvmRecipe::X64,
-                    OpenhclIgvmRecipe::X64Devkern,
-                    OpenhclIgvmRecipe::X64TestLinuxDirect,
-                    OpenhclIgvmRecipe::X64TestLinuxDirectDevkern,
-                    OpenhclIgvmRecipe::X64Cvm,
-                    OpenhclIgvmRecipe::X64Asan,
-                ],
+                CommonArch::X86_64 => {
+                    // Build an ASAN variant of X64 alongside the standard recipes.
+                    let mut asan_details = OpenhclIgvmRecipe::X64.recipe_details(release);
+                    asan_details
+                        .openvmm_hcl_features
+                        .insert(OpenvmmHclFeature::Sanitizer);
+                    asan_details.igvm_manifest =
+                        IgvmManifestPath::InTree("openhcl-x64-asan.json".into());
+                    asan_details
+                        .extra_rootfs_configs
+                        .push("rootfs.asan.config".into());
+
+                    vec![
+                        OpenhclIgvmRecipe::X64,
+                        OpenhclIgvmRecipe::X64Devkern,
+                        OpenhclIgvmRecipe::X64TestLinuxDirect,
+                        OpenhclIgvmRecipe::X64TestLinuxDirectDevkern,
+                        OpenhclIgvmRecipe::X64Cvm,
+                        OpenhclIgvmRecipe::LocalOnlyCustom(asan_details),
+                    ]
+                }
                 CommonArch::Aarch64 => {
                     vec![
                         OpenhclIgvmRecipe::Aarch64,

@@ -165,8 +165,8 @@ impl FlowNode for Node {
             features.extend(max_trace_level.features());
 
             // For ASAN builds, only RUSTC_BOOTSTRAP goes in extra_env.
-            // ASAN-specific rustflags are passed via --config to avoid
-            // overwriting the flags from .cargo/config.toml.
+            // ASAN-specific rustflags are passed via inline --config to replace
+            // via --config to override the musl rustflags section.
             let extra_env = if is_sanitizer {
                 Some(ctx.emit_rust_stepv("set ASAN env vars", |_ctx| {
                     move |_rt| {
@@ -179,10 +179,11 @@ impl FlowNode for Node {
                 None
             };
 
-            // Build the ASAN rustflags as --config overrides for the musl
-            // target. This replaces the [target.'cfg(target_env = "musl")']
-            // section in .cargo/config.toml with ASAN-compatible flags, while
-            // preserving all other target config sections.
+            // Replace the [target.'cfg(target_env = "musl")'] rustflags with
+            // ASAN-compatible flags via inline --config (which replaces the key,
+            // unlike file-based --config which appends).
+            //
+            // NOTE: keep in sync with the musl section in .cargo/config.toml.
             let extra_cargo_config = if is_sanitizer {
                 let is_x86_64 = matches!(arch, CommonArch::X86_64);
                 let mut flags = vec![

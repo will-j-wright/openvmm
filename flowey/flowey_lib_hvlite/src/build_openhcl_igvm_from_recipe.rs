@@ -92,7 +92,6 @@ pub enum OpenhclIgvmRecipe {
     X64TestLinuxDirectDevkern,
     X64Cvm,
     X64CvmDevkern,
-    X64Asan,
     Aarch64,
     Aarch64Devkern,
 }
@@ -222,23 +221,6 @@ impl OpenhclIgvmRecipe {
                 max_trace_level,
                 extra_rootfs_configs: vec![],
             },
-            Self::X64Asan => {
-                let mut features = base_openvmm_hcl_features();
-                features.insert(OpenvmmHclFeature::Sanitizer);
-                OpenhclIgvmRecipeDetails {
-                    local_only: None,
-                    igvm_manifest: IgvmManifestPath::InTree("openhcl-x64-asan.json".into()),
-                    openhcl_kernel_package: OpenhclKernelPackage::Dev,
-                    openvmm_hcl_features: features,
-                    target: CommonTriple::X86_64_LINUX_MUSL,
-                    vtl0_kernel_type: None,
-                    with_uefi: true,
-                    with_interactive: true,
-                    with_sidecar: false,
-                    max_trace_level: MaxTraceLevel::Trace,
-                    extra_rootfs_configs: vec!["rootfs.asan.config".into()],
-                }
-            }
             Self::Aarch64 => OpenhclIgvmRecipeDetails {
                 local_only: None,
                 igvm_manifest: in_repo_template(
