@@ -4,7 +4,7 @@ This guide explains how to build an OpenHCL IGVM image with [AddressSanitizer (A
 
 ## How ASAN support works
 
-ASAN support is implemented via the `sanitizer` cargo feature and a dedicated IGVM recipe (`X64Asan`). The following components are involved:
+ASAN support is implemented via the `sanitizer` cargo feature and the `--with-asan` build flag. The following components are involved:
 
 | Component | What it does |
 |-----------|-------------|
@@ -28,23 +28,23 @@ ASAN support is implemented via the `sanitizer` cargo feature and a dedicated IG
 
 ## Building with flowey (recommended)
 
-The easiest way to build an ASAN-enabled IGVM is to use the `X64Asan` recipe via `cargo xflowey build-igvm`:
+The easiest way to build an ASAN-enabled IGVM is to use the `--with-asan` flag with any recipe:
 
 ```bash
-cargo xflowey build-igvm x64-asan
+cargo xflowey build-igvm x64 --with-asan
 ```
 
-This handles all RUSTFLAGS, feature flags, sysroot configuration, and rootfs shared library inclusion automatically.
+This works with any base recipe (e.g., `x64`, `x64-cvm`, `x64-test-linux-direct`). It handles all RUSTFLAGS, feature flags, sysroot configuration, and rootfs shared library inclusion automatically.
 
 The output IGVM will be at:
 
 ```text
-flowey-out/artifacts/build-igvm/debug/x64-asan/openhcl-x64-asan.bin
+flowey-out/artifacts/build-igvm/debug/x64-custom/openhcl-x64-custom.bin
 ```
 
 ### CI
 
-The `X64Asan` recipe is built automatically in the CI (nightly) pipeline alongside other x64 IGVM recipes. ASAN VMM tests run only in CI, not in PR builds.
+The ASAN IGVM is built automatically in CI alongside other x64 IGVM recipes. ASAN VMM tests run in both PR and CI builds.
 
 ---
 
@@ -81,11 +81,11 @@ target/x86_64-unknown-linux-musl/debug/openvmm_hcl
 ### Step 2: Build the IGVM
 
 ```bash
-cargo xflowey build-igvm x64-asan \
+cargo xflowey build-igvm x64 --with-asan \
   --custom-openvmm-hcl target/x86_64-unknown-linux-musl/debug/openvmm_hcl
 ```
 
-The `x64-asan` recipe automatically uses the ASAN manifest (2 GB VTL2 memory), includes `rootfs.asan.config` (musl shared libs), and sets `OPENHCL_SYSROOT_LIB`.
+The `--with-asan` flag automatically uses the ASAN manifest (2 GB VTL2 memory), includes `rootfs.asan.config` (musl shared libs), and sets `OPENHCL_SYSROOT_LIB`.
 
 ### Step 3: Use the IGVM
 
@@ -95,7 +95,7 @@ Pass the resulting IGVM to your VM configuration in place of the standard OpenHC
 
 ## Rootfs shared library note
 
-The `rootfs.asan.config` (included automatically by the `X64Asan` recipe) contains entries for the musl shared libraries needed by the dynamically-linked ASAN binary:
+The `rootfs.asan.config` (included automatically when `--with-asan` is used) contains entries for the musl shared libraries needed by the dynamically-linked ASAN binary:
 
 ```text
 file /lib/libc.so              ${OPENHCL_SYSROOT_LIB}/libc.so          0755 0 0
@@ -103,7 +103,7 @@ file /lib/libgcc_s.so.1        ${OPENHCL_SYSROOT_LIB}/libgcc_s.so.1    0755 0 0
 slink /lib/ld-musl-x86_64.so.1 /lib/libc.so 0755 0 0
 ```
 
-The `OPENHCL_SYSROOT_LIB` environment variable is set automatically by the `build-igvm x64-asan` recipe.
+The `OPENHCL_SYSROOT_LIB` environment variable is set automatically by the `--with-asan` flag.
 
 ---
 
@@ -111,7 +111,7 @@ The `OPENHCL_SYSROOT_LIB` environment variable is set automatically by the `buil
 
 ### "Initramfs unpacking failed"
 
-The VTL2 memory allocation is too small. Ensure the manifest's `memory_page_count` is set to at least `524288` (2 GB). The ASAN recipe uses `vm/loader/manifests/openhcl-x64-asan.json` which has this pre-configured.
+The VTL2 memory allocation is too small. Ensure the manifest's `memory_page_count` is set to at least `524288` (2 GB). The `--with-asan` flag uses `vm/loader/manifests/openhcl-x64-asan.json` which has this pre-configured.
 
 ### "Failed to execute /underhill-init (error -2)"
 
@@ -123,10 +123,6 @@ The ASAN binary is dynamically linked but the rootfs is missing the required sha
 ### "cannot find native static library `rustc-stable_rt.asan`"
 
 The ASAN sanitizer runtime is not available for the target. This happens when cross-compiling. Rust only ships ASAN runtimes for the host architecture. Build on a native x86_64 Linux host.
-
-### "cannot specify features for packages outside of workspace"
-
-Run `cargo build` from the `openhcl/openvmm_hcl` directory, not the repo root. The `--features` flag doesn't work with `-p` for packages in different workspace roots.
 
 ---
 

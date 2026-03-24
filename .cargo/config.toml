@@ -81,8 +81,9 @@ rustflags = [
   "-Ctarget-feature=+lse,+neon",
 ]
 
-# NOTE: When modifying this section, also update the ASAN rustflags override
-# in build_openvmm_hcl.rs, which replaces these flags for ASAN builds.
+# NOTE: When modifying this section or [target.'cfg(all())'], also update the
+# ASAN RUSTFLAGS in build_openvmm_hcl.rs which replaces all rustflags for ASAN
+# builds (Cargo has no mechanism to additively override rustflags).
 [target.'cfg(target_env = "musl")']
 rustflags = [
   # Use the musl from the sysroot, not from the Rust distribution.

@@ -115,6 +115,9 @@ impl SimpleFlowNode for Node {
         let mut recipe_details = base_recipe.recipe_details(release_cfg);
 
         if with_asan {
+            if recipe_details.target != CommonTriple::X86_64_LINUX_MUSL {
+                anyhow::bail!("--with-asan is currently only supported for x86_64 recipes");
+            }
             recipe_details
                 .openvmm_hcl_features
                 .insert(OpenvmmHclFeature::Sanitizer);

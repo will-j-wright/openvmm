@@ -516,11 +516,11 @@ fn openhcl_bin_path(
             },
         ),
         (MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::Asan) => (
-            "flowey-out/artifacts/build-igvm/debug/x64-asan",
-            "openhcl-x64-asan.bin",
+            "flowey-out/artifacts/build-igvm/debug/x64-custom",
+            "openhcl-x64-custom.bin",
             MissingCommand::XFlowey {
                 description: "OpenHCL ASAN IGVM file",
-                xflowey_args: &["build-igvm", "x64-asan"],
+                xflowey_args: &["build-igvm", "x64", "--with-asan"],
             },
         ),
         (MachineArch::Aarch64, OpenhclVersion::Latest, OpenhclFlavor::Standard) => (
