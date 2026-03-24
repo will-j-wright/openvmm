@@ -23,8 +23,7 @@ vpci = ["underhill_core/vpci"]
 dev_snp_ohcl_tio_support = ["underhill_core/dev_snp_ohcl_tio_support"]
 
 # Disable mimalloc and fast_memcpy so that ASAN's instrumented allocator and
-# memory interceptors are used instead. Use --no-default-features --features sanitizer
-# to build with ASAN.
+# memory interceptors are used instead.
 sanitizer = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
