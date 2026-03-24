@@ -92,68 +92,56 @@ async fn parse_guest_pci_devices(
             }
         }
         OsFlavor::Windows => {
-            devs = pnputil_parse_pci_devices(agent, &["/connected"]).await?;
-        }
-        _ => unreachable!(),
-    }
+            let sh = agent.windows_shell();
+            let output = cmd!(
+                sh,
+                "pnputil.exe /enum-devices /bus PCI /connected /properties"
+            )
+            .read()
+            .await?;
 
-    Ok(devs)
-}
-
-/// Run `pnputil.exe /enum-devices /bus PCI /properties` with additional
-/// filter flags and parse PCI device hardware IDs from the output.
-async fn pnputil_parse_pci_devices(
-    agent: &PipetteClient,
-    extra_args: &[&str],
-) -> anyhow::Result<Vec<ParsedPciDevice>> {
-    let sh = agent.windows_shell();
-    let extra = extra_args.join(" ");
-    let output = cmd!(sh, "pnputil.exe /enum-devices /bus PCI {extra} /properties")
-        .read()
-        .await?;
-
-    let mut devs = vec![];
-    let lines = output.as_str().lines();
-    let mut parsing_hwids = false;
-    for line in lines {
-        // Reset state when we hit a new DEVPKEY section, even if we were
-        // still looking for hardware IDs. This prevents getting stuck in
-        // parsing_hwids if the hardware ID lines don't match the expected
-        // PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ pattern.
-        if line.contains("DEVPKEY_Device_HardwareIds") {
-            parsing_hwids = true;
-            continue;
-        } else if line.contains("DEVPKEY") {
-            parsing_hwids = false;
-            continue;
-        }
-
-        if parsing_hwids {
-            // Find one matching PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ
-            let mut toks = line.trim().split('_');
-            if let (Some(tok0), Some(tok1), Some(tok2), Some(tok3)) =
-                (toks.next(), toks.next(), toks.next(), toks.next())
-            {
-                if tok0.ends_with("VEN")
-                    && tok1.ends_with("DEV")
-                    && tok2.ends_with("CC")
-                    && tok3.len() == 6
-                {
-                    if let (Ok(vendor_id), Ok(device_id), Ok(class_code)) = (
-                        u16::from_str_radix(&tok1[..4], 16),
-                        u16::from_str_radix(&tok2[..4], 16),
-                        u32::from_str_radix(&tok3[..6], 16),
-                    ) {
-                        devs.push(ParsedPciDevice {
-                            vendor_id,
-                            device_id,
-                            class_code,
-                        });
-                    }
+            let lines = output.as_str().lines();
+            let mut parsing_hwids = false;
+            for line in lines {
+                // Reset state when we hit a new DEVPKEY section, even if we
+                // were still looking for hardware IDs.
+                if line.contains("DEVPKEY_Device_HardwareIds") {
+                    parsing_hwids = true;
+                    continue;
+                } else if line.contains("DEVPKEY") {
                     parsing_hwids = false;
+                    continue;
+                }
+
+                if parsing_hwids {
+                    // Find one matching PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ
+                    let mut toks = line.trim().split('_');
+                    if let (Some(tok0), Some(tok1), Some(tok2), Some(tok3)) =
+                        (toks.next(), toks.next(), toks.next(), toks.next())
+                    {
+                        if tok0.ends_with("VEN")
+                            && tok1.ends_with("DEV")
+                            && tok2.ends_with("CC")
+                            && tok3.len() == 6
+                        {
+                            if let (Ok(vendor_id), Ok(device_id), Ok(class_code)) = (
+                                u16::from_str_radix(&tok1[..4], 16),
+                                u16::from_str_radix(&tok2[..4], 16),
+                                u32::from_str_radix(&tok3[..6], 16),
+                            ) {
+                                devs.push(ParsedPciDevice {
+                                    vendor_id,
+                                    device_id,
+                                    class_code,
+                                });
+                            }
+                            parsing_hwids = false;
+                        }
+                    }
                 }
             }
         }
+        _ => unreachable!(),
     }
 
     Ok(devs)
