@@ -330,13 +330,20 @@ async fn pcie_hotplug(
             assert!(removed, "expected endpoint to disappear after hot-remove");
         }
         OsFlavor::Windows => {
-            // TODO: Windows hot-remove is not working yet. The MSI
-            // fires correctly and pci.sys ISR reads the DLLSC status, but
-            // the device is never surprise-removed. Investigation
-            // shows that the hotplug state machine should handle
-            // this, but something prevents it from completing. Tracked as
-            // a follow-up to the initial hotplug implementation.
-            tracing::info!("skipping Windows removal verification (known issue)");
+            // Windows pci.sys needs time to process the surprise-removal
+            // through its hotplug state machine.
+            let mut removed = false;
+            for attempt in 0..30 {
+                let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
+                let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
+                if endpoints == 0 {
+                    tracing::info!(attempt, "device removed after hot-remove");
+                    removed = true;
+                    break;
+                }
+                timer.sleep(Duration::from_millis(500)).await;
+            }
+            assert!(removed, "expected endpoint to disappear after hot-remove");
         }
         _ => unreachable!(),
     }

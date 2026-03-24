@@ -2453,6 +2453,24 @@ enum InteractiveCommand {
         file: Option<PathBuf>,
     },
 
+    /// Hot-add a PCIe device to a named root port.
+    AddPcieDevice {
+        /// The root port name (e.g., "rp0").
+        port: String,
+        /// Create an NVMe controller with this many MSI-X vectors (default: 2).
+        #[clap(long, default_value_t = 2)]
+        msix: u16,
+        /// Maximum IO queues for the NVMe controller (default: 1).
+        #[clap(long, default_value_t = 1)]
+        max_io_queues: u16,
+    },
+
+    /// Hot-remove a PCIe device from a named root port.
+    RmPcieDevice {
+        /// The root port name (e.g., "rp0").
+        port: String,
+    },
+
     /// Inject an artificial panic into OpenVMM
     Panic,
 
@@ -3723,6 +3741,44 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
 
                 if let Err(err) = vm_rpc.call(VmRpc::WriteMemory, (gpa, data)).await? {
                     eprintln!("error: {err:?}");
+                }
+            }
+            InteractiveCommand::AddPcieDevice {
+                port,
+                msix,
+                max_io_queues,
+            } => {
+                let nvme_resource =
+                    Resource::new(nvme_resources::NvmeControllerHandle {
+                        subsystem_id: Guid::ZERO,
+                        msix_count: msix,
+                        max_io_queues,
+                        namespaces: vec![],
+                        requests: None,
+                    });
+                match vm_rpc
+                    .call_failable(VmRpc::AddPcieDevice, (port.clone(), nvme_resource))
+                    .await
+                {
+                    Ok(()) => {
+                        eprintln!("PCIe device added to port '{port}'");
+                    }
+                    Err(err) => {
+                        eprintln!("error: failed to add PCIe device: {err:#}");
+                    }
+                }
+            }
+            InteractiveCommand::RmPcieDevice { port } => {
+                match vm_rpc
+                    .call_failable(VmRpc::RemovePcieDevice, port.clone())
+                    .await
+                {
+                    Ok(()) => {
+                        eprintln!("PCIe device removed from port '{port}'");
+                    }
+                    Err(err) => {
+                        eprintln!("error: failed to remove PCIe device: {err:#}");
+                    }
                 }
             }
             InteractiveCommand::Kvp(command) => {
