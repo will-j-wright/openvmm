@@ -116,6 +116,18 @@ async fn pnputil_parse_pci_devices(
     let lines = output.as_str().lines();
     let mut parsing_hwids = false;
     for line in lines {
+        // Reset state when we hit a new DEVPKEY section, even if we were
+        // still looking for hardware IDs. This prevents getting stuck in
+        // parsing_hwids if the hardware ID lines don't match the expected
+        // PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ pattern.
+        if line.contains("DEVPKEY_Device_HardwareIds") {
+            parsing_hwids = true;
+            continue;
+        } else if line.contains("DEVPKEY") {
+            parsing_hwids = false;
+            continue;
+        }
+
         if parsing_hwids {
             // Find one matching PCI\VEN_XXXX&DEV_YYYY&CC_ZZZZZZ
             let mut toks = line.trim().split('_');
@@ -141,10 +153,6 @@ async fn pnputil_parse_pci_devices(
                     parsing_hwids = false;
                 }
             }
-        } else if line.contains("DEVPKEY_Device_HardwareIds") {
-            parsing_hwids = true;
-        } else if line.contains("DEVPKEY") {
-            parsing_hwids = false;
         }
     }
 
@@ -312,41 +320,21 @@ async fn pcie_hotplug(
     // Hot-remove the device
     vm.remove_pcie_device("rp0".into()).await?;
 
-    // Verify the device is gone.
-    match os_flavor {
-        OsFlavor::Linux => {
-            // On Linux, pciehp removes the device from sysfs promptly.
-            let mut removed = false;
-            for attempt in 0..30 {
-                let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
-                let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
-                if endpoints == 0 {
-                    tracing::info!(attempt, "device removed after hot-remove");
-                    removed = true;
-                    break;
-                }
-                timer.sleep(Duration::from_millis(500)).await;
-            }
-            assert!(removed, "expected endpoint to disappear after hot-remove");
+    // Verify the device is gone. Both Linux (pciehp) and Windows (pci.sys)
+    // process native PCIe hotplug surprise-removal through their respective
+    // hotplug state machines within a few seconds.
+    let mut removed = false;
+    for attempt in 0..30 {
+        let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
+        let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
+        if endpoints == 0 {
+            tracing::info!(attempt, "device removed after hot-remove");
+            removed = true;
+            break;
         }
-        OsFlavor::Windows => {
-            // Windows pci.sys needs time to process the surprise-removal
-            // through its hotplug state machine.
-            let mut removed = false;
-            for attempt in 0..30 {
-                let devices = parse_guest_pci_devices(os_flavor, &agent).await?;
-                let endpoints = devices.iter().filter(|d| d.class_code != 0x060400).count();
-                if endpoints == 0 {
-                    tracing::info!(attempt, "device removed after hot-remove");
-                    removed = true;
-                    break;
-                }
-                timer.sleep(Duration::from_millis(500)).await;
-            }
-            assert!(removed, "expected endpoint to disappear after hot-remove");
-        }
-        _ => unreachable!(),
+        timer.sleep(Duration::from_millis(500)).await;
     }
+    assert!(removed, "expected endpoint to disappear after hot-remove");
 
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;

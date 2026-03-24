@@ -3748,14 +3748,13 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                 msix,
                 max_io_queues,
             } => {
-                let nvme_resource =
-                    Resource::new(nvme_resources::NvmeControllerHandle {
-                        subsystem_id: Guid::ZERO,
-                        msix_count: msix,
-                        max_io_queues,
-                        namespaces: vec![],
-                        requests: None,
-                    });
+                let nvme_resource = Resource::new(nvme_resources::NvmeControllerHandle {
+                    subsystem_id: Guid::ZERO,
+                    msix_count: msix,
+                    max_io_queues,
+                    namespaces: vec![],
+                    requests: None,
+                });
                 match vm_rpc
                     .call_failable(VmRpc::AddPcieDevice, (port.clone(), nvme_resource))
                     .await
