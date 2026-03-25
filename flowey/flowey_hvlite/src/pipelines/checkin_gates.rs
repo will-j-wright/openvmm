@@ -11,10 +11,8 @@ use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use flowey_lib_common::git_checkout::RepoSource;
 use flowey_lib_hvlite::_jobs::build_and_publish_openhcl_igvm_from_recipe::OpenhclIgvmBuildParams;
-use flowey_lib_hvlite::build_openhcl_igvm_from_recipe::IgvmManifestPath;
 use flowey_lib_hvlite::build_openhcl_igvm_from_recipe::OpenhclIgvmRecipe;
 use flowey_lib_hvlite::build_openvmm_hcl::OpenvmmHclBuildProfile;
-use flowey_lib_hvlite::build_openvmm_hcl::OpenvmmHclFeature;
 use flowey_lib_hvlite::run_cargo_build::common::CommonArch;
 use flowey_lib_hvlite::run_cargo_build::common::CommonPlatform;
 use flowey_lib_hvlite::run_cargo_build::common::CommonProfile;
@@ -744,14 +742,7 @@ impl IntoPipeline for CheckinGatesCli {
                 CommonArch::X86_64 => {
                     // Build an ASAN variant of X64 alongside the standard recipes.
                     let mut asan_details = OpenhclIgvmRecipe::X64.recipe_details(release);
-                    asan_details
-                        .openvmm_hcl_features
-                        .insert(OpenvmmHclFeature::Sanitizer);
-                    asan_details.igvm_manifest =
-                        IgvmManifestPath::InTree("openhcl-x64-asan.json".into());
-                    asan_details
-                        .extra_rootfs_configs
-                        .push("rootfs.asan.config".into());
+                    asan_details.apply_asan_overrides();
 
                     vec![
                         OpenhclIgvmRecipe::X64,

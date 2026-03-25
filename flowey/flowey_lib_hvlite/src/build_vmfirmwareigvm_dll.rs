@@ -95,7 +95,6 @@ impl SimpleFlowNode for Node {
             .as_triple(),
             no_split_dbg_info: false,
             extra_env: Some(extra_env),
-            extra_cargo_config: vec![],
             pre_build_deps: Vec::new(),
             output: v,
         });

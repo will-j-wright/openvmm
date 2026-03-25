@@ -151,6 +151,9 @@ impl FlowNode for Node {
             }
 
             let is_sanitizer = features.contains(&OpenvmmHclFeature::Sanitizer);
+            if is_sanitizer && !matches!(arch, CommonArch::X86_64) {
+                anyhow::bail!("ASAN is currently only supported for x86_64");
+            }
 
             let mut features = features
                 .into_iter()
@@ -200,8 +203,6 @@ impl FlowNode for Node {
                 None
             };
 
-            let extra_cargo_config = vec![];
-
             let output = ctx.reqv(|v| crate::run_cargo_build::Request {
                 crate_name: "openvmm_hcl".into(),
                 out_name: "openvmm_hcl".into(),
@@ -219,7 +220,6 @@ impl FlowNode for Node {
                 target,
                 no_split_dbg_info,
                 extra_env,
-                extra_cargo_config,
                 pre_build_deps,
                 output: v,
             });

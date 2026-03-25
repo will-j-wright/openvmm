@@ -118,13 +118,7 @@ impl SimpleFlowNode for Node {
             if recipe_details.target != CommonTriple::X86_64_LINUX_MUSL {
                 anyhow::bail!("--with-asan is currently only supported for x86_64 recipes");
             }
-            recipe_details
-                .openvmm_hcl_features
-                .insert(OpenvmmHclFeature::Sanitizer);
-            recipe_details.igvm_manifest = IgvmManifestPath::InTree("openhcl-x64-asan.json".into());
-            recipe_details
-                .extra_rootfs_configs
-                .push("rootfs.asan.config".into());
+            recipe_details.apply_asan_overrides();
         }
 
         {

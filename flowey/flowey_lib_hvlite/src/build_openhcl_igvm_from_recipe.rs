@@ -71,6 +71,19 @@ pub struct OpenhclIgvmRecipeDetails {
     pub extra_rootfs_configs: Vec<String>,
 }
 
+impl OpenhclIgvmRecipeDetails {
+    /// Apply ASAN build overrides to this recipe.
+    ///
+    /// Adds the `Sanitizer` feature, switches to the ASAN manifest (2 GB
+    /// VTL2 memory), and includes `rootfs.asan.config` for musl shared libs.
+    pub fn apply_asan_overrides(&mut self) {
+        self.openvmm_hcl_features
+            .insert(OpenvmmHclFeature::Sanitizer);
+        self.igvm_manifest = IgvmManifestPath::InTree("openhcl-x64-asan.json".into());
+        self.extra_rootfs_configs.push("rootfs.asan.config".into());
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OpenhclIgvmRecipeDetailsLocalOnly {
     pub openvmm_hcl_no_strip: bool,

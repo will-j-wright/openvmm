@@ -284,8 +284,6 @@ flowey_request! {
         /// If supported by the target, build without split debuginfo.
         pub no_split_dbg_info: bool,
         pub extra_env: Option<ReadVar<BTreeMap<String, String>>>,
-        /// Extra `--config` arguments to pass to `cargo build`.
-        pub extra_cargo_config: Vec<String>,
         /// Wait for specified side-effects to resolve before running cargo-run.
         ///
         /// (e.g: to allow for some ambient packages / dependencies to get
@@ -326,7 +324,6 @@ impl FlowNode for Node {
             mut target,
             no_split_dbg_info,
             extra_env,
-            extra_cargo_config,
             pre_build_deps: user_pre_build_deps,
             output,
         } in requests
@@ -377,7 +374,6 @@ impl FlowNode for Node {
             };
 
             let mut config = Vec::new();
-            config.extend(extra_cargo_config);
 
             // If the target vendor is specified as `minimal_rt`, then this is
             // our custom target triple for the minimal_rt toolchain. Include the appropriate
