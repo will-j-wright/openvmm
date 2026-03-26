@@ -13,6 +13,7 @@ use flowey_lib_hvlite::build_openvmm_hcl::OpenvmmHclBuildProfile;
 use flowey_lib_hvlite::resolve_openhcl_kernel_package::OpenhclKernelPackageKind;
 use flowey_lib_hvlite::run_cargo_build::common::CommonArch;
 use flowey_lib_hvlite::run_cargo_build::common::CommonPlatform;
+use std::collections::BTreeSet;
 use flowey_lib_hvlite::run_cargo_build::common::CommonTriple;
 use target_lexicon::Triple;
 
@@ -117,6 +118,7 @@ impl IntoPipeline for BuildReproducibleCli {
                         profile: openvmm_hcl_profile,
                         recipe,
                         custom_target: Some(CommonTriple::Custom(openhcl_musl_target(recipe_arch))),
+                        extra_features: BTreeSet::new(),
                     })
                     .collect(),
                 artifact_dir_openhcl_igvm: ctx.publish_artifact(pub_openhcl_igvm),

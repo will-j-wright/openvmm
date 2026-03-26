@@ -4,6 +4,7 @@
 //! A local-only job that supports the `cargo xflowey build-igvm` CLI
 
 use flowey::node::prelude::*;
+use std::collections::BTreeSet;
 
 use crate::build_openhcl_boot::OpenhclBootOutput;
 use crate::build_openhcl_igvm_from_recipe::IgvmManifestPath;
@@ -233,6 +234,7 @@ impl SimpleFlowNode for Node {
             release_cfg,
             recipe: OpenhclIgvmRecipe::LocalOnlyCustom(recipe_details),
             custom_target: None,
+            extra_features: BTreeSet::new(),
             built_openvmm_hcl: write_built_openvmm_hcl,
             built_openhcl_boot: write_built_openhcl_boot,
             built_openhcl_igvm: write_built_openhcl_igvm,

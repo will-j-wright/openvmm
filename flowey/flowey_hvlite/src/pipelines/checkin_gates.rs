@@ -18,6 +18,7 @@ use flowey_lib_hvlite::run_cargo_build::common::CommonPlatform;
 use flowey_lib_hvlite::run_cargo_build::common::CommonProfile;
 use flowey_lib_hvlite::run_cargo_build::common::CommonTriple;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use target_lexicon::Triple;
 use vmm_test_images::KnownTestArtifacts;
@@ -793,6 +794,7 @@ impl IntoPipeline for CheckinGatesCli {
                                 custom_target: Some(CommonTriple::Custom(openhcl_musl_target(
                                     arch,
                                 ))),
+                                extra_features: BTreeSet::new(),
                             })
                             .collect(),
                         artifact_dir_openhcl_igvm: ctx.publish_artifact(pub_openhcl_igvm),
