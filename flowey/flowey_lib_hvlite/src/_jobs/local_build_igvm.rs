@@ -38,6 +38,7 @@ pub struct Customizations {
     pub override_openvmm_hcl_feature: Vec<String>,
     pub override_max_trace_level: Option<MaxTraceLevel>,
     pub with_debuginfo: bool,
+    pub with_mi_secure: bool,
     pub with_perf_tools: bool,
     pub with_sidecar: bool,
 }
@@ -93,6 +94,7 @@ impl SimpleFlowNode for Node {
             override_openvmm_hcl_feature,
             override_max_trace_level,
             with_debuginfo,
+            with_mi_secure,
             with_perf_tools,
             with_sidecar,
             custom_extra_rootfs,
@@ -175,6 +177,10 @@ impl SimpleFlowNode for Node {
                     .into_iter()
                     .map(OpenvmmHclFeature::LocalOnlyCustom)
                     .collect()
+            }
+
+            if with_mi_secure {
+                openvmm_hcl_features.insert(OpenvmmHclFeature::MiSecure);
             }
 
             if let Some(arch) = override_arch {
