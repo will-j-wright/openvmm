@@ -1059,6 +1059,19 @@ impl IntoPipeline for CheckinGatesCli {
             all_jobs.push(clippy_unit_test_job.finish());
         }
 
+        let standard_x64_test_artifacts = vec![
+            KnownTestArtifacts::Alpine323X64Vhd,
+            KnownTestArtifacts::FreeBsd13_2X64Vhd,
+            KnownTestArtifacts::FreeBsd13_2X64Iso,
+            KnownTestArtifacts::Gen1WindowsDataCenterCore2022X64Vhd,
+            KnownTestArtifacts::Gen2WindowsDataCenterCore2022X64Vhd,
+            KnownTestArtifacts::Gen2WindowsDataCenterCore2025X64Vhd,
+            KnownTestArtifacts::Ubuntu2404ServerX64Vhd,
+            KnownTestArtifacts::Ubuntu2504ServerX64Vhd,
+            KnownTestArtifacts::VmgsWithBootEntry,
+            KnownTestArtifacts::VmgsWith16kTpm,
+        ];
+
         // Emit a mi-secure build + test gate.
         //
         // This builds a single X64 OpenHCL recipe with mimalloc secure mode
@@ -1120,18 +1133,7 @@ impl IntoPipeline for CheckinGatesCli {
                 "test(openhcl) & !test(servicing) & !test(cvm) & !test(memory_validation) & !test(very_heavy) & !test(hyperv_openhcl_pcat)"
                     .to_string();
 
-            let mi_secure_test_artifacts = vec![
-                KnownTestArtifacts::Alpine323X64Vhd,
-                KnownTestArtifacts::FreeBsd13_2X64Vhd,
-                KnownTestArtifacts::FreeBsd13_2X64Iso,
-                KnownTestArtifacts::Gen1WindowsDataCenterCore2022X64Vhd,
-                KnownTestArtifacts::Gen2WindowsDataCenterCore2022X64Vhd,
-                KnownTestArtifacts::Gen2WindowsDataCenterCore2025X64Vhd,
-                KnownTestArtifacts::Ubuntu2404ServerX64Vhd,
-                KnownTestArtifacts::Ubuntu2504ServerX64Vhd,
-                KnownTestArtifacts::VmgsWithBootEntry,
-                KnownTestArtifacts::VmgsWith16kTpm,
-            ];
+            let mi_secure_test_artifacts = standard_x64_test_artifacts.clone();
 
             let mi_secure_test_label = "x64-windows-intel-mi-secure-vmm-tests".to_string();
             let pub_mi_secure_test_results = if matches!(backend_hint, PipelineBackendHint::Local) {
@@ -1262,19 +1264,6 @@ impl IntoPipeline for CheckinGatesCli {
             }
             filter
         };
-
-        let standard_x64_test_artifacts = vec![
-            KnownTestArtifacts::Alpine323X64Vhd,
-            KnownTestArtifacts::FreeBsd13_2X64Vhd,
-            KnownTestArtifacts::FreeBsd13_2X64Iso,
-            KnownTestArtifacts::Gen1WindowsDataCenterCore2022X64Vhd,
-            KnownTestArtifacts::Gen2WindowsDataCenterCore2022X64Vhd,
-            KnownTestArtifacts::Gen2WindowsDataCenterCore2025X64Vhd,
-            KnownTestArtifacts::Ubuntu2404ServerX64Vhd,
-            KnownTestArtifacts::Ubuntu2504ServerX64Vhd,
-            KnownTestArtifacts::VmgsWithBootEntry,
-            KnownTestArtifacts::VmgsWith16kTpm,
-        ];
 
         let cvm_filter = |isolation_type| {
             let mut filter = format!(
