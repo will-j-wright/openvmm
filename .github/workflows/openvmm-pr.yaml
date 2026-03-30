@@ -2392,7 +2392,7 @@ jobs:
       run: flowey e 17 flowey_lib_common::cache 7
       shell: bash
   job18:
-    name: build mi-secure OpenHCL [x64-linux]
+    name: build openhcl (mi-secure) [x64-linux]
     runs-on:
     - self-hosted
     - 1ES.Pool=OpenVMM-GitHub-Linux-Pool-WestUS3

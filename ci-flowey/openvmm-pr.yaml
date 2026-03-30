@@ -200,7 +200,7 @@ jobs:
     displayName: 🌼🥾 Publish bootstrapped flowey
     artifact: _internal-flowey-bootstrap-x86_64-linux-uid-1
 - job: job13
-  displayName: build mi-secure OpenHCL [x64-linux]
+  displayName: build openhcl (mi-secure) [x64-linux]
   pool: HvLite-CI-Linux-Pool-CentralUS
   dependsOn:
   - job0

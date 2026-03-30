@@ -1080,7 +1080,7 @@ impl IntoPipeline for CheckinGatesCli {
                 .new_job(
                     FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu),
                     FlowArch::X86_64,
-                    "build mi-secure OpenHCL [x64-linux]",
+                    "build openhcl (mi-secure) [x64-linux]",
                 )
                 .gh_set_pool(crate::pipelines_shared::gh_pools::linux_self_hosted_largedisk())
                 .ado_set_pool(crate::pipelines_shared::ado_pools::default_x86_pool(
