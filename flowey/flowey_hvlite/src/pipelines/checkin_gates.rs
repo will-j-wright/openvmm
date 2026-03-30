@@ -1074,8 +1074,8 @@ impl IntoPipeline for CheckinGatesCli {
 
         // Emit a mi-secure build + test gate.
         //
-        // This builds a single X64 OpenHCL recipe with mimalloc secure mode
-        // enabled, then runs a subset of basic OpenHCL tests against it.
+        // This builds the X64 OpenHCL recipes with mimalloc secure mode
+        // enabled, then runs a subset of basic OpenHCL tests against them.
         // Reuses the existing x64 pipette and tmk_vmm from the main build.
         {
             let mi_secure_profile = if release {
@@ -1083,6 +1083,8 @@ impl IntoPipeline for CheckinGatesCli {
             } else {
                 OpenvmmHclBuildProfile::Debug
             };
+
+            let mi_secure_extra_features: BTreeSet<_> = [OpenvmmHclFeature::MiSecure].into();
 
             let (pub_mi_secure_igvm, use_mi_secure_igvm) =
                 pipeline.new_artifact("x64-mi-secure-openhcl-igvm");
@@ -1101,14 +1103,21 @@ impl IntoPipeline for CheckinGatesCli {
                 ))
                 .dep_on(|ctx| {
                     flowey_lib_hvlite::_jobs::build_and_publish_openhcl_igvm_from_recipe::Params {
-                        igvm_files: vec![OpenhclIgvmBuildParams {
+                        igvm_files: [
+                            OpenhclIgvmRecipe::X64,
+                            OpenhclIgvmRecipe::X64TestLinuxDirect,
+                            OpenhclIgvmRecipe::X64Cvm,
+                        ]
+                        .into_iter()
+                        .map(|recipe| OpenhclIgvmBuildParams {
                             profile: mi_secure_profile,
-                            recipe: OpenhclIgvmRecipe::X64,
+                            recipe,
                             custom_target: Some(CommonTriple::Custom(openhcl_musl_target(
                                 CommonArch::X86_64,
                             ))),
-                            extra_features: [OpenvmmHclFeature::MiSecure].into(),
-                        }],
+                            extra_features: mi_secure_extra_features.clone(),
+                        })
+                        .collect(),
                         artifact_dir_openhcl_igvm: ctx.publish_artifact(pub_mi_secure_igvm),
                         artifact_dir_openhcl_igvm_extras: ctx
                             .publish_artifact(pub_mi_secure_igvm_extras),
