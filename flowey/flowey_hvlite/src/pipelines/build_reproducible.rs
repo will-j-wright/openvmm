@@ -13,8 +13,8 @@ use flowey_lib_hvlite::build_openvmm_hcl::OpenvmmHclBuildProfile;
 use flowey_lib_hvlite::resolve_openhcl_kernel_package::OpenhclKernelPackageKind;
 use flowey_lib_hvlite::run_cargo_build::common::CommonArch;
 use flowey_lib_hvlite::run_cargo_build::common::CommonPlatform;
-use std::collections::BTreeSet;
 use flowey_lib_hvlite::run_cargo_build::common::CommonTriple;
+use std::collections::BTreeSet;
 use target_lexicon::Triple;
 
 /// A list of pre-defined OpenHCL recipes that support being built reproducibly. Each recipe has a matching CI pipeline job that can be reproduced with this local CLI.
