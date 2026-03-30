@@ -1122,7 +1122,15 @@ impl IntoPipeline for CheckinGatesCli {
 
             let mi_secure_test_artifacts = vec![
                 KnownTestArtifacts::Alpine323X64Vhd,
+                KnownTestArtifacts::FreeBsd13_2X64Vhd,
+                KnownTestArtifacts::FreeBsd13_2X64Iso,
+                KnownTestArtifacts::Gen1WindowsDataCenterCore2022X64Vhd,
+                KnownTestArtifacts::Gen2WindowsDataCenterCore2022X64Vhd,
+                KnownTestArtifacts::Gen2WindowsDataCenterCore2025X64Vhd,
                 KnownTestArtifacts::Ubuntu2404ServerX64Vhd,
+                KnownTestArtifacts::Ubuntu2504ServerX64Vhd,
+                KnownTestArtifacts::VmgsWithBootEntry,
+                KnownTestArtifacts::VmgsWith16kTpm,
             ];
 
             let mi_secure_test_label = "x64-windows-intel-mi-secure-vmm-tests".to_string();
