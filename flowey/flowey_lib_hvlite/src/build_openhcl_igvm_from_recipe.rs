@@ -253,7 +253,6 @@ flowey_request! {
         pub recipe: OpenhclIgvmRecipe,
         pub custom_target: Option<CommonTriple>,
         /// Additional features to enable on top of the recipe's defaults.
-        #[serde(default)]
         pub extra_features: BTreeSet<OpenvmmHclFeature>,
 
         pub built_openvmm_hcl: WriteVar<crate::build_openvmm_hcl::OpenvmmHclOutput>,

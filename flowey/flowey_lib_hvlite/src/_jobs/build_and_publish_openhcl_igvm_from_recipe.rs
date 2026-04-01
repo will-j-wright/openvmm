@@ -24,7 +24,6 @@ pub struct OpenhclIgvmBuildParams {
     pub recipe: OpenhclIgvmRecipe,
     pub custom_target: Option<CommonTriple>,
     /// Additional features to enable on top of the recipe's defaults.
-    #[serde(default)]
     pub extra_features: BTreeSet<OpenvmmHclFeature>,
 }
 
