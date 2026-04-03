@@ -1798,10 +1798,24 @@ impl InitializedVm {
                 .region_info(vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX)
                 .context("failed to get VFIO config region info")?;
 
+            // Query VFIO region info for each BAR (indices 0-5).
+            let mut bar_info: [Option<(u64, u64)>; 6] = [None; 6];
+            for i in 0u32..6 {
+                match device.region_info(i) {
+                    Ok(info) if info.size > 0 => {
+                        bar_info[i as usize] = Some((info.offset, info.size));
+                    }
+                    _ => {}
+                }
+            }
+
             let device_file = device
                 .as_ref()
                 .try_clone()
                 .context("failed to clone VFIO device fd")?;
+
+            // Create MSI connection for interrupt delivery.
+            let msi_conn = pci_core::msi::MsiConnection::new();
 
             let assigned = assigned_device_vfio::VfioAssignedPciDevice::new(
                 assigned_device_vfio::VfioAssignedPciDeviceConfig {
@@ -1809,6 +1823,8 @@ impl InitializedVm {
                     device_file,
                     config_offset: config_info.offset,
                     config_size: config_info.size,
+                    msi_target: msi_conn.target().clone(),
+                    bar_info,
                 },
             )
             .with_context(|| format!("failed to create VFIO assigned device for {pci_id}"))?;
@@ -1818,6 +1834,11 @@ impl InitializedVm {
                 .arc_mutex_device(device_name)
                 .on_pcie_port(vmotherboard::BusId::new(&vfio_cfg.port_name))
                 .add(|_services| assigned)?;
+
+            // Connect MSI delivery to the partition's interrupt sink.
+            if let Some(signal_msi) = partition.clone().into_signal_msi(Vtl::Vtl0) {
+                msi_conn.connect(signal_msi);
+            }
 
             _vfio_handles.push((container, group, device));
         }
