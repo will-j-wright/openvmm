@@ -1754,11 +1754,7 @@ impl InitializedVm {
 
         // VFIO assigned devices (Linux only)
         #[cfg(target_os = "linux")]
-        let mut _vfio_handles: Vec<(
-            vfio_sys::Container,
-            vfio_sys::Group,
-            vfio_sys::Device,
-        )> = Vec::new();
+        let mut _vfio_handles: Vec<(vfio_sys::Container, vfio_sys::Group)> = Vec::new();
         #[cfg(target_os = "linux")]
         for vfio_cfg in cfg.vfio_devices {
             use std::path::Path;
@@ -1809,38 +1805,47 @@ impl InitializedVm {
                 }
             }
 
-            let device_file = device
-                .as_ref()
-                .try_clone()
-                .context("failed to clone VFIO device fd")?;
-
             // Create MSI connection for interrupt delivery.
             let msi_conn = pci_core::msi::MsiConnection::new();
-
-            let assigned = assigned_device_vfio::VfioAssignedPciDevice::new(
-                assigned_device_vfio::VfioAssignedPciDeviceConfig {
-                    pci_id: pci_id.clone(),
-                    device_file,
-                    config_offset: config_info.offset,
-                    config_size: config_info.size,
-                    msi_target: msi_conn.target().clone(),
-                    bar_info,
-                },
-            )
-            .with_context(|| format!("failed to create VFIO assigned device for {pci_id}"))?;
 
             let device_name = format!("vfio-assigned:{pci_id}");
             chipset_builder
                 .arc_mutex_device(device_name)
                 .on_pcie_port(vmotherboard::BusId::new(&vfio_cfg.port_name))
-                .add(|_services| assigned)?;
+                .try_add(|services| {
+                    use chipset_device::mmio::RegisterMmioIntercept;
+
+                    // Register MMIO regions for each BAR with the chipset.
+                    let mut register_mmio = services.register_mmio();
+                    let bar_mmio_controls: Vec<_> = bar_info
+                        .iter()
+                        .enumerate()
+                        .map(|(i, info)| {
+                            let size = info.map_or(0, |(_, size)| size);
+                            register_mmio.new_io_region(&format!("bar{i}"), size)
+                        })
+                        .collect();
+
+                    assigned_device_vfio::VfioAssignedPciDevice::new(
+                        assigned_device_vfio::VfioAssignedPciDeviceConfig {
+                            pci_id: pci_id.clone(),
+                            vfio_device: device,
+                            config_offset: config_info.offset,
+                            config_size: config_info.size,
+                            msi_target: msi_conn.target().clone(),
+                            bar_info,
+                            driver: driver_source.simple(),
+                            bar_mmio_controls,
+                        },
+                    )
+                })?;
 
             // Connect MSI delivery to the partition's interrupt sink.
             if let Some(signal_msi) = partition.clone().into_signal_msi(Vtl::Vtl0) {
                 msi_conn.connect(signal_msi);
             }
 
-            _vfio_handles.push((container, group, device));
+            _vfio_handles.push((container, group));
         }
 
         if let Some(vmbus_cfg) = cfg.vmbus {

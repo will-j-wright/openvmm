@@ -22,13 +22,14 @@ use pci_core::capabilities::PciCapability;
 use pci_core::capabilities::msix::MsixEmulator;
 use pci_core::msi::MsiTarget;
 use pci_core::spec::cfg_space;
-use std::fs::File;
 use std::os::unix::fs::FileExt;
 use vmcore::device_state::ChangeDeviceState;
+use vmcore::interrupt::EventProxy;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
 use vmcore::save_restore::SaveRestore;
 use vmcore::save_restore::SavedStateNotSupported;
+use vmcore::vm_task::VmTaskDriver;
 
 /// MSI-X capability ID per PCI spec.
 const PCI_CAP_ID_MSIX: u8 = 0x11;
@@ -52,6 +53,8 @@ struct MsixInfo {
     capability: Box<dyn PciCapability>,
     /// Offset of the MSI-X capability in PCI config space.
     cap_offset: u16,
+    /// Number of MSI-X vectors.
+    vector_count: u16,
     /// BAR index containing the MSI-X table.
     table_bar: u8,
     /// Byte offset of the MSI-X table within its BAR.
@@ -64,6 +67,19 @@ struct MsixInfo {
     pba_offset: u32,
     /// Total size of the PBA in bytes.
     pba_size: u64,
+    /// Whether MSI-X is currently enabled by the guest.
+    enabled: bool,
+    /// Active event proxies bridging VFIO eventfds to MsixEmulator interrupts.
+    /// Kept alive so the async proxy tasks continue running. Cleared on
+    /// MSI-X disable.
+    ///
+    // TODO: replace event_or_proxy workaround with direct MsixEmulator
+    // eventfd support once that extension lands (needed for virtio perf too).
+    _event_proxies: Vec<EventProxy>,
+    /// Original eventfd Event objects passed to VFIO map_msix. Must be kept
+    /// alive — VFIO holds a kernel reference to the eventfd context, but
+    /// closing the fd could cause issues if VFIO re-processes MSI-X state.
+    _events: Vec<pal_event::Event>,
 }
 
 /// A PCI device backed by a VFIO device file.
@@ -79,9 +95,13 @@ pub struct VfioAssignedPciDevice {
     #[inspect(display)]
     pci_id: String,
 
-    /// The VFIO device file descriptor, used for config space and BAR MMIO.
+    /// The VFIO device, used for config space, BAR MMIO, and MSI-X mapping.
     #[inspect(skip)]
-    device_file: File,
+    vfio_device: vfio_sys::Device,
+
+    /// Async driver for spawning event proxy tasks.
+    #[inspect(skip)]
+    driver: VmTaskDriver,
 
     /// Offset into the VFIO device fd where the PCI config region starts.
     #[inspect(hex)]
@@ -110,6 +130,12 @@ pub struct VfioAssignedPciDevice {
     #[inspect(skip)]
     active_bars: BarMappings,
 
+    /// Chipset MMIO region controls per BAR — used to register/unregister
+    /// the device's BAR address ranges with the chipset so MMIO accesses
+    /// are routed to this device.
+    #[inspect(skip)]
+    bar_mmio_controls: Vec<Box<dyn chipset_device::mmio::ControlMmioIntercept>>,
+
     /// VFIO region info per BAR for MMIO proxying via pread/pwrite.
     #[inspect(skip)]
     bar_regions: [Option<BarRegion>; 6],
@@ -123,8 +149,8 @@ pub struct VfioAssignedPciDevice {
 pub struct VfioAssignedPciDeviceConfig {
     /// PCI BDF string (e.g., "3f7a:00:00.0").
     pub pci_id: String,
-    /// The opened VFIO device file (from `vfio_sys::Group::open_device`).
-    pub device_file: File,
+    /// The opened VFIO device (from `vfio_sys::Group::open_device`).
+    pub vfio_device: vfio_sys::Device,
     /// Config region info from `vfio_sys::Device::region_info(CONFIG_REGION_INDEX)`.
     pub config_offset: u64,
     /// Config region size.
@@ -134,6 +160,11 @@ pub struct VfioAssignedPciDeviceConfig {
     /// VFIO region info per BAR: `(offset_in_fd, size)`. `None` if the BAR
     /// region does not exist or has zero size.
     pub bar_info: [Option<(u64, u64)>; 6],
+    /// Async driver for spawning event proxy tasks.
+    pub driver: VmTaskDriver,
+    /// Chipset MMIO region controls per BAR (created via
+    /// `services.register_mmio().new_io_region()`).
+    pub bar_mmio_controls: Vec<Box<dyn chipset_device::mmio::ControlMmioIntercept>>,
 }
 
 impl VfioAssignedPciDevice {
@@ -143,9 +174,10 @@ impl VfioAssignedPciDevice {
     /// and reading back the result (standard PCI BAR sizing). Discovers MSI-X
     /// capability if present and creates a software emulator for it.
     pub fn new(config: VfioAssignedPciDeviceConfig) -> anyhow::Result<Self> {
-        let device_file = config.device_file;
+        let vfio_device = config.vfio_device;
         let config_offset = config.config_offset;
         let config_size = config.config_size;
+        let device_file = vfio_device.as_ref();
 
         // Read original BAR values and probe masks.
         let mut bar_masks = [0u32; 6];
@@ -157,15 +189,15 @@ impl VfioAssignedPciDevice {
             let offset = 0x10 + (i as u16) * 4;
 
             // Save original value.
-            let original = read_config_u32(&device_file, config_offset, config_size, offset)?;
+            let original = read_config_u32(device_file, config_offset, config_size, offset)?;
             bars[i] = original;
 
             // Write all-ones to probe the mask.
-            write_config_u32(&device_file, config_offset, config_size, offset, !0)?;
-            let mask = read_config_u32(&device_file, config_offset, config_size, offset)?;
+            write_config_u32(device_file, config_offset, config_size, offset, !0)?;
+            let mask = read_config_u32(device_file, config_offset, config_size, offset)?;
 
             // Restore original value.
-            write_config_u32(&device_file, config_offset, config_size, offset, original)?;
+            write_config_u32(device_file, config_offset, config_size, offset, original)?;
 
             bar_masks[i] = mask;
             bar_flags[i] = original & 0xf;
@@ -175,14 +207,14 @@ impl VfioAssignedPciDevice {
                 if i + 1 < 6 {
                     let upper_offset = 0x10 + ((i + 1) as u16) * 4;
                     let upper_original =
-                        read_config_u32(&device_file, config_offset, config_size, upper_offset)?;
+                        read_config_u32(device_file, config_offset, config_size, upper_offset)?;
                     bars[i + 1] = upper_original;
 
-                    write_config_u32(&device_file, config_offset, config_size, upper_offset, !0)?;
+                    write_config_u32(device_file, config_offset, config_size, upper_offset, !0)?;
                     let upper_mask =
-                        read_config_u32(&device_file, config_offset, config_size, upper_offset)?;
+                        read_config_u32(device_file, config_offset, config_size, upper_offset)?;
                     write_config_u32(
-                        &device_file,
+                        device_file,
                         config_offset,
                         config_size,
                         upper_offset,
@@ -207,7 +239,7 @@ impl VfioAssignedPciDevice {
         });
 
         // Discover MSI-X capability from physical device config space.
-        let msix = discover_msix(&device_file, config_offset, config_size, &config.msi_target);
+        let msix = discover_msix(device_file, config_offset, config_size, &config.msi_target);
 
         tracing::info!(
             pci_id = config.pci_id.as_str(),
@@ -218,7 +250,8 @@ impl VfioAssignedPciDevice {
 
         Ok(Self {
             pci_id: config.pci_id,
-            device_file,
+            vfio_device,
+            driver: config.driver,
             config_offset,
             config_size,
             bar_masks,
@@ -226,6 +259,7 @@ impl VfioAssignedPciDevice {
             bar_flags,
             mmio_enabled: false,
             active_bars: BarMappings::default(),
+            bar_mmio_controls: config.bar_mmio_controls,
             bar_regions,
             msix,
         })
@@ -233,7 +267,7 @@ impl VfioAssignedPciDevice {
 
     fn read_phys_config(&self, offset: u16) -> u32 {
         read_config_u32(
-            &self.device_file,
+            self.vfio_device.as_ref(),
             self.config_offset,
             self.config_size,
             offset,
@@ -243,7 +277,7 @@ impl VfioAssignedPciDevice {
 
     fn write_phys_config(&self, offset: u16, value: u32) {
         if let Err(e) = write_config_u32(
-            &self.device_file,
+            self.vfio_device.as_ref(),
             self.config_offset,
             self.config_size,
             offset,
@@ -285,10 +319,92 @@ impl VfioAssignedPciDevice {
 
         None
     }
+
+    /// Set up VFIO MSI-X eventfd mapping when the guest enables MSI-X.
+    ///
+    /// For each vector, obtains an event (eventfd) from the MsixEmulator's
+    /// interrupt via `event_or_proxy`, then hands all events to VFIO via
+    /// `map_msix`. When hardware fires an interrupt, VFIO signals the eventfd,
+    /// the proxy task calls `Interrupt::deliver()`, which flows through
+    /// `MsiInterrupt` → `MsiTarget` → `SignalMsi` → guest MSI injection.
+    //
+    // TODO: replace event_or_proxy workaround with direct MsixEmulator eventfd
+    // support once that extension lands (needed for virtio perf too).
+    fn msix_enable(&mut self) {
+        let msix = self.msix.as_mut().unwrap();
+        let count = msix.vector_count;
+        let mut events = Vec::with_capacity(count as usize);
+        let mut proxies = Vec::new();
+
+        for i in 0..count {
+            let Some(interrupt) = msix.emulator.interrupt(i) else {
+                tracing::warn!(vector = i, "MSI-X vector out of range");
+                return;
+            };
+            match interrupt.event_or_proxy(&self.driver) {
+                Ok((event, proxy)) => {
+                    events.push(event);
+                    if let Some(p) = proxy {
+                        proxies.push(p);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        vector = i,
+                        error = format!("{e:#}").as_str(),
+                        "failed to create event for MSI-X vector"
+                    );
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = self.vfio_device.map_msix(0, &events) {
+            tracing::error!(
+                error = format!("{e:#}").as_str(),
+                pci_id = self.pci_id.as_str(),
+                "VFIO map_msix failed"
+            );
+            return;
+        }
+
+        self.msix.as_mut().unwrap()._event_proxies = proxies;
+        // Keep original eventfds alive — VFIO holds kernel references to them.
+        self.msix.as_mut().unwrap()._events = events;
+
+        let msix = self.msix.as_ref().unwrap();
+        let count = msix.vector_count;
+        tracing::info!(
+            count,
+            pci_id = self.pci_id.as_str(),
+            "MSI-X enabled: mapped {count} vectors to VFIO eventfds"
+        );
+    }
+
+    /// Tear down VFIO MSI-X eventfd mapping when the guest disables MSI-X.
+    fn msix_disable(&mut self) {
+        let msix = self.msix.as_mut().unwrap();
+        let count = msix.vector_count;
+
+        if let Err(e) = self.vfio_device.unmap_msix(0, count as u32) {
+            tracing::warn!(
+                error = format!("{e:#}").as_str(),
+                pci_id = self.pci_id.as_str(),
+                "VFIO unmap_msix failed"
+            );
+        }
+
+        msix._event_proxies.clear();
+        msix._events.clear();
+        tracing::info!(
+            pci_id = self.pci_id.as_str(),
+            "MSI-X disabled: unmapped vectors"
+        );
+    }
 }
 
 fn read_config_u32(
-    file: &File,
+    file: &std::fs::File,
     config_offset: u64,
     config_size: u64,
     offset: u16,
@@ -302,7 +418,7 @@ fn read_config_u32(
 }
 
 fn write_config_u32(
-    file: &File,
+    file: &std::fs::File,
     config_offset: u64,
     config_size: u64,
     offset: u16,
@@ -318,7 +434,7 @@ fn write_config_u32(
 /// Walk the PCI capabilities list to find an MSI-X capability. If found,
 /// create an [`MsixEmulator`] and return the discovery info.
 fn discover_msix(
-    device_file: &File,
+    device_file: &std::fs::File,
     config_offset: u64,
     config_size: u64,
     msi_target: &MsiTarget,
@@ -369,12 +485,16 @@ fn discover_msix(
                 emulator,
                 capability: Box::new(msix_cap),
                 cap_offset: cap_ptr,
+                vector_count: table_count,
                 table_bar: table_bir,
                 table_offset,
                 table_size,
                 pba_bar: pba_bir,
                 pba_offset,
                 pba_size,
+                enabled: false,
+                _event_proxies: Vec::new(),
+                _events: Vec::new(),
             });
         }
 
@@ -475,8 +595,21 @@ impl PciConfigSpace for VfioAssignedPciDevice {
 
                 if new_mmio_enabled && !self.mmio_enabled {
                     self.active_bars = BarMappings::parse(&self.bars, &self.bar_masks);
+                    // Register BAR address ranges with the chipset so MMIO
+                    // accesses are routed to this device.
+                    for mapping in self.active_bars.iter() {
+                        if let Some(control) =
+                            self.bar_mmio_controls.get_mut(mapping.index as usize)
+                        {
+                            control.map(mapping.base_address);
+                        }
+                    }
                     tracing::debug!(pci_id = self.pci_id.as_str(), "MMIO enabled by guest");
                 } else if !new_mmio_enabled && self.mmio_enabled {
+                    // Unregister BAR address ranges.
+                    for control in &mut self.bar_mmio_controls {
+                        control.unmap();
+                    }
                     self.active_bars = BarMappings::default();
                     tracing::debug!(pci_id = self.pci_id.as_str(), "MMIO disabled by guest");
                 }
@@ -492,10 +625,28 @@ impl PciConfigSpace for VfioAssignedPciDevice {
             // All other registers: pass through to physical device.
             _ => {
                 // Intercept MSI-X capability writes to track enable/disable
-                // state in the software emulator.
+                // state in the software emulator. Do NOT forward the MSI-X
+                // control register to hardware via write_phys_config — VFIO
+                // manages the hardware MSI-X enable bit internally via
+                // VFIO_DEVICE_SET_IRQS. Writing it again through config space
+                // causes VFIO to tear down and re-setup MSI-X, losing the
+                // eventfd associations.
                 if let Some(msix) = &mut self.msix {
                     if offset == msix.cap_offset {
+                        let new_enabled = value & 0x8000_0000 != 0;
+                        let was_enabled = msix.enabled;
+
+                        // Forward to MsixCapability to update emulator state.
                         msix.capability.write_u32(0, value);
+                        msix.enabled = new_enabled;
+
+                        if new_enabled && !was_enabled {
+                            self.msix_enable();
+                        } else if was_enabled && !new_enabled {
+                            self.msix_disable();
+                        }
+                        // Skip write_phys_config for MSI-X control register.
+                        return IoResult::Ok;
                     }
                 }
                 self.write_phys_config(offset, value);
@@ -519,7 +670,8 @@ impl MmioIntercept for VfioAssignedPciDevice {
             if let Some(region) = &self.bar_regions[bar as usize] {
                 if offset + data.len() as u64 <= region.size {
                     if self
-                        .device_file
+                        .vfio_device
+                        .as_ref()
                         .read_at(data, region.vfio_offset + offset)
                         .is_ok()
                     {
@@ -543,14 +695,19 @@ impl MmioIntercept for VfioAssignedPciDevice {
         if let Some((bar, offset)) = self.active_bars.find(addr) {
             // Check if this access falls in the MSI-X table or PBA.
             if let Some(emu_offset) = self.msix_emulator_offset(bar, offset) {
-                write_msix_emulator(&mut self.msix.as_mut().unwrap().emulator, emu_offset, data);
+                let msix = self.msix.as_mut().unwrap();
+                write_msix_emulator(&mut msix.emulator, emu_offset, data);
                 return IoResult::Ok;
             }
 
             // Proxy to physical device BAR via pwrite.
             if let Some(region) = &self.bar_regions[bar as usize] {
                 if offset + data.len() as u64 <= region.size {
-                    if let Err(e) = self.device_file.write_at(data, region.vfio_offset + offset) {
+                    if let Err(e) = self
+                        .vfio_device
+                        .as_ref()
+                        .write_at(data, region.vfio_offset + offset)
+                    {
                         tracelimit::warn_ratelimited!(
                             bar,
                             offset,
