@@ -284,6 +284,7 @@ storage_string = { path = "vm/devices/storage/storage_string" }
 tdisp = { path = "vm/devices/tdisp" }
 tdisp_proto = { path = "vm/devices/tdisp_proto" }
 vmswitch = { path = "vm/devices/net/vmswitch" }
+assigned_device_vfio = { path = "vm/devices/pci/assigned_device_vfio" }
 pci_bus = { path = "vm/devices/pci/pci_bus" }
 pci_core = { path = "vm/devices/pci/pci_core" }
 pci_resources = { path = "vm/devices/pci/pci_resources" }

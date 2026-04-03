@@ -170,6 +170,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "assigned_device_vfio"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chipset_device",
+ "inspect",
+ "pci_core",
+ "tracelimit",
+ "tracing",
+ "vmcore",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5200,6 +5213,7 @@ dependencies = [
  "aarch64defs",
  "acpi",
  "anyhow",
+ "assigned_device_vfio",
  "async-trait",
  "build_rs_guest_arch",
  "cache_topology",
@@ -5260,6 +5274,8 @@ dependencies = [
  "tracing",
  "uefi_nvram_storage",
  "uefi_specs",
+ "vfio-bindings",
+ "vfio_sys",
  "virt",
  "virt_whp",
  "virtio",
