@@ -27,6 +27,8 @@ pub struct Config {
     pub pcie_root_complexes: Vec<PcieRootComplexConfig>,
     pub pcie_devices: Vec<PcieDeviceConfig>,
     pub pcie_switches: Vec<PcieSwitchConfig>,
+    #[cfg(target_os = "linux")]
+    pub vfio_devices: Vec<VfioDeviceConfig>,
     pub vpci_devices: Vec<VpciDeviceConfig>,
     pub memory: MemoryConfig,
     pub processor_topology: ProcessorTopologyConfig,
@@ -231,6 +233,15 @@ pub struct PcieSwitchConfig {
 pub struct PcieDeviceConfig {
     pub port_name: String,
     pub resource: Resource<PciDeviceHandleKind>,
+}
+
+/// Configuration for a VFIO-assigned PCI device (Linux only).
+#[derive(Debug, MeshPayload)]
+pub struct VfioDeviceConfig {
+    /// PCIe port name to attach the device to.
+    pub port_name: String,
+    /// PCI BDF address on the host (e.g., "3f7a:00:00.0").
+    pub pci_id: String,
 }
 
 #[derive(Debug, MeshPayload)]

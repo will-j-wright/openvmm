@@ -169,6 +169,8 @@ impl Manifest {
             pcie_root_complexes: config.pcie_root_complexes,
             pcie_devices: config.pcie_devices,
             pcie_switches: config.pcie_switches,
+            #[cfg(target_os = "linux")]
+            vfio_devices: config.vfio_devices,
             vpci_devices: config.vpci_devices,
             hypervisor: config.hypervisor,
             memory: config.memory,
@@ -216,6 +218,8 @@ pub struct Manifest {
     pcie_root_complexes: Vec<PcieRootComplexConfig>,
     pcie_devices: Vec<PcieDeviceConfig>,
     pcie_switches: Vec<PcieSwitchConfig>,
+    #[cfg(target_os = "linux")]
+    vfio_devices: Vec<openvmm_defs::config::VfioDeviceConfig>,
     vpci_devices: Vec<VpciDeviceConfig>,
     memory: MemoryConfig,
     processor_topology: ProcessorTopologyConfig,
@@ -1748,6 +1752,76 @@ impl InitializedVm {
             .await?;
         }
 
+        // VFIO assigned devices (Linux only)
+        #[cfg(target_os = "linux")]
+        let mut _vfio_handles: Vec<(
+            vfio_sys::Container,
+            vfio_sys::Group,
+            vfio_sys::Device,
+        )> = Vec::new();
+        #[cfg(target_os = "linux")]
+        for vfio_cfg in cfg.vfio_devices {
+            use std::path::Path;
+
+            let pci_id = &vfio_cfg.pci_id;
+            let sysfs_path = Path::new("/sys/bus/pci/devices").join(pci_id);
+
+            tracing::info!(
+                pci_id,
+                port = vfio_cfg.port_name.as_str(),
+                "opening VFIO device"
+            );
+
+            let container = vfio_sys::Container::new().context("failed to open VFIO container")?;
+            let group_id = vfio_sys::Group::find_group_for_device(&sysfs_path)
+                .with_context(|| format!("failed to find IOMMU group for {pci_id}"))?;
+            let group = vfio_sys::Group::open(group_id)
+                .or_else(|_| vfio_sys::Group::open_noiommu(group_id))
+                .with_context(|| format!("failed to open VFIO group {group_id}"))?;
+            group
+                .set_container(&container)
+                .context("failed to set VFIO container")?;
+            // Try real IOMMU first (Type1v2), fall back to no-IOMMU mode.
+            if container.set_iommu(vfio_sys::IommuType::Type1v2).is_err() {
+                container
+                    .set_iommu(vfio_sys::IommuType::NoIommu)
+                    .context("failed to set VFIO IOMMU type (tried Type1v2 and NoIommu)")?;
+            }
+
+            let driver = driver_source.simple();
+            let device = group
+                .open_device(pci_id, &driver)
+                .await
+                .with_context(|| format!("failed to open VFIO device {pci_id}"))?;
+
+            let config_info = device
+                .region_info(vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX)
+                .context("failed to get VFIO config region info")?;
+
+            let device_file = device
+                .as_ref()
+                .try_clone()
+                .context("failed to clone VFIO device fd")?;
+
+            let assigned = assigned_device_vfio::VfioAssignedPciDevice::new(
+                assigned_device_vfio::VfioAssignedPciDeviceConfig {
+                    pci_id: pci_id.clone(),
+                    device_file,
+                    config_offset: config_info.offset,
+                    config_size: config_info.size,
+                },
+            )
+            .with_context(|| format!("failed to create VFIO assigned device for {pci_id}"))?;
+
+            let device_name = format!("vfio-assigned:{pci_id}");
+            chipset_builder
+                .arc_mutex_device(device_name)
+                .on_pcie_port(vmotherboard::BusId::new(&vfio_cfg.port_name))
+                .add(|_services| assigned)?;
+
+            _vfio_handles.push((container, group, device));
+        }
+
         if let Some(vmbus_cfg) = cfg.vmbus {
             if !cfg.hypervisor.with_hv {
                 anyhow::bail!("vmbus required hypervisor enlightements");
@@ -2978,6 +3052,8 @@ impl LoadedVm {
             pcie_root_complexes: vec![], // TODO
             pcie_devices: vec![],        // TODO
             pcie_switches: vec![],       // TODO
+            #[cfg(target_os = "linux")]
+            vfio_devices: vec![], // TODO
             vpci_devices: vec![],        // TODO
             memory: self.inner.memory_cfg,
             processor_topology: self.inner.processor_topology.to_config(),

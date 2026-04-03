@@ -112,6 +112,7 @@ impl Container {
 
 #[repr(u32)]
 pub enum IommuType {
+    Type1v2 = vfio_bindings::bindings::vfio::VFIO_TYPE1v2_IOMMU,
     NoIommu = vfio_bindings::bindings::vfio::VFIO_NOIOMMU_IOMMU,
 }
 

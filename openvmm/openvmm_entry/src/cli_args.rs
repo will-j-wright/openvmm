@@ -811,6 +811,25 @@ Options:
 "#)]
     #[clap(long, conflicts_with("pcat"))]
     pub pcie_remote: Vec<PcieRemoteCli>,
+
+    /// Assign a host PCI device to the guest via VFIO (Linux only)
+    #[clap(long_help = r#"
+Assign a host PCI device to the guest via Linux VFIO.
+
+The device must be bound to vfio-pci on the host before starting the VM.
+
+Examples:
+    # Assign NVMe controller to root port rp0
+    --vfio rp0:3f7a:00:00.0
+
+Syntax: <port_name>:<pci_bdf>
+
+    port_name    Root port or downstream switch port name
+    pci_bdf      PCI bus:device.function of the VFIO device on the host
+"#)]
+    #[cfg(target_os = "linux")]
+    #[clap(long, conflicts_with("pcat"))]
+    pub vfio: Vec<VfioDeviceCli>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1939,6 +1958,41 @@ impl FromStr for PcieRemoteCli {
             socket_addr,
             hu,
             controller,
+        })
+    }
+}
+
+/// CLI configuration for a VFIO-assigned PCI device.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct VfioDeviceCli {
+    /// Name of the PCIe downstream port to attach to.
+    pub port_name: String,
+    /// PCI BDF address of the device on the host (e.g., "3f7a:00:00.0").
+    pub pci_id: String,
+}
+
+#[cfg(target_os = "linux")]
+impl FromStr for VfioDeviceCli {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (port_name, pci_id) = s
+            .split_once(':')
+            .context("expected <port_name>:<pci_bdf> (e.g., rp0:3f7a:00:00.0)")?;
+
+        if port_name.is_empty() {
+            anyhow::bail!("port name cannot be empty");
+        }
+
+        // Re-join the rest as the PCI BDF (which itself contains colons).
+        if pci_id.is_empty() {
+            anyhow::bail!("PCI BDF cannot be empty");
+        }
+
+        Ok(VfioDeviceCli {
+            port_name: port_name.to_string(),
+            pci_id: pci_id.to_string(),
         })
     }
 }

@@ -768,6 +768,16 @@ async fn vm_config_from_command_line(
 
     let pcie_switches = build_switch_list(&opt.pcie_switch);
 
+    #[cfg(target_os = "linux")]
+    let vfio_devices: Vec<openvmm_defs::config::VfioDeviceConfig> = opt
+        .vfio
+        .iter()
+        .map(|cli_cfg| openvmm_defs::config::VfioDeviceConfig {
+            port_name: cli_cfg.port_name.clone(),
+            pci_id: cli_cfg.pci_id.clone(),
+        })
+        .collect();
+
     #[cfg(windows)]
     let vpci_resources: Vec<_> = opt
         .device
@@ -1517,6 +1527,8 @@ async fn vm_config_from_command_line(
         pcie_root_complexes,
         pcie_devices,
         pcie_switches,
+        #[cfg(target_os = "linux")]
+        vfio_devices,
         vpci_devices,
         ide_disks: Vec::new(),
         memory: MemoryConfig {
