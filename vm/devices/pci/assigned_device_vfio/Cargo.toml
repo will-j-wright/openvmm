@@ -11,6 +11,7 @@ chipset_device.workspace = true
 inspect.workspace = true
 pal_event.workspace = true
 pci_core.workspace = true
+virt.workspace = true
 vmcore.workspace = true
 
 anyhow.workspace = true

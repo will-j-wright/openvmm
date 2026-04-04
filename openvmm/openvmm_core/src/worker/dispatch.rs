@@ -1808,6 +1808,12 @@ impl InitializedVm {
             // Create MSI connection for interrupt delivery.
             let msi_conn = pci_core::msi::MsiConnection::new();
 
+            // Get irqfd interface from partition for direct interrupt injection.
+            let irqfd = partition
+                .clone()
+                .irqfd()
+                .context("partition does not support irqfd (required for VFIO)")?;
+
             let device_name = format!("vfio-assigned:{pci_id}");
             chipset_builder
                 .arc_mutex_device(device_name)
@@ -1834,7 +1840,7 @@ impl InitializedVm {
                             config_size: config_info.size,
                             msi_target: msi_conn.target().clone(),
                             bar_info,
-                            driver: driver_source.simple(),
+                            irqfd: irqfd.clone(),
                             bar_mmio_controls,
                         },
                     )

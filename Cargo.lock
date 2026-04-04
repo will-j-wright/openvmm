@@ -176,9 +176,12 @@ dependencies = [
  "anyhow",
  "chipset_device",
  "inspect",
+ "pal_event",
  "pci_core",
  "tracelimit",
  "tracing",
+ "vfio_sys",
+ "virt",
  "vmcore",
 ]
 

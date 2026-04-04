@@ -401,10 +401,16 @@ impl MsixEmulator {
         state.vectors[index as usize].state.is_pending = false;
     }
 
-    #[cfg(test)]
-    fn set_pending_bit(&self, index: u8) {
+    /// Sets the pending bit for the given vector index.
+    ///
+    /// Used by device passthrough (e.g., VFIO with irqfd) to record that an
+    /// interrupt arrived while the vector was masked, so PBA reads return
+    /// the correct pending state.
+    pub fn set_pending_bit(&self, index: u16) {
         let mut state = self.state.lock();
-        state.vectors[index as usize].state.is_pending = true;
+        if let Some(entry) = state.vectors.get_mut(index as usize) {
+            entry.state.is_pending = true;
+        }
     }
 }
 
