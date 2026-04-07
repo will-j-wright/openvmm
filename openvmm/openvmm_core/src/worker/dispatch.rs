@@ -1832,8 +1832,8 @@ impl InitializedVm {
                         })
                         .collect();
 
-                    assigned_device_vfio::VfioAssignedPciDevice::new(
-                        assigned_device_vfio::VfioAssignedPciDeviceConfig {
+                    vfio_assigned_device::VfioAssignedPciDevice::new(
+                        vfio_assigned_device::VfioAssignedPciDeviceConfig {
                             pci_id: pci_id.clone(),
                             vfio_device: device,
                             config_offset: config_info.offset,
@@ -1847,7 +1847,7 @@ impl InitializedVm {
                 })?;
 
             // Connect MSI delivery to the partition's interrupt sink.
-            if let Some(signal_msi) = partition.clone().into_signal_msi(Vtl::Vtl0) {
+            if let Some(signal_msi) = partition.clone().as_signal_msi(Vtl::Vtl0) {
                 msi_conn.connect(signal_msi);
             }
 

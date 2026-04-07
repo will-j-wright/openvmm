@@ -217,7 +217,7 @@ where
     }
 
     fn irqfd(self: Arc<Self>) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
-        Partition::irqfd(&self)
+        Partition::irqfd(&*self)
     }
 
     fn supports_virtual_devices(&self) -> bool {

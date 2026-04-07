@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 
 [package]
-name = "assigned_device_vfio"
+name = "vfio_assigned_device"
 edition.workspace = true
 rust-version.workspace = true
 
