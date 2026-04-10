@@ -1754,7 +1754,7 @@ impl InitializedVm {
 
         // VFIO assigned devices (Linux only)
         #[cfg(target_os = "linux")]
-        let mut _vfio_handles: Vec<(vfio_sys::Container, vfio_sys::Group)> = Vec::new();
+        let mut vfio_lifetime_handles: Vec<(vfio_sys::Container, vfio_sys::Group)> = Vec::new();
         #[cfg(target_os = "linux")]
         for vfio_cfg in cfg.vfio_devices {
             use std::path::Path;
@@ -1772,17 +1772,13 @@ impl InitializedVm {
             let group_id = vfio_sys::Group::find_group_for_device(&sysfs_path)
                 .with_context(|| format!("failed to find IOMMU group for {pci_id}"))?;
             let group = vfio_sys::Group::open(group_id)
-                .or_else(|_| vfio_sys::Group::open_noiommu(group_id))
                 .with_context(|| format!("failed to open VFIO group {group_id}"))?;
             group
                 .set_container(&container)
                 .context("failed to set VFIO container")?;
-            // Try real IOMMU first (Type1v2), fall back to no-IOMMU mode.
-            if container.set_iommu(vfio_sys::IommuType::Type1v2).is_err() {
-                container
-                    .set_iommu(vfio_sys::IommuType::NoIommu)
-                    .context("failed to set VFIO IOMMU type (tried Type1v2 and NoIommu)")?;
-            }
+            container
+                .set_iommu(vfio_sys::IommuType::Type1v2)
+                .context("failed to set VFIO IOMMU type to Type1v2 (IOMMU required)")?;
 
             let driver = driver_source.simple();
             let device = group
@@ -1797,11 +1793,10 @@ impl InitializedVm {
             // Query VFIO region info for each BAR (indices 0-5).
             let mut bar_info: [Option<(u64, u64)>; 6] = [None; 6];
             for i in 0u32..6 {
-                match device.region_info(i) {
-                    Ok(info) if info.size > 0 => {
+                if let Ok(info) = device.region_info(i) {
+                    if info.size > 0 {
                         bar_info[i as usize] = Some((info.offset, info.size));
                     }
-                    _ => {}
                 }
             }
 
@@ -1847,11 +1842,13 @@ impl InitializedVm {
                 })?;
 
             // Connect MSI delivery to the partition's interrupt sink.
-            if let Some(signal_msi) = partition.clone().as_signal_msi(Vtl::Vtl0) {
-                msi_conn.connect(signal_msi);
-            }
+            let signal_msi = partition
+                .clone()
+                .as_signal_msi(Vtl::Vtl0)
+                .context("partition must support MSI signaling for VFIO")?;
+            msi_conn.connect(signal_msi);
 
-            _vfio_handles.push((container, group));
+            vfio_lifetime_handles.push((container, group));
         }
 
         if let Some(vmbus_cfg) = cfg.vmbus {
