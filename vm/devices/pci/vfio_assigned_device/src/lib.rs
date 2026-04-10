@@ -12,6 +12,7 @@
 #![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 
+use anyhow::Context as _;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::MmioIntercept;
@@ -35,9 +36,13 @@ use vmcore::save_restore::SavedStateNotSupported;
 /// MSI-X table entry size in bytes.
 const MSIX_ENTRY_SIZE: u64 = 16;
 /// Offset of the vector control field within an MSI-X table entry.
+/// Matches `pci_core::spec::caps::msix::MsixTableEntryIdx::VECTOR_CTL`.
 const MSIX_ENTRY_CONTROL_OFFSET: u64 = 12;
 /// Vector mask bit in the MSI-X table entry control field.
 const MSIX_VECTOR_MASK_BIT: u32 = 1;
+/// MSI-X Enable bit in the MSI-X Message Control register (bit 15,
+/// shifted into the dword position at config offset cap+0).
+const MSIX_ENABLE_BIT: u32 = 0x8000_0000;
 
 /// PCI config space offsets as plain constants for use in match patterns.
 const CFG_BAR0: u16 = 0x10;
@@ -47,11 +52,11 @@ const CFG_CAP_PTR: u16 = 0x34;
 
 /// VFIO BAR region information (offset and size within the device fd).
 #[derive(Debug, Clone, Copy)]
-struct VfioBarMapping {
+pub struct VfioBarInfo {
     /// Offset within the VFIO device fd where this BAR region starts.
-    vfio_offset: u64,
+    pub vfio_offset: u64,
     /// Size of the BAR region in bytes.
-    size: u64,
+    pub size: u64,
 }
 
 /// MSI-X emulation state, discovered from the physical device's capabilities.
@@ -96,7 +101,7 @@ struct MsixEmulationState {
 /// proxied to the physical device via pread/pwrite on the VFIO device fd.
 #[derive(InspectMut)]
 pub struct VfioAssignedPciDevice {
-    /// The PCI BDF string (e.g., "0000:3f7a:00:00.0") for diagnostics.
+    /// The PCI address string (e.g., "3f7a:00:00.0") for diagnostics.
     #[inspect(display)]
     pci_id: String,
 
@@ -143,11 +148,20 @@ pub struct VfioAssignedPciDevice {
 
     /// VFIO region info per BAR for MMIO proxying via pread/pwrite.
     #[inspect(skip)]
-    bar_regions: [Option<VfioBarMapping>; 6],
+    bar_regions: [Option<VfioBarInfo>; 6],
 
     /// MSI-X emulation state (None if device has no MSI-X capability).
     #[inspect(skip)]
     msix: Option<MsixEmulationState>,
+
+    /// VFIO container and group handles. These must be kept alive for the
+    /// lifetime of the device — dropping them would close the VFIO fds and
+    /// tear down IOMMU mappings. Declared after `vfio_device` so they are
+    /// dropped after the device fd.
+    #[inspect(skip)]
+    _vfio_container: vfio_sys::Container,
+    #[inspect(skip)]
+    _vfio_group: vfio_sys::Group,
 }
 
 /// Parameters for creating a [`VfioAssignedPciDevice`].
@@ -163,14 +177,18 @@ pub struct VfioAssignedPciDeviceConfig {
     /// MSI target for the MsixEmulator (used to track table entries; interrupt
     /// delivery bypasses this path via irqfd).
     pub msi_target: MsiTarget,
-    /// VFIO region info per BAR: `(offset_in_fd, size)`. `None` if the BAR
-    /// region does not exist or has zero size.
-    pub bar_info: [Option<(u64, u64)>; 6],
+    /// VFIO region info per BAR. `None` if the BAR region does not exist or
+    /// has zero size.
+    pub bar_info: [Option<VfioBarInfo>; 6],
     /// irqfd routing interface for registering eventfds with the hypervisor.
     pub irqfd: Arc<dyn IrqFd>,
     /// Chipset MMIO region controls per BAR (created via
     /// `services.register_mmio().new_io_region()`).
     pub bar_mmio_controls: Vec<Box<dyn chipset_device::mmio::ControlMmioIntercept>>,
+    /// VFIO container handle (must outlive the device).
+    pub vfio_container: vfio_sys::Container,
+    /// VFIO group handle (must outlive the device).
+    pub vfio_group: vfio_sys::Group,
 }
 
 impl VfioAssignedPciDevice {
@@ -236,13 +254,7 @@ impl VfioAssignedPciDevice {
             }
         }
 
-        // Convert bar_info to VfioBarMapping array.
-        let bar_regions = config.bar_info.map(|info| {
-            info.map(|(offset, size)| VfioBarMapping {
-                vfio_offset: offset,
-                size,
-            })
-        });
+        let bar_regions = config.bar_info;
 
         // Discover MSI-X capability from physical device config space.
         let msix = discover_msix(device_file, config_offset, config_size, &config.msi_target);
@@ -268,6 +280,8 @@ impl VfioAssignedPciDevice {
             bar_mmio_controls: config.bar_mmio_controls,
             bar_regions,
             msix,
+            _vfio_container: config.vfio_container,
+            _vfio_group: config.vfio_group,
         })
     }
 
@@ -291,7 +305,7 @@ impl VfioAssignedPciDevice {
         ) {
             tracelimit::warn_ratelimited!(
                 offset,
-                error = format!("{e:#}").as_str(),
+                error = ?e,
                 "VFIO config space write failed"
             );
         }
@@ -332,46 +346,39 @@ impl VfioAssignedPciDevice {
     /// the hypervisor, and hands all eventfds to VFIO via `map_msix`. When the
     /// physical device fires an interrupt, VFIO signals the eventfd, the kernel
     /// looks up the GSI routing, and injects the MSI directly into the guest.
-    fn msix_enable(&mut self) {
+    fn msix_enable(&mut self) -> anyhow::Result<()> {
         let msix = self.msix.as_mut().expect("msix must be present");
         let count = msix.vector_count;
         let mut routes = Vec::with_capacity(count as usize);
 
         for i in 0..count {
-            match self.irqfd.new_irqfd_route() {
-                Ok(route) => {
-                    routes.push(route);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        vector = i,
-                        error = format!("{e:#}").as_str(),
-                        "failed to create irqfd route for MSI-X vector"
-                    );
-                    return;
-                }
-            }
+            let route = self.irqfd.new_irqfd_route().with_context(|| {
+                format!("failed to create irqfd route for MSI-X vector {i}")
+            })?;
+            routes.push(route);
         }
 
-        // Collect event references from routes for VFIO map_msix.
-        let events: Vec<&pal_event::Event> = routes.iter().map(|r| r.event()).collect();
-        if let Err(e) = self.vfio_device.map_msix(0, &events) {
-            tracing::error!(
-                error = format!("{e:#}").as_str(),
-                pci_id = self.pci_id.as_str(),
-                "VFIO map_msix failed"
-            );
-            return;
-        }
-
+        // Save routes before map_msix so they are cleaned up on failure
+        // (Drop will unregister irqfds and free GSIs).
         let msix = self.msix.as_mut().expect("msix must be present");
         msix.irqfd_routes = routes;
+
+        // Collect event references from routes for VFIO map_msix.
+        let events: Vec<&pal_event::Event> =
+            msix.irqfd_routes.iter().map(|r| r.event()).collect();
+        if let Err(e) = self.vfio_device.map_msix(0, &events) {
+            // Clean up routes on failure.
+            let msix = self.msix.as_mut().expect("msix must be present");
+            msix.irqfd_routes.clear();
+            return Err(e).context("VFIO map_msix failed");
+        }
 
         tracing::info!(
             count,
             pci_id = self.pci_id.as_str(),
             "MSI-X enabled: mapped vectors to irqfd routes"
         );
+        Ok(())
     }
 
     /// Tear down VFIO MSI-X eventfd mapping when the guest disables MSI-X.
@@ -381,7 +388,7 @@ impl VfioAssignedPciDevice {
 
         if let Err(e) = self.vfio_device.unmap_msix(0, count as u32) {
             tracing::warn!(
-                error = format!("{e:#}").as_str(),
+                error = ?e,
                 pci_id = self.pci_id.as_str(),
                 "VFIO unmap_msix failed"
             );
@@ -433,7 +440,7 @@ impl VfioAssignedPciDevice {
             if let Err(e) = route.mask() {
                 tracelimit::warn_ratelimited!(
                     vector,
-                    error = format!("{e:#}").as_str(),
+                    error = ?e,
                     "failed to mask irqfd route"
                 );
             }
@@ -442,28 +449,28 @@ impl VfioAssignedPciDevice {
             if let Err(e) = route.clear_msi() {
                 tracelimit::warn_ratelimited!(
                     vector,
-                    error = format!("{e:#}").as_str(),
+                    error = ?e,
                     "failed to clear irqfd route"
                 );
             }
         } else {
-            // Vector is unmasked with valid addr/data. Consume any pending
-            // interrupt from the eventfd (accumulated while masked) and record
-            // it in the PBA. Then re-enable the irqfd route so future
-            // interrupts are injected directly by the kernel.
-            if route.consume_pending() {
-                msix.emulator.set_pending_bit(vector as u16);
-            }
-
+            // Vector is unmasked with valid addr/data. Configure the irqfd
+            // route first so new interrupts are handled immediately, then
+            // drain any pending interrupt from the eventfd (accumulated while
+            // masked) and record it in the PBA.
             let address = addr_lo as u64 | ((addr_hi as u64) << 32);
             if let Err(e) = route.set_msi(address, data) {
                 tracelimit::warn_ratelimited!(
                     vector,
                     address,
                     data,
-                    error = format!("{e:#}").as_str(),
+                    error = ?e,
                     "failed to update irqfd route"
                 );
+            }
+
+            if route.consume_pending() {
+                msix.emulator.set_pending_bit(vector as u16);
             }
         }
     }
@@ -710,19 +717,28 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                 // eventfd associations.
                 if let Some(msix) = &mut self.msix {
                     if offset == msix.cap_offset {
-                        // Bit 31 of the first dword is MSI-X Enable (Message
-                        // Control bit 15, shifted into dword position).
-                        let new_enabled = value & 0x8000_0000 != 0;
+                        let new_enabled = value & MSIX_ENABLE_BIT != 0;
                         let was_enabled = msix.enabled;
 
                         // Forward to MsixCapability to update emulator state.
                         msix.capability.write_u32(0, value);
-                        msix.enabled = new_enabled;
 
                         if new_enabled && !was_enabled {
-                            self.msix_enable();
+                            match self.msix_enable() {
+                                Ok(()) => {
+                                    self.msix.as_mut().unwrap().enabled = true;
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = ?e,
+                                        pci_id = self.pci_id.as_str(),
+                                        "failed to enable MSI-X"
+                                    );
+                                }
+                            }
                         } else if was_enabled && !new_enabled {
                             self.msix_disable();
+                            self.msix.as_mut().unwrap().enabled = false;
                         }
                         // Skip write_phys_config for MSI-X control register.
                         return IoResult::Ok;
@@ -780,8 +796,13 @@ impl MmioIntercept for VfioAssignedPciDevice {
             if let Some(emu_offset) = self.msix_emulator_offset(bar, offset) {
                 let msix = self.msix.as_mut().expect("msix must be present");
                 write_msix_emulator(&mut msix.emulator, emu_offset, data);
-                // Update irqfd routing if this write affected a table entry.
-                self.update_irqfd_routing(emu_offset);
+                // Update irqfd routing for all table entries affected by this
+                // write. A single write may span multiple 16-byte entries.
+                let first_vector = emu_offset / MSIX_ENTRY_SIZE;
+                let last_vector = (emu_offset + data.len().saturating_sub(1) as u64) / MSIX_ENTRY_SIZE;
+                for v in first_vector..=last_vector {
+                    self.update_irqfd_routing(v * MSIX_ENTRY_SIZE);
+                }
                 return IoResult::Ok;
             }
 
@@ -796,7 +817,7 @@ impl MmioIntercept for VfioAssignedPciDevice {
                         tracelimit::warn_ratelimited!(
                             bar,
                             offset,
-                            error = format!("{e:#}").as_str(),
+                            error = ?e,
                             pci_id = self.pci_id.as_str(),
                             "VFIO BAR write failed"
                         );

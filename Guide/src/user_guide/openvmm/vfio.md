@@ -5,7 +5,7 @@ This page explains how to assign a physical PCI device to an OpenVMM guest using
 VFIO device assignment lets a guest VM directly access a physical PCI device (such as an NVMe controller or GPU). The guest sees the real device in its PCI bus and can interact with its config space.
 
 ```admonish warning
-VFIO device assignment is experimental. PCI config space, BAR MMIO passthrough, and MSI-X interrupts (via irqfd) are functional. DMA (IOMMU mapping of guest memory) is not yet implemented — devices that require DMA will not work correctly.
+VFIO device assignment is experimental. PCI config space, BAR MMIO passthrough, MSI-X interrupts (via irqfd), and DMA are functional. Devices such as NVMe controllers work end-to-end.
 ```
 
 ## Overview
@@ -16,7 +16,7 @@ OpenVMM running on a Linux host can assign physical PCI devices to guest VMs usi
 Linux Host
 └── OpenVMM
     └── Guest VM
-        └── sees physical PCI device via ECAM
+        └── sees physical PCI device on its PCI bus
 ```
 
 ## Prerequisites
@@ -154,9 +154,6 @@ Run OpenVMM with `sudo`, or add your user to the `vfio` group and set appropriat
 
 ## Current Limitations
 
-- **No DMA** — IOMMU mapping of guest memory is not yet implemented. Devices
-  that issue DMA (most NVMe, network, GPU, etc.) will not work correctly.
-  PCI config space, BAR MMIO passthrough, and MSI-X interrupts (via irqfd)
-  are functional.
 - **No save/restore** — VMs with VFIO devices cannot be saved or migrated.
+- **No hot-plug** — VFIO devices must be specified at VM creation time and cannot be added or removed while the VM is running.
 - **Linux only** — the `--vfio` flag is only available when OpenVMM is built and run on Linux. On Windows, use `--device` with WHP for device assignment.

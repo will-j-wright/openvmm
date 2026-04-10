@@ -236,6 +236,7 @@ pub struct PcieDeviceConfig {
 }
 
 /// Configuration for a VFIO-assigned PCI device (Linux only).
+#[cfg(target_os = "linux")]
 #[derive(Debug, MeshPayload)]
 pub struct VfioDeviceConfig {
     /// PCIe port name to attach the device to.
