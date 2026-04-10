@@ -608,11 +608,6 @@ struct LoadedVmInner {
         vmotherboard::DynamicDeviceUnit,
         Arc<closeable_mutex::CloseableMutex<chipset_device_resources::ErasedChipsetDevice>>,
     )>,
-    /// VFIO container and group handles for assigned PCI devices (Linux only).
-    /// Must remain alive for the entire VM lifetime to keep VFIO group/IOMMU
-    /// context open and accessible to the device fds.
-    #[cfg(target_os = "linux")]
-    _vfio_lifetime_handles: Vec<(vfio_sys::Container, vfio_sys::Group)>,
 }
 
 fn convert_vtl2_config(
@@ -1759,8 +1754,6 @@ impl InitializedVm {
 
         // VFIO assigned devices (Linux only)
         #[cfg(target_os = "linux")]
-        let mut vfio_lifetime_handles: Vec<(vfio_sys::Container, vfio_sys::Group)> = Vec::new();
-        #[cfg(target_os = "linux")]
         for vfio_cfg in cfg.vfio_devices {
             use std::path::Path;
 
@@ -1785,6 +1778,33 @@ impl InitializedVm {
                 .set_iommu(vfio_sys::IommuType::Type1v2)
                 .context("failed to set VFIO IOMMU type to Type1v2 (IOMMU required)")?;
 
+            // Map guest RAM into the IOMMU for device DMA access. Each
+            // RAM range is identity-mapped (IOVA == GPA) so that device
+            // DMA addresses match guest physical addresses.
+            let (base_va, va_size) = gm
+                .full_mapping()
+                .context("VFIO DMA mapping requires linearly mapped guest memory")?;
+            for ram_range in mem_layout.ram() {
+                let gpa_start = ram_range.range.start();
+                let size = ram_range.range.len();
+                anyhow::ensure!(
+                    gpa_start + size <= va_size as u64,
+                    "RAM range {:#x}..{:#x} exceeds guest memory mapping size {:#x}",
+                    gpa_start,
+                    gpa_start + size,
+                    va_size
+                );
+                let vaddr = base_va as u64 + gpa_start;
+                container.map_dma(gpa_start, vaddr, size).with_context(|| {
+                    format!(
+                        "failed to map DMA for RAM range {:#x}..{:#x}",
+                        gpa_start,
+                        gpa_start + size
+                    )
+                })?;
+                tracing::debug!(gpa_start, size, vaddr, "mapped guest RAM for VFIO DMA");
+            }
+
             let driver = driver_source.simple();
             let device = group
                 .open_device(pci_id, &driver)
@@ -1796,11 +1816,14 @@ impl InitializedVm {
                 .context("failed to get VFIO config region info")?;
 
             // Query VFIO region info for each BAR (indices 0-5).
-            let mut bar_info: [Option<(u64, u64)>; 6] = [None; 6];
+            let mut bar_info: [Option<vfio_assigned_device::VfioBarInfo>; 6] = [None; 6];
             for i in 0u32..6 {
                 if let Ok(info) = device.region_info(i) {
                     if info.size > 0 {
-                        bar_info[i as usize] = Some((info.offset, info.size));
+                        bar_info[i as usize] = Some(vfio_assigned_device::VfioBarInfo {
+                            vfio_offset: info.offset,
+                            size: info.size,
+                        });
                     }
                 }
             }
@@ -1810,7 +1833,6 @@ impl InitializedVm {
 
             // Get irqfd interface from partition for direct interrupt injection.
             let irqfd = partition
-                .clone()
                 .irqfd()
                 .context("partition does not support irqfd (required for VFIO)")?;
 
@@ -1827,7 +1849,7 @@ impl InitializedVm {
                         .iter()
                         .enumerate()
                         .map(|(i, info)| {
-                            let size = info.map_or(0, |(_, size)| size);
+                            let size = info.map_or(0, |bi| bi.size);
                             register_mmio.new_io_region(&format!("bar{i}"), size)
                         })
                         .collect();
@@ -1842,18 +1864,17 @@ impl InitializedVm {
                             bar_info,
                             irqfd: irqfd.clone(),
                             bar_mmio_controls,
+                            vfio_container: container,
+                            vfio_group: group,
                         },
                     )
                 })?;
 
             // Connect MSI delivery to the partition's interrupt sink.
             let signal_msi = partition
-                .clone()
                 .as_signal_msi(Vtl::Vtl0)
                 .context("partition must support MSI signaling for VFIO")?;
             msi_conn.connect(signal_msi);
-
-            vfio_lifetime_handles.push((container, group));
         }
 
         if let Some(vmbus_cfg) = cfg.vmbus {
@@ -2341,8 +2362,6 @@ impl InitializedVm {
                 pcie_host_bridges,
                 pcie_root_complexes,
                 pcie_hotplug_devices: Vec::new(),
-                #[cfg(target_os = "linux")]
-                _vfio_lifetime_handles: vfio_lifetime_handles,
             },
         };
 

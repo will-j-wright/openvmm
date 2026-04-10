@@ -1985,9 +1985,13 @@ impl FromStr for VfioDeviceCli {
             anyhow::bail!("port name cannot be empty");
         }
 
-        // Re-join the rest as the PCI BDF (which itself contains colons).
         if pci_id.is_empty() {
-            anyhow::bail!("PCI BDF cannot be empty");
+            anyhow::bail!("PCI address cannot be empty");
+        }
+
+        // Reject path separators to prevent sysfs path traversal via Path::join.
+        if pci_id.contains('/') || pci_id.contains("..") {
+            anyhow::bail!("PCI address must not contain path separators");
         }
 
         Ok(VfioDeviceCli {

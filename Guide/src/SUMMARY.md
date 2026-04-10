@@ -119,7 +119,6 @@
       - [VGA]()
     - [PCIe]()
       - [Overview](./reference/emulated/pcie/overview.md)
-  - [Direct Assigned](./user_guide/openvmm/vfio.md)
 - [Device Backends]()
   - [Serial]()
   - [Graphics and Input]()
