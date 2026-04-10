@@ -110,6 +110,10 @@ impl Container {
     }
 }
 
+/// IOMMU type for VFIO container.
+///
+/// Only Type1v2 and NoIommu are supported. Type1 (v1) is a legacy interface
+/// that does not support fine-grained DMA mapping and is intentionally excluded.
 #[repr(u32)]
 pub enum IommuType {
     Type1v2 = vfio_bindings::bindings::vfio::VFIO_TYPE1v2_IOMMU,
@@ -399,10 +403,12 @@ impl Device {
         I: IntoIterator,
         I::Item: AsFd,
     {
+        const MAX_MSIX_VECTORS: usize = 256;
+
         #[repr(C)]
         struct VfioIrqSetWithArray {
             header: vfio_irq_set,
-            fd: [i32; 256],
+            fd: [i32; MAX_MSIX_VECTORS],
         }
         let mut param = VfioIrqSetWithArray {
             header: vfio_irq_set {
@@ -414,13 +420,23 @@ impl Device {
                 // data is a zero-sized array, the real data is fd.
                 data: Default::default(),
             },
-            fd: [-1; 256],
+            fd: [-1; MAX_MSIX_VECTORS],
         };
 
+        let mut count = 0u32;
         for (x, y) in eventfd.into_iter().zip(&mut param.fd) {
             *y = x.as_fd().as_raw_fd();
-            param.header.count += 1;
+            count += 1;
         }
+        param.header.count = count;
+
+        // The fixed-size fd array limits us to MAX_MSIX_VECTORS vectors per
+        // ioctl call. The zip above silently stops at the array bound, so
+        // verify we didn't truncate.
+        anyhow::ensure!(
+            (count as usize) <= MAX_MSIX_VECTORS,
+            "MSI-X vector count {count} exceeds maximum {MAX_MSIX_VECTORS}"
+        );
 
         if param.header.count == 0 {
             param.header.flags |= VFIO_IRQ_SET_DATA_NONE;
