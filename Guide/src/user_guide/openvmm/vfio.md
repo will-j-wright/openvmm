@@ -154,6 +154,9 @@ Run OpenVMM with `sudo`, or add your user to the `vfio` group and set appropriat
 
 ## Current Limitations
 
-- **Config space only** — the guest can enumerate the device and read/write PCI config space, but MMIO BAR access, MSI-X interrupts, and DMA are not yet implemented.
+- **No DMA** — IOMMU mapping of guest memory is not yet implemented. Devices
+  that issue DMA (most NVMe, network, GPU, etc.) will not work correctly.
+  PCI config space, BAR MMIO passthrough, and MSI-X interrupts (via irqfd)
+  are functional.
 - **No save/restore** — VMs with VFIO devices cannot be saved or migrated.
 - **Linux only** — the `--vfio` flag is only available when OpenVMM is built and run on Linux. On Windows, use `--device` with WHP for device assignment.
