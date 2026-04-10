@@ -423,20 +423,19 @@ impl Device {
             fd: [-1; MAX_MSIX_VECTORS],
         };
 
+        let fds: Vec<_> = eventfd.into_iter().collect();
+        anyhow::ensure!(
+            fds.len() <= MAX_MSIX_VECTORS,
+            "MSI-X vector count {} exceeds maximum {MAX_MSIX_VECTORS}",
+            fds.len()
+        );
+
         let mut count = 0u32;
-        for (x, y) in eventfd.into_iter().zip(&mut param.fd) {
+        for (x, y) in fds.iter().zip(&mut param.fd) {
             *y = x.as_fd().as_raw_fd();
             count += 1;
         }
         param.header.count = count;
-
-        // The fixed-size fd array limits us to MAX_MSIX_VECTORS vectors per
-        // ioctl call. The zip above silently stops at the array bound, so
-        // verify we didn't truncate.
-        anyhow::ensure!(
-            (count as usize) <= MAX_MSIX_VECTORS,
-            "MSI-X vector count {count} exceeds maximum {MAX_MSIX_VECTORS}"
-        );
 
         if param.header.count == 0 {
             param.header.flags |= VFIO_IRQ_SET_DATA_NONE;

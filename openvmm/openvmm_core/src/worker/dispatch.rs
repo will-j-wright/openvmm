@@ -608,6 +608,11 @@ struct LoadedVmInner {
         vmotherboard::DynamicDeviceUnit,
         Arc<closeable_mutex::CloseableMutex<chipset_device_resources::ErasedChipsetDevice>>,
     )>,
+    /// VFIO container and group handles for assigned PCI devices (Linux only).
+    /// Must remain alive for the entire VM lifetime to keep VFIO group/IOMMU
+    /// context open and accessible to the device fds.
+    #[cfg(target_os = "linux")]
+    _vfio_lifetime_handles: Vec<(vfio_sys::Container, vfio_sys::Group)>,
 }
 
 fn convert_vtl2_config(
@@ -2345,6 +2350,8 @@ impl InitializedVm {
                 pcie_host_bridges,
                 pcie_root_complexes,
                 pcie_hotplug_devices: Vec::new(),
+                #[cfg(target_os = "linux")]
+                _vfio_lifetime_handles: vfio_lifetime_handles,
             },
         };
 
