@@ -5260,9 +5260,6 @@ dependencies = [
  "tracing",
  "uefi_nvram_storage",
  "uefi_specs",
- "vfio-bindings",
- "vfio_assigned_device",
- "vfio_sys",
  "virt",
  "virt_whp",
  "virtio",
@@ -5385,6 +5382,7 @@ dependencies = [
  "uidevices_resources",
  "unicycle",
  "unix_socket",
+ "vfio_assigned_device_resources",
  "video_core",
  "virt_whp",
  "virtio",
@@ -5532,6 +5530,7 @@ dependencies = [
  "storvsp",
  "tpm_device",
  "uidevices",
+ "vfio_assigned_device",
  "vhost_user_frontend",
  "virtio",
  "virtio_blk",
@@ -5831,7 +5830,9 @@ dependencies = [
  "chipset_device_resources",
  "guestmem",
  "pci_core",
+ "virt",
  "vm_resource",
+ "vm_topology",
  "vmcore",
 ]
 
@@ -8710,15 +8711,28 @@ name = "vfio_assigned_device"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chipset_device",
  "inspect",
  "pal_event",
  "pci_core",
+ "pci_resources",
  "tracelimit",
  "tracing",
+ "vfio-bindings",
+ "vfio_assigned_device_resources",
  "vfio_sys",
  "virt",
+ "vm_resource",
  "vmcore",
+]
+
+[[package]]
+name = "vfio_assigned_device_resources"
+version = "0.0.0"
+dependencies = [
+ "mesh",
+ "vm_resource",
 ]
 
 [[package]]

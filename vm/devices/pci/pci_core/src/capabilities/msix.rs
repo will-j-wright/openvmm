@@ -701,17 +701,17 @@ mod tests {
     }
 
     impl MockMsixRoute {
-        fn new(
-            calls: Arc<Mutex<Vec<RouteCall>>>,
-            pending: Arc<Mutex<bool>>,
-        ) -> Self {
+        fn new(calls: Arc<Mutex<Vec<RouteCall>>>, pending: Arc<Mutex<bool>>) -> Self {
             Self { calls, pending }
         }
     }
 
     impl MsixRoute for MockMsixRoute {
         fn set_msi(&self, address: u64, data: u32) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push(RouteCall::SetMsi { address, data });
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RouteCall::SetMsi { address, data });
             Ok(())
         }
 
@@ -734,7 +734,13 @@ mod tests {
         }
     }
 
-    fn make_mock_routes(count: usize) -> (Vec<Box<dyn MsixRoute>>, Vec<Arc<Mutex<Vec<RouteCall>>>>, Vec<Arc<Mutex<bool>>>) {
+    fn make_mock_routes(
+        count: usize,
+    ) -> (
+        Vec<Box<dyn MsixRoute>>,
+        Vec<Arc<Mutex<Vec<RouteCall>>>>,
+        Vec<Arc<Mutex<bool>>>,
+    ) {
         let mut routes: Vec<Box<dyn MsixRoute>> = Vec::new();
         let mut call_logs = Vec::new();
         let mut pendings = Vec::new();
@@ -763,11 +769,17 @@ mod tests {
 
         // Program vector 0 addr/data (still masked — control starts at 1).
         msix.write_u32(0, 0xFEE00000); // addr_lo
-        msix.write_u32(4, 0);          // addr_hi
-        msix.write_u32(8, 0x42);       // data
+        msix.write_u32(4, 0); // addr_hi
+        msix.write_u32(8, 0x42); // data
 
         // No set_msi yet because vector is still masked.
-        assert!(!calls[0].lock().unwrap().iter().any(|c| matches!(c, RouteCall::SetMsi { .. })));
+        assert!(
+            !calls[0]
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, RouteCall::SetMsi { .. }))
+        );
 
         // Unmask vector 0 (write control = 0).
         calls[0].lock().unwrap().clear();
@@ -776,7 +788,10 @@ mod tests {
         // Should have called consume_pending then set_msi.
         let log = calls[0].lock().unwrap().clone();
         assert!(log.contains(&RouteCall::ConsumePending));
-        assert!(log.contains(&RouteCall::SetMsi { address: 0xFEE00000, data: 0x42 }));
+        assert!(log.contains(&RouteCall::SetMsi {
+            address: 0xFEE00000,
+            data: 0x42
+        }));
     }
 
     #[test]
@@ -853,7 +868,12 @@ mod tests {
         let pba = msix.read_u32(32);
 
         // Should have called consume_pending and returned bit 0 set.
-        assert!(calls[0].lock().unwrap().contains(&RouteCall::ConsumePending));
+        assert!(
+            calls[0]
+                .lock()
+                .unwrap()
+                .contains(&RouteCall::ConsumePending)
+        );
         assert_eq!(pba & 1, 1);
     }
 
@@ -878,6 +898,9 @@ mod tests {
         msix.write_u32(8, 0x99);
 
         let log = calls[0].lock().unwrap().clone();
-        assert!(log.contains(&RouteCall::SetMsi { address: 0xFEE00000, data: 0x99 }));
+        assert!(log.contains(&RouteCall::SetMsi {
+            address: 0xFEE00000,
+            data: 0x99
+        }));
     }
 }

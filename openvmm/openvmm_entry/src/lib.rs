@@ -769,12 +769,18 @@ async fn vm_config_from_command_line(
     let pcie_switches = build_switch_list(&opt.pcie_switch);
 
     #[cfg(target_os = "linux")]
-    let vfio_devices: Vec<openvmm_defs::config::VfioDeviceConfig> = opt
+    let vfio_pcie_devices: Vec<PcieDeviceConfig> = opt
         .vfio
         .iter()
-        .map(|cli_cfg| openvmm_defs::config::VfioDeviceConfig {
-            port_name: cli_cfg.port_name.clone(),
-            pci_id: cli_cfg.pci_id.clone(),
+        .map(|cli_cfg| {
+            use vm_resource::IntoResource;
+            PcieDeviceConfig {
+                port_name: cli_cfg.port_name.clone(),
+                resource: vfio_assigned_device_resources::VfioDeviceHandle {
+                    pci_id: cli_cfg.pci_id.clone(),
+                }
+                .into_resource(),
+            }
         })
         .collect();
 
@@ -1525,10 +1531,15 @@ async fn vm_config_from_command_line(
         load_mode,
         floppy_disks,
         pcie_root_complexes,
+        #[cfg(target_os = "linux")]
+        pcie_devices: {
+            let mut devs = pcie_devices;
+            devs.extend(vfio_pcie_devices);
+            devs
+        },
+        #[cfg(not(target_os = "linux"))]
         pcie_devices,
         pcie_switches,
-        #[cfg(target_os = "linux")]
-        vfio_devices,
         vpci_devices,
         ide_disks: Vec::new(),
         memory: MemoryConfig {

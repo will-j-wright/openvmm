@@ -169,8 +169,6 @@ impl Manifest {
             pcie_root_complexes: config.pcie_root_complexes,
             pcie_devices: config.pcie_devices,
             pcie_switches: config.pcie_switches,
-            #[cfg(target_os = "linux")]
-            vfio_devices: config.vfio_devices,
             vpci_devices: config.vpci_devices,
             hypervisor: config.hypervisor,
             memory: config.memory,
@@ -218,8 +216,6 @@ pub struct Manifest {
     pcie_root_complexes: Vec<PcieRootComplexConfig>,
     pcie_devices: Vec<PcieDeviceConfig>,
     pcie_switches: Vec<PcieSwitchConfig>,
-    #[cfg(target_os = "linux")]
-    vfio_devices: Vec<openvmm_defs::config::VfioDeviceConfig>,
     vpci_devices: Vec<VpciDeviceConfig>,
     memory: MemoryConfig,
     processor_topology: ProcessorTopologyConfig,
@@ -1748,133 +1744,10 @@ impl InitializedVm {
                 partition.clone().into_doorbell_registration(Vtl::Vtl0),
                 Some(&mapper),
                 partition.as_signal_msi(Vtl::Vtl0),
+                Some(&mem_layout),
+                partition.irqfd(),
             )
             .await?;
-        }
-
-        // VFIO assigned devices (Linux only)
-        #[cfg(target_os = "linux")]
-        for vfio_cfg in cfg.vfio_devices {
-            use std::path::Path;
-
-            let pci_id = &vfio_cfg.pci_id;
-            let sysfs_path = Path::new("/sys/bus/pci/devices").join(pci_id);
-
-            tracing::info!(
-                pci_id,
-                port = vfio_cfg.port_name.as_str(),
-                "opening VFIO device"
-            );
-
-            let container = vfio_sys::Container::new().context("failed to open VFIO container")?;
-            let group_id = vfio_sys::Group::find_group_for_device(&sysfs_path)
-                .with_context(|| format!("failed to find IOMMU group for {pci_id}"))?;
-            let group = vfio_sys::Group::open(group_id)
-                .with_context(|| format!("failed to open VFIO group {group_id}"))?;
-            group
-                .set_container(&container)
-                .context("failed to set VFIO container")?;
-            container
-                .set_iommu(vfio_sys::IommuType::Type1v2)
-                .context("failed to set VFIO IOMMU type to Type1v2 (IOMMU required)")?;
-
-            // Map guest RAM into the IOMMU for device DMA access. Each
-            // RAM range is identity-mapped (IOVA == GPA) so that device
-            // DMA addresses match guest physical addresses.
-            let (base_va, va_size) = gm
-                .full_mapping()
-                .context("VFIO DMA mapping requires linearly mapped guest memory")?;
-            for ram_range in mem_layout.ram() {
-                let gpa_start = ram_range.range.start();
-                let size = ram_range.range.len();
-                anyhow::ensure!(
-                    gpa_start + size <= va_size as u64,
-                    "RAM range {:#x}..{:#x} exceeds guest memory mapping size {:#x}",
-                    gpa_start,
-                    gpa_start + size,
-                    va_size
-                );
-                let vaddr = base_va as u64 + gpa_start;
-                container.map_dma(gpa_start, vaddr, size).with_context(|| {
-                    format!(
-                        "failed to map DMA for RAM range {:#x}..{:#x}",
-                        gpa_start,
-                        gpa_start + size
-                    )
-                })?;
-                tracing::debug!(gpa_start, size, vaddr, "mapped guest RAM for VFIO DMA");
-            }
-
-            let driver = driver_source.simple();
-            let device = group
-                .open_device(pci_id, &driver)
-                .await
-                .with_context(|| format!("failed to open VFIO device {pci_id}"))?;
-
-            let config_info = device
-                .region_info(vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX)
-                .context("failed to get VFIO config region info")?;
-
-            // Query VFIO region info for each BAR (indices 0-5).
-            let mut bar_info: [Option<vfio_assigned_device::VfioBarInfo>; 6] = [None; 6];
-            for i in 0u32..6 {
-                if let Ok(info) = device.region_info(i) {
-                    if info.size > 0 {
-                        bar_info[i as usize] = Some(vfio_assigned_device::VfioBarInfo {
-                            vfio_offset: info.offset,
-                            size: info.size,
-                        });
-                    }
-                }
-            }
-
-            // Create MSI connection for interrupt delivery.
-            let msi_conn = pci_core::msi::MsiConnection::new();
-
-            // Get irqfd interface from partition for direct interrupt injection.
-            let irqfd = partition
-                .irqfd()
-                .context("partition does not support irqfd (required for VFIO)")?;
-
-            let device_name = format!("vfio-assigned:{pci_id}");
-            chipset_builder
-                .arc_mutex_device(device_name)
-                .on_pcie_port(vmotherboard::BusId::new(&vfio_cfg.port_name))
-                .try_add(|services| {
-                    use chipset_device::mmio::RegisterMmioIntercept;
-
-                    // Register MMIO regions for each BAR with the chipset.
-                    let mut register_mmio = services.register_mmio();
-                    let bar_mmio_controls: Vec<_> = bar_info
-                        .iter()
-                        .enumerate()
-                        .map(|(i, info)| {
-                            let size = info.map_or(0, |bi| bi.size);
-                            register_mmio.new_io_region(&format!("bar{i}"), size)
-                        })
-                        .collect();
-
-                    vfio_assigned_device::VfioAssignedPciDevice::new(
-                        vfio_assigned_device::VfioAssignedPciDeviceConfig {
-                            pci_id: pci_id.clone(),
-                            vfio_device: device,
-                            config_offset: config_info.offset,
-                            config_size: config_info.size,
-                            msi_target: msi_conn.target().clone(),
-                            bar_info,
-                            irqfd: irqfd.clone(),
-                            bar_mmio_controls,
-                            vfio_container: container,
-                            vfio_group: group,
-                        },
-                    )
-                })?;
-
-            // Connect MSI delivery to the partition's interrupt sink.
-            let signal_msi = partition
-                .as_signal_msi(Vtl::Vtl0)
-                .context("partition must support MSI signaling for VFIO")?;
-            msi_conn.connect(signal_msi);
         }
 
         if let Some(vmbus_cfg) = cfg.vmbus {
@@ -2896,6 +2769,8 @@ impl LoadedVm {
                                                 guest_memory: &self.inner.gm,
                                                 doorbell_registration: self.inner.partition.clone().into_doorbell_registration(Vtl::Vtl0),
                                                 shared_mem_mapper: None,
+                                                mem_layout: None,
+                                                irqfd: self.inner.partition.irqfd(),
                                             },
                                         )
                                         .await
@@ -3107,8 +2982,6 @@ impl LoadedVm {
             pcie_root_complexes: vec![], // TODO
             pcie_devices: vec![],        // TODO
             pcie_switches: vec![],       // TODO
-            #[cfg(target_os = "linux")]
-            vfio_devices: vec![], // TODO
             vpci_devices: vec![],        // TODO
             memory: self.inner.memory_cfg,
             processor_topology: self.inner.processor_topology.to_config(),

@@ -60,6 +60,7 @@ vmgs_broker.workspace = true
 gdma.workspace = true
 nvme.workspace = true
 nvme_test.workspace = true
+vfio_assigned_device.workspace = true
 
 # SCSI
 scsidisk.workspace = true

@@ -285,6 +285,7 @@ tdisp = { path = "vm/devices/tdisp" }
 tdisp_proto = { path = "vm/devices/tdisp_proto" }
 vmswitch = { path = "vm/devices/net/vmswitch" }
 vfio_assigned_device = { path = "vm/devices/pci/vfio_assigned_device" }
+vfio_assigned_device_resources = { path = "vm/devices/pci/vfio_assigned_device_resources" }
 pci_bus = { path = "vm/devices/pci/pci_bus" }
 pci_core = { path = "vm/devices/pci/pci_core" }
 pci_resources = { path = "vm/devices/pci/pci_resources" }

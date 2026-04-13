@@ -12,6 +12,8 @@
 #![cfg(target_os = "linux")]
 #![forbid(unsafe_code)]
 
+pub mod resolver;
+
 use anyhow::Context as _;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
