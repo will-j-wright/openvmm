@@ -117,7 +117,12 @@ impl PciCapability for MsixCapability {
                         if entry.is_enabled(true) {
                             entry.msi.disable();
                             if let Some(route) = &entry.route {
-                                let _ = route.mask();
+                                if let Err(e) = route.mask() {
+                                    tracelimit::warn_ratelimited!(
+                                        error = ?e,
+                                        "failed to mask MSI-X route on global disable"
+                                    );
+                                }
                             }
                         }
                     }
@@ -129,7 +134,14 @@ impl PciCapability for MsixCapability {
                                     entry.state.is_pending = true;
                                 }
                                 if entry.state.address != 0 || entry.state.data != 0 {
-                                    let _ = route.set_msi(entry.state.address, entry.state.data);
+                                    if let Err(e) =
+                                        route.set_msi(entry.state.address, entry.state.data)
+                                    {
+                                        tracelimit::warn_ratelimited!(
+                                            error = ?e,
+                                            "failed to program MSI-X route on global enable"
+                                        );
+                                    }
                                 }
                             }
                             entry.msi.enable(
@@ -157,7 +169,12 @@ impl PciCapability for MsixCapability {
         state.enabled = false;
         for vector in &mut state.vectors {
             if let Some(route) = &vector.route {
-                let _ = route.mask();
+                if let Err(e) = route.mask() {
+                    tracelimit::warn_ratelimited!(
+                        error = ?e,
+                        "failed to mask MSI-X route on reset"
+                    );
+                }
             }
             vector.state = EntryState::new();
         }
@@ -426,7 +443,12 @@ impl MsixEmulator {
                             entry.state.is_pending = true;
                         }
                         if entry.state.address != 0 || entry.state.data != 0 {
-                            let _ = route.set_msi(entry.state.address, entry.state.data);
+                            if let Err(e) = route.set_msi(entry.state.address, entry.state.data) {
+                                tracelimit::warn_ratelimited!(
+                                    error = ?e,
+                                    "failed to program MSI-X route on vector unmask"
+                                );
+                            }
                         }
                     }
                     entry.msi.enable(
@@ -438,13 +460,23 @@ impl MsixEmulator {
                 } else if was_enabled && !is_enabled {
                     // Vector just masked.
                     if let Some(route) = &entry.route {
-                        let _ = route.mask();
+                        if let Err(e) = route.mask() {
+                            tracelimit::warn_ratelimited!(
+                                error = ?e,
+                                "failed to mask MSI-X route on vector mask"
+                            );
+                        }
                     }
                     entry.msi.disable();
                 } else if is_enabled {
                     // Still enabled — addr/data may have changed.
                     if let Some(route) = &entry.route {
-                        let _ = route.set_msi(entry.state.address, entry.state.data);
+                        if let Err(e) = route.set_msi(entry.state.address, entry.state.data) {
+                            tracelimit::warn_ratelimited!(
+                                error = ?e,
+                                "failed to update MSI-X route on addr/data change"
+                            );
+                        }
                     }
                     entry
                         .msi

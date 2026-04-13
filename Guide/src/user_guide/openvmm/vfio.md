@@ -31,10 +31,10 @@ Linux Host
 Find the PCI device you want to assign:
 
 ```bash
-lspci
+lspci -D
 ```
 
-Look for the device's BDF (bus:device.function) address, for example `3f7a:00:00.0`.
+Look for the device's PCI address in `domain:bus:device.function` format, for example `3f7a:00:00.0`.
 
 ## Step 2: Enable unsafe interrupts
 

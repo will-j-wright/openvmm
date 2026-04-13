@@ -273,13 +273,22 @@ impl VfioAssignedPciDevice {
     }
 
     fn read_phys_config(&self, offset: u16) -> u32 {
-        read_config_u32(
+        match read_config_u32(
             self.vfio_device.as_ref(),
             self.config_offset,
             self.config_size,
             offset,
-        )
-        .unwrap_or(!0)
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                tracelimit::warn_ratelimited!(
+                    offset,
+                    error = ?e,
+                    "VFIO config space read failed"
+                );
+                !0
+            }
+        }
     }
 
     fn write_phys_config(&self, offset: u16, value: u32) {
@@ -462,8 +471,18 @@ fn discover_msix(
     let cap_ptr_dword =
         read_config_u32(device_file, config_offset, config_size, CFG_CAP_PTR).ok()?;
     let mut cap_ptr = (cap_ptr_dword & 0xFC) as u16; // mask off reserved bits [1:0]
+    let mut iterations = 0usize;
 
     while cap_ptr != 0 {
+        // Guard against malformed capability lists (cycles or excessive length).
+        // PCI config space is 256 bytes; capabilities are at least 4 bytes each.
+        const MAX_CAPS: usize = 48;
+        if iterations >= MAX_CAPS {
+            tracing::warn!("PCI capability list exceeded {MAX_CAPS} entries, aborting walk");
+            return None;
+        }
+        iterations += 1;
+
         let header = read_config_u32(device_file, config_offset, config_size, cap_ptr).ok()?;
         let cap_id = (header & 0xFF) as u8;
         let next_ptr = ((header >> 8) & 0xFC) as u16;

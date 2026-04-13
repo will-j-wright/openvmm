@@ -825,7 +825,8 @@ Examples:
 Syntax: <port_name>:<pci_bdf>
 
     port_name    Root port or downstream switch port name
-    pci_bdf      PCI bus:device.function of the VFIO device on the host
+    pci_bdf      PCI domain:bus:device.function of the VFIO device on
+                 the host (use lspci -D to find it)
 "#)]
     #[cfg(target_os = "linux")]
     #[clap(long, conflicts_with("pcat"))]

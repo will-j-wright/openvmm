@@ -16,7 +16,7 @@ use vm_resource::kind::PciDeviceHandleKind;
 /// is needed in the handle — all runtime state is created during resolution.
 #[derive(MeshPayload)]
 pub struct VfioDeviceHandle {
-    /// PCI BDF address on the host (e.g., "0000:3f7a:00:00.0").
+    /// PCI BDF address on the host (e.g., "0000:3f:7a.0").
     pub pci_id: String,
 }
 

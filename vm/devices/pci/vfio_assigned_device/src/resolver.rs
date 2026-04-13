@@ -50,6 +50,15 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
         group
             .set_container(&container)
             .context("failed to set VFIO container")?;
+
+        anyhow::ensure!(
+            group
+                .status()
+                .context("failed to check VFIO group status")?
+                .viable(),
+            "VFIO group {group_id} is not viable (all devices in the group must be bound to vfio-pci)"
+        );
+
         container
             .set_iommu(vfio_sys::IommuType::Type1v2)
             .context("failed to set VFIO IOMMU type to Type1v2 (IOMMU required)")?;

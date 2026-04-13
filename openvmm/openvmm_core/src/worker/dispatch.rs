@@ -2769,7 +2769,7 @@ impl LoadedVm {
                                                 guest_memory: &self.inner.gm,
                                                 doorbell_registration: self.inner.partition.clone().into_doorbell_registration(Vtl::Vtl0),
                                                 shared_mem_mapper: None,
-                                                mem_layout: None,
+                                                mem_layout: Some(&self.inner.mem_layout),
                                                 irqfd: self.inner.partition.irqfd(),
                                             },
                                         )
