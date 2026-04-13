@@ -88,7 +88,7 @@ Check that a VFIO group device was created:
 ls /dev/vfio/
 ```
 
-You should see a numbered group (e.g., `/dev/vfio/0`) or a `noiommu-` prefixed group. Either is fine.
+You should see a numbered group (e.g., `/dev/vfio/0`). An IOMMU group is required — NoIommu mode is not supported.
 
 ## Step 5: Launch OpenVMM with the VFIO device
 
@@ -133,9 +133,9 @@ The device will appear with its real vendor and device ID from the physical hard
 
 ## Troubleshooting
 
-### "No such file or directory" for `/dev/vfio/noiommu-*`
+### "No such file or directory" for `/dev/vfio/*`
 
-The device has a real IOMMU group. Make sure you completed Step 2 (allow unsafe interrupts) and that the device is bound to `vfio-pci`.
+Make sure you completed Step 2 (allow unsafe interrupts) and that the device is bound to `vfio-pci`. An IOMMU must be available — NoIommu mode is not supported.
 
 ### "No interrupt remapping" / ENODEV on IOMMU setup
 

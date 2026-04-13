@@ -333,6 +333,13 @@ impl VfioAssignedPciDevice {
     fn msix_enable(&mut self) -> anyhow::Result<()> {
         let msix = self.msix.as_mut().expect("msix must be present");
         let count = msix.vector_count;
+
+        // VFIO map_msix has a hard limit of 256 eventfds per call.
+        anyhow::ensure!(
+            count <= 256,
+            "MSI-X vector count ({count}) exceeds VFIO limit of 256"
+        );
+
         let mut irqfd_routes: Vec<Box<dyn IrqFdRoute>> = Vec::with_capacity(count as usize);
 
         for i in 0..count {
@@ -349,8 +356,8 @@ impl VfioAssignedPciDevice {
             .map_msix(0, &events)
             .context("VFIO map_msix failed")?;
 
-        // Wrap as MsixRoute adapters and install in the emulator.
-        // The emulator will automatically call set_msi/mask/consume_pending
+        // Install routes in the emulator BEFORE updating the enabled flag.
+        // The emulator will call set_msi/mask/consume_pending on these routes
         // when the guest modifies MSI-X table entries.
         let msix = self.msix.as_mut().expect("msix must be present");
         let routes: Vec<Box<dyn MsixRoute>> = irqfd_routes
@@ -654,13 +661,16 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                         let new_enabled = value & 0x8000_0000 != 0;
                         let was_enabled = msix.enabled;
 
-                        // Forward to MsixCapability to update emulator state.
-                        msix.capability.write_u32(0, value);
-
                         if new_enabled && !was_enabled {
+                            // Install irqfd routes BEFORE writing the
+                            // capability, so that when the capability
+                            // processes the enable transition it can call
+                            // set_msi() on the already-installed routes.
                             match self.msix_enable() {
                                 Ok(()) => {
-                                    self.msix.as_mut().unwrap().enabled = true;
+                                    let msix = self.msix.as_mut().unwrap();
+                                    msix.capability.write_u32(0, value);
+                                    msix.enabled = true;
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -671,8 +681,14 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                                 }
                             }
                         } else if was_enabled && !new_enabled {
+                            // Write capability first to disable vectors,
+                            // then tear down VFIO mapping.
+                            msix.capability.write_u32(0, value);
                             self.msix_disable();
                             self.msix.as_mut().unwrap().enabled = false;
+                        } else {
+                            // No enable/disable transition — just forward.
+                            msix.capability.write_u32(0, value);
                         }
                         // Skip write_phys_config for MSI-X control register.
                         return IoResult::Ok;
@@ -748,6 +764,13 @@ impl MmioIntercept for VfioAssignedPciDevice {
                     }
                     return IoResult::Ok;
                 }
+                tracelimit::warn_ratelimited!(
+                    bar,
+                    offset,
+                    len = data.len(),
+                    pci_id = self.pci_id.as_str(),
+                    "VFIO BAR write out of range"
+                );
             }
         }
         IoResult::Ok
