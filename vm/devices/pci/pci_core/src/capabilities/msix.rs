@@ -15,6 +15,41 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use vmcore::interrupt::Interrupt;
 
+/// Per-vector interrupt route control for kernel-mediated MSI-X delivery.
+///
+/// When routes are installed on an [`MsixEmulator`] via [`MsixEmulator::set_routes`],
+/// the emulator automatically calls these methods when the guest modifies MSI-X
+/// table entries or changes the global enable/mask state. This enables interrupt
+/// injection without userspace involvement (e.g., via irqfd for VFIO or
+/// vhost-user devices).
+///
+/// Implementors typically wrap a kernel irqfd registration: an eventfd + GSI
+/// with MSI routing in the hypervisor.
+pub trait MsixRoute: Send {
+    /// Sets the MSI routing (address and data) for this vector.
+    ///
+    /// Called when a vector becomes unmasked with valid addr/data, or when
+    /// the guest updates addr/data while the vector is active.
+    fn set_msi(&self, address: u64, data: u32) -> anyhow::Result<()>;
+
+    /// Clears the MSI routing for this vector.
+    ///
+    /// Called when a vector has no valid routing configured (addr and data
+    /// are both zero).
+    fn clear_msi(&self) -> anyhow::Result<()>;
+
+    /// Masks the route. Interrupts arriving while masked should accumulate
+    /// on the underlying event and be reported via
+    /// [`consume_pending`](Self::consume_pending).
+    fn mask(&self) -> anyhow::Result<()>;
+
+    /// Drains any pending interrupt and returns whether one was pending.
+    ///
+    /// Called when a vector is unmasked or when PBA bits are read, to
+    /// transfer pending state from the event into the MSI-X PBA.
+    fn consume_pending(&self) -> bool;
+}
+
 #[derive(Debug, Inspect)]
 struct MsiTableLocation {
     #[inspect(hex)]
@@ -81,11 +116,22 @@ impl PciCapability for MsixCapability {
                     for entry in &mut state.vectors {
                         if entry.is_enabled(true) {
                             entry.msi.disable();
+                            if let Some(route) = &entry.route {
+                                let _ = route.mask();
+                            }
                         }
                     }
                 } else if enabled && !was_enabled {
                     for entry in &mut state.vectors {
                         if entry.is_enabled(true) {
+                            if let Some(route) = &entry.route {
+                                if route.consume_pending() {
+                                    entry.state.is_pending = true;
+                                }
+                                if entry.state.address != 0 || entry.state.data != 0 {
+                                    let _ = route.set_msi(entry.state.address, entry.state.data);
+                                }
+                            }
                             entry.msi.enable(
                                 entry.state.address,
                                 entry.state.data,
@@ -110,6 +156,9 @@ impl PciCapability for MsixCapability {
         let mut state = self.state.lock();
         state.enabled = false;
         for vector in &mut state.vectors {
+            if let Some(route) = &vector.route {
+                let _ = route.mask();
+            }
             vector.state = EntryState::new();
         }
     }
@@ -178,6 +227,8 @@ impl MsiInterrupt {
 struct MsixMessageTableEntry {
     msi: MsiInterrupt,
     state: EntryState,
+    /// Optional kernel-mediated route for fast interrupt delivery.
+    route: Option<Box<dyn MsixRoute>>,
 }
 
 impl InspectMut for MsixMessageTableEntry {
@@ -215,6 +266,7 @@ impl MsixMessageTableEntry {
         Self {
             msi,
             state: EntryState::new(),
+            route: None,
         }
     }
 
@@ -248,7 +300,11 @@ impl MsixMessageTableEntry {
 
     fn check_is_pending(&mut self, global_enabled: bool) -> bool {
         if !self.state.is_pending && !self.is_enabled(global_enabled) {
-            self.state.is_pending = self.msi.drain_pending();
+            if let Some(route) = &self.route {
+                self.state.is_pending = route.consume_pending();
+            } else {
+                self.state.is_pending = self.msi.drain_pending();
+            }
         }
         self.state.is_pending
     }
@@ -363,6 +419,16 @@ impl MsixEmulator {
                 entry.write_u32(offset & 0xf, val);
                 let is_enabled = entry.is_enabled(global);
                 if is_enabled && !was_enabled {
+                    // Vector just unmasked. Consume any pending interrupt
+                    // from the route's event and update routing.
+                    if let Some(route) = &entry.route {
+                        if route.consume_pending() {
+                            entry.state.is_pending = true;
+                        }
+                        if entry.state.address != 0 || entry.state.data != 0 {
+                            let _ = route.set_msi(entry.state.address, entry.state.data);
+                        }
+                    }
                     entry.msi.enable(
                         entry.state.address,
                         entry.state.data,
@@ -370,7 +436,19 @@ impl MsixEmulator {
                     );
                     entry.state.is_pending = false;
                 } else if was_enabled && !is_enabled {
+                    // Vector just masked.
+                    if let Some(route) = &entry.route {
+                        let _ = route.mask();
+                    }
                     entry.msi.disable();
+                } else if is_enabled {
+                    // Still enabled — addr/data may have changed.
+                    if let Some(route) = &entry.route {
+                        let _ = route.set_msi(entry.state.address, entry.state.data);
+                    }
+                    entry
+                        .msi
+                        .enable(entry.state.address, entry.state.data, false);
                 }
                 return;
             }
@@ -410,6 +488,35 @@ impl MsixEmulator {
         let mut state = self.state.lock();
         if let Some(entry) = state.vectors.get_mut(index as usize) {
             entry.state.is_pending = true;
+        }
+    }
+
+    /// Install per-vector interrupt routes for kernel-mediated delivery.
+    ///
+    /// Each route corresponds to one MSI-X vector, in order. When the guest
+    /// writes to the MSI-X table or changes the enable/mask state, the
+    /// emulator automatically calls [`MsixRoute::set_msi`],
+    /// [`MsixRoute::mask`], and [`MsixRoute::consume_pending`] on the
+    /// appropriate route.
+    ///
+    /// Excess routes (beyond the vector count) are ignored. Missing routes
+    /// leave those vectors without kernel-mediated delivery (they fall back
+    /// to the [`MsiTarget`]-based path).
+    pub fn set_routes(&self, routes: Vec<Box<dyn MsixRoute>>) {
+        let mut state = self.state.lock();
+        for (entry, route) in state.vectors.iter_mut().zip(routes) {
+            entry.route = Some(route);
+        }
+    }
+
+    /// Remove all installed routes.
+    ///
+    /// Routes are dropped, which typically unregisters irqfds and frees
+    /// GSI allocations.
+    pub fn clear_routes(&self) {
+        let mut state = self.state.lock();
+        for entry in &mut state.vectors {
+            entry.route = None;
         }
     }
 }

@@ -21,6 +21,7 @@ use inspect::InspectMut;
 use pci_core::bar_mapping::BarMappings;
 use pci_core::capabilities::PciCapability;
 use pci_core::capabilities::msix::MsixEmulator;
+use pci_core::capabilities::msix::MsixRoute;
 use pci_core::msi::MsiTarget;
 use pci_core::spec::cfg_space;
 use std::os::unix::fs::FileExt;
@@ -32,17 +33,6 @@ use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
 use vmcore::save_restore::SaveRestore;
 use vmcore::save_restore::SavedStateNotSupported;
-
-/// MSI-X table entry size in bytes.
-const MSIX_ENTRY_SIZE: u64 = 16;
-/// Offset of the vector control field within an MSI-X table entry.
-/// Matches `pci_core::spec::caps::msix::MsixTableEntryIdx::VECTOR_CTL`.
-const MSIX_ENTRY_CONTROL_OFFSET: u64 = 12;
-/// Vector mask bit in the MSI-X table entry control field.
-const MSIX_VECTOR_MASK_BIT: u32 = 1;
-/// MSI-X Enable bit in the MSI-X Message Control register (bit 15,
-/// shifted into the dword position at config offset cap+0).
-const MSIX_ENABLE_BIT: u32 = 0x8000_0000;
 
 /// PCI config space offsets as plain constants for use in match patterns.
 const CFG_BAR0: u16 = 0x10;
@@ -62,7 +52,7 @@ pub struct VfioBarInfo {
 /// MSI-X emulation state, discovered from the physical device's capabilities.
 struct MsixEmulationState {
     /// Software MSI-X table emulator (handles table entries, PBA,
-    /// enable/disable state transitions).
+    /// enable/disable state transitions, and irqfd route management).
     emulator: MsixEmulator,
     /// MSI-X PCI capability handler (shared state with emulator; used to
     /// forward config space writes so the emulator tracks enable/disable).
@@ -85,11 +75,6 @@ struct MsixEmulationState {
     pba_size: u64,
     /// Whether MSI-X is currently enabled by the guest.
     enabled: bool,
-    /// irqfd routes for each MSI-X vector. When the guest programs a vector's
-    /// addr/data, the route is updated via `set_msi`. The kernel injects the
-    /// MSI directly into the guest when the eventfd is signaled by VFIO.
-    /// Events are owned by the routes and stay alive as long as the routes do.
-    irqfd_routes: Vec<Box<dyn IrqFdRoute>>,
 }
 
 /// A PCI device backed by a VFIO device file.
@@ -342,36 +327,37 @@ impl VfioAssignedPciDevice {
 
     /// Set up irqfd-backed MSI-X interrupt delivery when the guest enables MSI-X.
     ///
-    /// For each vector, creates an eventfd, registers it as an irqfd route with
-    /// the hypervisor, and hands all eventfds to VFIO via `map_msix`. When the
-    /// physical device fires an interrupt, VFIO signals the eventfd, the kernel
-    /// looks up the GSI routing, and injects the MSI directly into the guest.
+    /// Creates irqfd routes for each vector, installs them as MsixRoutes in the
+    /// emulator (so addr/data updates are handled automatically), then passes the
+    /// events to VFIO so the physical device signals the eventfds on interrupt.
     fn msix_enable(&mut self) -> anyhow::Result<()> {
         let msix = self.msix.as_mut().expect("msix must be present");
         let count = msix.vector_count;
-        let mut routes = Vec::with_capacity(count as usize);
+        let mut irqfd_routes: Vec<Box<dyn IrqFdRoute>> = Vec::with_capacity(count as usize);
 
         for i in 0..count {
             let route = self
                 .irqfd
                 .new_irqfd_route()
                 .with_context(|| format!("failed to create irqfd route for MSI-X vector {i}"))?;
-            routes.push(route);
+            irqfd_routes.push(route);
         }
-
-        // Save routes before map_msix so they are cleaned up on failure
-        // (Drop will unregister irqfds and free GSIs).
-        let msix = self.msix.as_mut().expect("msix must be present");
-        msix.irqfd_routes = routes;
 
         // Collect event references from routes for VFIO map_msix.
-        let events: Vec<&pal_event::Event> = msix.irqfd_routes.iter().map(|r| r.event()).collect();
-        if let Err(e) = self.vfio_device.map_msix(0, &events) {
-            // Clean up routes on failure.
-            let msix = self.msix.as_mut().expect("msix must be present");
-            msix.irqfd_routes.clear();
-            return Err(e).context("VFIO map_msix failed");
-        }
+        let events: Vec<&pal_event::Event> = irqfd_routes.iter().map(|r| r.event()).collect();
+        self.vfio_device
+            .map_msix(0, &events)
+            .context("VFIO map_msix failed")?;
+
+        // Wrap as MsixRoute adapters and install in the emulator.
+        // The emulator will automatically call set_msi/mask/consume_pending
+        // when the guest modifies MSI-X table entries.
+        let msix = self.msix.as_mut().expect("msix must be present");
+        let routes: Vec<Box<dyn MsixRoute>> = irqfd_routes
+            .into_iter()
+            .map(|r| Box::new(IrqFdMsixRoute(r)) as Box<dyn MsixRoute>)
+            .collect();
+        msix.emulator.set_routes(routes);
 
         tracing::info!(
             count,
@@ -394,85 +380,34 @@ impl VfioAssignedPciDevice {
             );
         }
 
-        // Dropping routes unregisters irqfds and frees GSIs.
-        msix.irqfd_routes.clear();
+        // Clearing routes drops the irqfd registrations and frees GSIs.
+        msix.emulator.clear_routes();
         tracing::info!(
             pci_id = self.pci_id.as_str(),
             "MSI-X disabled: unmapped vectors"
         );
     }
+}
 
-    /// After an MSI-X table write, read back the affected vector's addr/data
-    /// from the emulator and update the corresponding irqfd route so the kernel
-    /// injects the correct MSI.
-    ///
-    /// When a vector is masked, the irqfd route is masked (not cleared), so
-    /// interrupts accumulate on the eventfd. When the vector is unmasked, any
-    /// pending interrupt is consumed from the eventfd and stored in the MSI-X
-    /// emulator's PBA before the route is re-enabled.
-    fn update_irqfd_routing(&self, emu_offset: u64) {
-        let msix = match &self.msix {
-            Some(msix) if msix.enabled => msix,
-            _ => return,
-        };
+/// Adapter wrapping an [`IrqFdRoute`] as a [`MsixRoute`] for use with
+/// [`MsixEmulator`].
+struct IrqFdMsixRoute(Box<dyn IrqFdRoute>);
 
-        // Determine which vector was written (each entry is 16 bytes).
-        // Only table entries (before the PBA) affect routing.
-        if emu_offset >= msix.table_size {
-            return;
-        }
-        let vector = (emu_offset / MSIX_ENTRY_SIZE) as usize;
-        let Some(route) = msix.irqfd_routes.get(vector) else {
-            return;
-        };
+impl MsixRoute for IrqFdMsixRoute {
+    fn set_msi(&self, address: u64, data: u32) -> anyhow::Result<()> {
+        self.0.set_msi(address, data)
+    }
 
-        let base = (vector as u64) * MSIX_ENTRY_SIZE;
-        let addr_lo = msix.emulator.read_u32(base);
-        let addr_hi = msix.emulator.read_u32(base + 4);
-        let data = msix.emulator.read_u32(base + 8);
-        let control = msix.emulator.read_u32(base + MSIX_ENTRY_CONTROL_OFFSET);
-        let masked = control & MSIX_VECTOR_MASK_BIT != 0;
+    fn clear_msi(&self) -> anyhow::Result<()> {
+        self.0.clear_msi()
+    }
 
-        if masked {
-            // Mask the route but preserve it so it can be restored on unmask.
-            // Interrupts arriving while masked accumulate on the eventfd and
-            // are consumed on PBA reads or on unmask.
-            if let Err(e) = route.mask() {
-                tracelimit::warn_ratelimited!(
-                    vector,
-                    error = ?e,
-                    "failed to mask irqfd route"
-                );
-            }
-        } else if addr_lo == 0 && addr_hi == 0 && data == 0 {
-            // No valid routing configured yet.
-            if let Err(e) = route.clear_msi() {
-                tracelimit::warn_ratelimited!(
-                    vector,
-                    error = ?e,
-                    "failed to clear irqfd route"
-                );
-            }
-        } else {
-            // Vector is unmasked with valid addr/data. Configure the irqfd
-            // route first so new interrupts are handled immediately, then
-            // drain any pending interrupt from the eventfd (accumulated while
-            // masked) and record it in the PBA.
-            let address = addr_lo as u64 | ((addr_hi as u64) << 32);
-            if let Err(e) = route.set_msi(address, data) {
-                tracelimit::warn_ratelimited!(
-                    vector,
-                    address,
-                    data,
-                    error = ?e,
-                    "failed to update irqfd route"
-                );
-            }
+    fn mask(&self) -> anyhow::Result<()> {
+        self.0.mask()
+    }
 
-            if route.consume_pending() {
-                msix.emulator.set_pending_bit(vector as u16);
-            }
-        }
+    fn consume_pending(&self) -> bool {
+        self.0.consume_pending()
     }
 }
 
@@ -541,7 +476,7 @@ fn discover_msix(
             let pba_bir = (pba_dword & 0x7) as u8;
             let pba_offset = pba_dword & !0x7;
 
-            let table_size = table_count as u64 * MSIX_ENTRY_SIZE;
+            let table_size = table_count as u64 * 16; // MSI-X entry size
             // PBA: one bit per vector, rounded up to QWORD boundary.
             let pba_size = (table_count as u64).div_ceil(64) * 8;
 
@@ -569,7 +504,6 @@ fn discover_msix(
                 pba_offset,
                 pba_size,
                 enabled: false,
-                irqfd_routes: Vec::new(),
             });
         }
 
@@ -717,7 +651,7 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                 // eventfd associations.
                 if let Some(msix) = &mut self.msix {
                     if offset == msix.cap_offset {
-                        let new_enabled = value & MSIX_ENABLE_BIT != 0;
+                        let new_enabled = value & 0x8000_0000 != 0;
                         let was_enabled = msix.enabled;
 
                         // Forward to MsixCapability to update emulator state.
@@ -758,17 +692,6 @@ impl MmioIntercept for VfioAssignedPciDevice {
             // Check if this access falls in the MSI-X table or PBA.
             if let Some(emu_offset) = self.msix_emulator_offset(bar, offset) {
                 let msix = self.msix.as_ref().expect("msix must be present");
-
-                // For PBA reads, drain any pending eventfds first so the
-                // returned pending bits reflect the current interrupt state.
-                if emu_offset >= msix.table_size {
-                    for (i, route) in msix.irqfd_routes.iter().enumerate() {
-                        if route.consume_pending() {
-                            msix.emulator.set_pending_bit(i as u16);
-                        }
-                    }
-                }
-
                 read_msix_emulator(&msix.emulator, emu_offset, data);
                 return IoResult::Ok;
             }
@@ -804,14 +727,6 @@ impl MmioIntercept for VfioAssignedPciDevice {
             if let Some(emu_offset) = self.msix_emulator_offset(bar, offset) {
                 let msix = self.msix.as_mut().expect("msix must be present");
                 write_msix_emulator(&mut msix.emulator, emu_offset, data);
-                // Update irqfd routing for all table entries affected by this
-                // write. A single write may span multiple 16-byte entries.
-                let first_vector = emu_offset / MSIX_ENTRY_SIZE;
-                let last_vector =
-                    (emu_offset + data.len().saturating_sub(1) as u64) / MSIX_ENTRY_SIZE;
-                for v in first_vector..=last_vector {
-                    self.update_irqfd_routing(v * MSIX_ENTRY_SIZE);
-                }
                 return IoResult::Ok;
             }
 
