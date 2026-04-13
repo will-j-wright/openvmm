@@ -88,7 +88,7 @@ struct MsixEmulationState {
 /// proxied to the physical device via pread/pwrite on the VFIO device fd.
 #[derive(InspectMut)]
 pub struct VfioAssignedPciDevice {
-    /// The PCI address string (e.g., "3f7a:00:00.0") for diagnostics.
+    /// The PCI address string (e.g., "0000:01:00.0") for diagnostics.
     #[inspect(display)]
     pci_id: String,
 
@@ -153,7 +153,7 @@ pub struct VfioAssignedPciDevice {
 
 /// Parameters for creating a [`VfioAssignedPciDevice`].
 pub struct VfioAssignedPciDeviceConfig {
-    /// PCI BDF string (e.g., "3f7a:00:00.0").
+    /// PCI BDF string (e.g., "0000:01:00.0").
     pub pci_id: String,
     /// The opened VFIO device (from `vfio_sys::Group::open_device`).
     pub vfio_device: vfio_sys::Device,
@@ -624,6 +624,18 @@ impl PciConfigSpace for VfioAssignedPciDevice {
             CFG_BAR0..=CFG_BAR5 if (offset - CFG_BAR0).is_multiple_of(4) => {
                 let i = (offset - CFG_BAR0) as usize / 4;
                 self.bars[i]
+            }
+            // MSI-X capability: return emulator state, not hardware.
+            // The emulator tracks the enable/function-mask bits; reading
+            // hardware would return stale state since we don't forward
+            // MSI-X control writes to the physical device.
+            offset if self.msix.as_ref().is_some_and(|m| {
+                let cap_end = m.cap_offset + 12; // MSI-X capability is 12 bytes
+                offset >= m.cap_offset && offset < cap_end
+            }) => {
+                let msix = self.msix.as_ref().unwrap();
+                let cap_offset = offset - msix.cap_offset;
+                msix.capability.read_u32(cap_offset)
             }
             // Everything else: read from physical device.
             _ => self.read_phys_config(offset),

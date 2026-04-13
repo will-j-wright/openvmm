@@ -34,7 +34,7 @@ Find the PCI device you want to assign:
 lspci -D
 ```
 
-Look for the device's PCI address in `domain:bus:device.function` format, for example `3f7a:00:00.0`.
+Look for the device's PCI address in `domain:bus:device.function` format, for example `0000:01:00.0`.
 
 ## Step 2: Enable unsafe interrupts
 
@@ -59,20 +59,20 @@ echo "options vfio_iommu_type1 allow_unsafe_interrupts=1" | sudo tee /etc/modpro
 If the device is currently bound to another driver (e.g., `nvme`), unbind it first:
 
 ```bash
-echo "3f7a:00:00.0" | sudo tee /sys/bus/pci/devices/3f7a:00:00.0/driver/unbind
+echo "0000:01:00.0" | sudo tee /sys/bus/pci/devices/0000:01:00.0/driver/unbind
 ```
 
 Then bind to `vfio-pci`:
 
 ```bash
-echo "vfio-pci" | sudo tee /sys/bus/pci/devices/3f7a:00:00.0/driver_override
-echo "3f7a:00:00.0" | sudo tee /sys/bus/pci/drivers/vfio-pci/bind
+echo "vfio-pci" | sudo tee /sys/bus/pci/devices/0000:01:00.0/driver_override
+echo "0000:01:00.0" | sudo tee /sys/bus/pci/drivers/vfio-pci/bind
 ```
 
 Verify the binding:
 
 ```bash
-ls -la /sys/bus/pci/devices/3f7a:00:00.0/driver
+ls -la /sys/bus/pci/devices/0000:01:00.0/driver
 # Should show: ... -> ../../../../bus/pci/drivers/vfio-pci
 ```
 
@@ -98,7 +98,7 @@ Use the `--vfio` flag to assign the device to a PCIe root port. You also need to
 sudo openvmm \
   --pcie-root-complex rc0 \
   --pcie-root-port rc0:rp0 \
-  --vfio rp0:3f7a:00:00.0 \
+  --vfio rp0:0000:01:00.0 \
   --kernel /path/to/vmlinux \
   --initrd /path/to/initrd \
   --cmdline "console=ttyS0" \
@@ -110,14 +110,14 @@ sudo openvmm \
 The `--vfio` syntax is `<port_name>:<pci_bdf>`:
 
 - `rp0` — the name of the PCIe root port to attach the device to (must match a `--pcie-root-port` name)
-- `3f7a:00:00.0` — the PCI BDF of the VFIO device on the host
+- `0000:01:00.0` — the PCI BDF of the VFIO device on the host
 
 ```admonish tip
 You can assign multiple devices by adding more root ports and `--vfio` flags:
 
     --pcie-root-port rc0:rp0 \
     --pcie-root-port rc0:rp1 \
-    --vfio rp0:3f7a:00:00.0 \
+    --vfio rp0:0000:01:00.0 \
     --vfio rp1:334c:00:00.0
 ```
 

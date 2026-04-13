@@ -132,5 +132,5 @@ For `--virtio-rng` and `--virtio-console`, use their separate PCIe port flags:
 **VFIO device assignment** (Linux only): `--vfio`
 
 ```sh
---vfio rp0:3f7a:00:00.0
+--vfio rp0:0000:01:00.0
 ```

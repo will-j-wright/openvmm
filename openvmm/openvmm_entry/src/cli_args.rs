@@ -820,7 +820,7 @@ The device must be bound to vfio-pci on the host before starting the VM.
 
 Examples:
     # Assign NVMe controller to root port rp0
-    --vfio rp0:3f7a:00:00.0
+    --vfio rp0:0000:01:00.0
 
 Syntax: <port_name>:<pci_bdf>
 
@@ -1969,7 +1969,7 @@ impl FromStr for PcieRemoteCli {
 pub struct VfioDeviceCli {
     /// Name of the PCIe downstream port to attach to.
     pub port_name: String,
-    /// PCI BDF address of the device on the host (e.g., "3f7a:00:00.0").
+    /// PCI BDF address of the device on the host (e.g., "0000:01:00.0").
     pub pci_id: String,
 }
 
@@ -1980,7 +1980,7 @@ impl FromStr for VfioDeviceCli {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (port_name, pci_id) = s
             .split_once(':')
-            .context("expected <port_name>:<pci_bdf> (e.g., rp0:3f7a:00:00.0)")?;
+            .context("expected <port_name>:<pci_bdf> (e.g., rp0:0000:01:00.0)")?;
 
         if port_name.is_empty() {
             anyhow::bail!("port name cannot be empty");

@@ -449,6 +449,11 @@ impl MsixEmulator {
                                     "failed to program MSI-X route on vector unmask"
                                 );
                             }
+                        } else if let Err(e) = route.clear_msi() {
+                            tracelimit::warn_ratelimited!(
+                                error = ?e,
+                                "failed to clear MSI-X route on vector unmask"
+                            );
                         }
                     }
                     entry.msi.enable(
@@ -471,7 +476,16 @@ impl MsixEmulator {
                 } else if is_enabled {
                     // Still enabled — addr/data may have changed.
                     if let Some(route) = &entry.route {
-                        if let Err(e) = route.set_msi(entry.state.address, entry.state.data) {
+                        if entry.state.address == 0 && entry.state.data == 0 {
+                            if let Err(e) = route.clear_msi() {
+                                tracelimit::warn_ratelimited!(
+                                    error = ?e,
+                                    "failed to clear MSI-X route on addr/data zeroed"
+                                );
+                            }
+                        } else if let Err(e) =
+                            route.set_msi(entry.state.address, entry.state.data)
+                        {
                             tracelimit::warn_ratelimited!(
                                 error = ?e,
                                 "failed to update MSI-X route on addr/data change"
@@ -520,6 +534,12 @@ impl MsixEmulator {
         let mut state = self.state.lock();
         if let Some(entry) = state.vectors.get_mut(index as usize) {
             entry.state.is_pending = true;
+        } else {
+            tracelimit::warn_ratelimited!(
+                index,
+                count = state.vectors.len(),
+                "set_pending_bit: vector index out of range"
+            );
         }
     }
 
