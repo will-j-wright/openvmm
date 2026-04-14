@@ -78,19 +78,21 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
         for ram_range in mem_layout.ram() {
             let gpa_start = ram_range.range.start();
             let size = ram_range.range.len();
+            let gpa_end = gpa_start
+                .checked_add(size)
+                .context("RAM range overflows u64")?;
             anyhow::ensure!(
-                gpa_start + size <= va_size as u64,
+                gpa_end <= va_size as u64,
                 "RAM range {:#x}..{:#x} exceeds guest memory mapping size {:#x}",
                 gpa_start,
-                gpa_start + size,
+                gpa_end,
                 va_size
             );
             let vaddr = base_va as u64 + gpa_start;
             container.map_dma(gpa_start, vaddr, size).with_context(|| {
                 format!(
                     "failed to map DMA for RAM range {:#x}..{:#x}",
-                    gpa_start,
-                    gpa_start + size
+                    gpa_start, gpa_end
                 )
             })?;
             tracing::debug!(gpa_start, size, vaddr, "mapped guest RAM for VFIO DMA");

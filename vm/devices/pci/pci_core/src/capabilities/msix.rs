@@ -555,8 +555,13 @@ impl MsixEmulator {
     /// to the [`MsiTarget`]-based path).
     pub fn set_routes(&self, routes: Vec<Box<dyn MsixRoute>>) {
         let mut state = self.state.lock();
+        let route_count = routes.len();
         for (entry, route) in state.vectors.iter_mut().zip(routes) {
             entry.route = Some(route);
+        }
+        // Clear stale routes on vectors beyond the new set.
+        for entry in state.vectors.iter_mut().skip(route_count) {
+            entry.route = None;
         }
     }
 
@@ -733,7 +738,7 @@ mod tests {
         assert_eq!(msix.read_u32(0x404), 0x80000002);
     }
 
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// Record of a call made to a [`MockMsixRoute`].
     #[derive(Debug, Clone, PartialEq)]
@@ -759,26 +764,23 @@ mod tests {
 
     impl MsixRoute for MockMsixRoute {
         fn set_msi(&self, address: u64, data: u32) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(RouteCall::SetMsi { address, data });
+            self.calls.lock().push(RouteCall::SetMsi { address, data });
             Ok(())
         }
 
         fn clear_msi(&self) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push(RouteCall::ClearMsi);
+            self.calls.lock().push(RouteCall::ClearMsi);
             Ok(())
         }
 
         fn mask(&self) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push(RouteCall::Mask);
+            self.calls.lock().push(RouteCall::Mask);
             Ok(())
         }
 
         fn consume_pending(&self) -> bool {
-            self.calls.lock().unwrap().push(RouteCall::ConsumePending);
-            let mut p = self.pending.lock().unwrap();
+            self.calls.lock().push(RouteCall::ConsumePending);
+            let mut p = self.pending.lock();
             let was = *p;
             *p = false;
             was
@@ -827,17 +829,16 @@ mod tests {
         assert!(
             !calls[0]
                 .lock()
-                .unwrap()
                 .iter()
                 .any(|c| matches!(c, RouteCall::SetMsi { .. }))
         );
 
         // Unmask vector 0 (write control = 0).
-        calls[0].lock().unwrap().clear();
+        calls[0].lock().clear();
         msix.write_u32(12, 0);
 
         // Should have called consume_pending then set_msi.
-        let log = calls[0].lock().unwrap().clone();
+        let log = calls[0].lock().clone();
         assert!(log.contains(&RouteCall::ConsumePending));
         assert!(log.contains(&RouteCall::SetMsi {
             address: 0xFEE00000,
@@ -861,12 +862,12 @@ mod tests {
         msix.write_u32(8, 0x42);
         msix.write_u32(12, 0); // unmask
 
-        calls[0].lock().unwrap().clear();
+        calls[0].lock().clear();
 
         // Mask vector 0 (write control = 1).
         msix.write_u32(12, 1);
 
-        let log = calls[0].lock().unwrap().clone();
+        let log = calls[0].lock().clone();
         assert!(log.contains(&RouteCall::Mask));
     }
 
@@ -887,21 +888,21 @@ mod tests {
             msix.write_u32(v * 16 + 8, (v + 1) as u32);
             msix.write_u32(v * 16 + 12, 0); // unmask
         }
-        calls[0].lock().unwrap().clear();
-        calls[1].lock().unwrap().clear();
+        calls[0].lock().clear();
+        calls[1].lock().clear();
 
         // Disable MSI-X globally.
         cap.write_u32(0, 0);
 
         // Both vectors should have been masked.
-        assert!(calls[0].lock().unwrap().contains(&RouteCall::Mask));
-        assert!(calls[1].lock().unwrap().contains(&RouteCall::Mask));
+        assert!(calls[0].lock().contains(&RouteCall::Mask));
+        assert!(calls[1].lock().contains(&RouteCall::Mask));
     }
 
     #[test]
     fn route_consume_pending_on_pba_read() {
         let msi_conn = MsiConnection::new();
-        let (mut msix, mut cap) = MsixEmulator::new(2, 2, msi_conn.target());
+        let (msix, mut cap) = MsixEmulator::new(2, 2, msi_conn.target());
         let msi_controller = TestPciInterruptController::new();
         msi_conn.connect(msi_controller.signal_msi());
 
@@ -912,19 +913,14 @@ mod tests {
         cap.write_u32(0, 0x80000000);
 
         // Simulate a pending interrupt on vector 0.
-        *pendings[0].lock().unwrap() = true;
-        calls[0].lock().unwrap().clear();
+        *pendings[0].lock() = true;
+        calls[0].lock().clear();
 
         // PBA is at offset = vector_count * 16 = 32.
         let pba = msix.read_u32(32);
 
         // Should have called consume_pending and returned bit 0 set.
-        assert!(
-            calls[0]
-                .lock()
-                .unwrap()
-                .contains(&RouteCall::ConsumePending)
-        );
+        assert!(calls[0].lock().contains(&RouteCall::ConsumePending));
         assert_eq!(pba & 1, 1);
     }
 
@@ -943,12 +939,12 @@ mod tests {
         msix.write_u32(0, 0xFEE00000);
         msix.write_u32(8, 0x42);
         msix.write_u32(12, 0);
-        calls[0].lock().unwrap().clear();
+        calls[0].lock().clear();
 
         // Change data while still unmasked.
         msix.write_u32(8, 0x99);
 
-        let log = calls[0].lock().unwrap().clone();
+        let log = calls[0].lock().clone();
         assert!(log.contains(&RouteCall::SetMsi {
             address: 0xFEE00000,
             data: 0x99
