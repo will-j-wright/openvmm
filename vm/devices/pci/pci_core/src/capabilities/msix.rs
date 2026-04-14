@@ -483,8 +483,7 @@ impl MsixEmulator {
                                     "failed to clear MSI-X route on addr/data zeroed"
                                 );
                             }
-                        } else if let Err(e) =
-                            route.set_msi(entry.state.address, entry.state.data)
+                        } else if let Err(e) = route.set_msi(entry.state.address, entry.state.data)
                         {
                             tracelimit::warn_ratelimited!(
                                 error = ?e,

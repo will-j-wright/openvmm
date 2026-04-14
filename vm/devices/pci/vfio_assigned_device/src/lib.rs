@@ -629,10 +629,12 @@ impl PciConfigSpace for VfioAssignedPciDevice {
             // The emulator tracks the enable/function-mask bits; reading
             // hardware would return stale state since we don't forward
             // MSI-X control writes to the physical device.
-            offset if self.msix.as_ref().is_some_and(|m| {
-                let cap_end = m.cap_offset + 12; // MSI-X capability is 12 bytes
-                offset >= m.cap_offset && offset < cap_end
-            }) => {
+            offset
+                if self.msix.as_ref().is_some_and(|m| {
+                    let cap_end = m.cap_offset + 12; // MSI-X capability is 12 bytes
+                    offset >= m.cap_offset && offset < cap_end
+                }) =>
+            {
                 let msix = self.msix.as_ref().unwrap();
                 let cap_offset = offset - msix.cap_offset;
                 msix.capability.read_u32(cap_offset)
