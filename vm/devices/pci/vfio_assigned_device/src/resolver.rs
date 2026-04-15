@@ -64,38 +64,45 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
             .context("failed to set VFIO IOMMU type to Type1v2 (IOMMU required)")?;
 
         // Map guest RAM into the IOMMU for device DMA access. Each
-        // RAM range is identity-mapped (IOVA == GPA) so that device
+        // shareable region is identity-mapped (IOVA == GPA) so that device
         // DMA addresses match guest physical addresses.
-        let mem_layout = input
-            .mem_layout
-            .context("VFIO requires mem_layout in resolve params")?;
+        let sharing = input
+            .guest_memory
+            .sharing()
+            .context("VFIO requires shareable guest memory")?;
+
+        let regions = sharing
+            .get_regions()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("failed to get shareable guest memory regions")?;
 
         let (base_va, va_size) = input
             .guest_memory
             .full_mapping()
             .context("VFIO DMA mapping requires linearly mapped guest memory")?;
 
-        for ram_range in mem_layout.ram() {
-            let gpa_start = ram_range.range.start();
-            let size = ram_range.range.len();
-            let gpa_end = gpa_start
+        for region in &regions {
+            let gpa = region.guest_address;
+            let size = region.size;
+            let gpa_end = gpa
                 .checked_add(size)
-                .context("RAM range overflows u64")?;
+                .context("guest memory region overflows u64")?;
             anyhow::ensure!(
                 gpa_end <= va_size as u64,
-                "RAM range {:#x}..{:#x} exceeds guest memory mapping size {:#x}",
-                gpa_start,
+                "guest memory region {:#x}..{:#x} exceeds mapping size {:#x}",
+                gpa,
                 gpa_end,
                 va_size
             );
-            let vaddr = base_va as u64 + gpa_start;
-            container.map_dma(gpa_start, vaddr, size).with_context(|| {
+            let vaddr = base_va as u64 + gpa;
+            container.map_dma(gpa, vaddr, size).with_context(|| {
                 format!(
-                    "failed to map DMA for RAM range {:#x}..{:#x}",
-                    gpa_start, gpa_end
+                    "failed to map DMA for guest memory region {:#x}..{:#x}",
+                    gpa, gpa_end
                 )
             })?;
-            tracing::debug!(gpa_start, size, vaddr, "mapped guest RAM for VFIO DMA");
+            tracing::debug!(gpa, size, vaddr, "mapped guest RAM for VFIO DMA");
         }
 
         let driver = input.driver_source.simple();

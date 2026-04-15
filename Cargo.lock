@@ -5832,7 +5832,6 @@ dependencies = [
  "guestmem",
  "pci_core",
  "vm_resource",
- "vm_topology",
  "vmcore",
 ]
 

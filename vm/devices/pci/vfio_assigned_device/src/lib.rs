@@ -394,7 +394,11 @@ fn read_config_u32(
         anyhow::bail!("config read offset {offset:#x} out of range");
     }
     let mut buf = [0u8; 4];
-    file.read_at(&mut buf, config_offset + offset as u64)?;
+    let n = file.read_at(&mut buf, config_offset + offset as u64)?;
+    anyhow::ensure!(
+        n == 4,
+        "short config read at offset {offset:#x}: got {n} bytes"
+    );
     // VFIO config space reads return host-endian bytes on x86. Using
     // native endian is correct on LE platforms (x86, aarch64).
     Ok(u32::from_ne_bytes(buf))
@@ -410,7 +414,11 @@ fn write_config_u32(
     if (offset as u64) + 4 > config_size {
         anyhow::bail!("config write offset {offset:#x} out of range");
     }
-    file.write_at(&value.to_ne_bytes(), config_offset + offset as u64)?;
+    let n = file.write_at(&value.to_ne_bytes(), config_offset + offset as u64)?;
+    anyhow::ensure!(
+        n == 4,
+        "short config write at offset {offset:#x}: wrote {n} bytes"
+    );
     Ok(())
 }
 
@@ -701,13 +709,22 @@ impl MmioIntercept for VfioAssignedPciDevice {
             // Proxy to physical device BAR via pread.
             if let Some(region) = &self.bar_regions[bar as usize] {
                 if offset + data.len() as u64 <= region.size {
-                    if self
+                    match self
                         .vfio_device
                         .as_ref()
                         .read_at(data, region.vfio_offset + offset)
-                        .is_ok()
                     {
-                        return IoResult::Ok;
+                        Ok(n) if n == data.len() => return IoResult::Ok,
+                        Ok(n) => {
+                            tracelimit::warn_ratelimited!(
+                                bar,
+                                offset,
+                                expected = data.len(),
+                                actual = n,
+                                "VFIO BAR short read"
+                            );
+                        }
+                        Err(_) => {}
                     }
                 }
                 tracelimit::warn_ratelimited!(
@@ -735,18 +752,31 @@ impl MmioIntercept for VfioAssignedPciDevice {
             // Proxy to physical device BAR via pwrite.
             if let Some(region) = &self.bar_regions[bar as usize] {
                 if offset + data.len() as u64 <= region.size {
-                    if let Err(e) = self
+                    match self
                         .vfio_device
                         .as_ref()
                         .write_at(data, region.vfio_offset + offset)
                     {
-                        tracelimit::warn_ratelimited!(
-                            bar,
-                            offset,
-                            error = ?e,
-                            pci_id = self.pci_id.as_str(),
-                            "VFIO BAR write failed"
-                        );
+                        Ok(n) if n == data.len() => return IoResult::Ok,
+                        Ok(n) => {
+                            tracelimit::warn_ratelimited!(
+                                bar,
+                                offset,
+                                expected = data.len(),
+                                actual = n,
+                                pci_id = self.pci_id.as_str(),
+                                "VFIO BAR short write"
+                            );
+                        }
+                        Err(e) => {
+                            tracelimit::warn_ratelimited!(
+                                bar,
+                                offset,
+                                error = ?e,
+                                pci_id = self.pci_id.as_str(),
+                                "VFIO BAR write failed"
+                            );
+                        }
                     }
                     return IoResult::Ok;
                 }

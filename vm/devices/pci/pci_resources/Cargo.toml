@@ -12,7 +12,6 @@ chipset_device_resources.workspace = true
 pci_core.workspace = true
 guestmem.workspace = true
 vm_resource.workspace = true
-vm_topology.workspace = true
 vmcore.workspace = true
 
 [lints]

@@ -135,6 +135,8 @@ impl Container {
         use vfio_bindings::bindings::vfio::VFIO_DMA_MAP_FLAG_READ;
         use vfio_bindings::bindings::vfio::VFIO_DMA_MAP_FLAG_WRITE;
 
+        // SAFETY: sysconf(_SC_PAGESIZE) is always safe and returns the
+        // host page size.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let page_mask = page_size - 1;
         anyhow::ensure!(

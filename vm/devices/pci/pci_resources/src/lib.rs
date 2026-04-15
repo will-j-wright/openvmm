@@ -15,7 +15,6 @@ use pci_core::msi::MsiTarget;
 use std::sync::Arc;
 use vm_resource::CanResolveTo;
 use vm_resource::kind::PciDeviceHandleKind;
-use vm_topology::memory::MemoryLayout;
 use vmcore::irqfd::IrqFd;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -46,9 +45,6 @@ pub struct ResolvePciDeviceHandleParams<'a> {
     pub doorbell_registration: Option<Arc<dyn DoorbellRegistration>>,
     /// An object with which to register shared memory regions.
     pub shared_mem_mapper: Option<&'a dyn MemoryMapper>,
-    /// The VM's memory layout (RAM ranges, MMIO gaps). Used by device
-    /// passthrough resolvers that need to set up DMA identity mappings.
-    pub mem_layout: Option<&'a MemoryLayout>,
     /// irqfd interface for kernel-mediated interrupt delivery. Used by
     /// device passthrough resolvers (VFIO, vhost-user) for irqfd-based
     /// MSI injection.
