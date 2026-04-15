@@ -513,6 +513,7 @@ impl VmService {
             firmware_event_send: None,
             debugger_rpc: None,
             chipset_devices: chipset.chipset_devices,
+            chipset_capabilities: chipset.capabilities,
             generation_id_recv: None,
             rtc_delta_milliseconds: 0,
             automatic_guest_reset: true,

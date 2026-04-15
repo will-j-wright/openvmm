@@ -854,6 +854,7 @@ async fn vm_config_from_command_line(
     let VmChipsetResult {
         chipset,
         mut chipset_devices,
+        capabilities,
     } = chipset
         .build()
         .context("failed to build chipset configuration")?;
@@ -1577,6 +1578,7 @@ async fn vm_config_from_command_line(
         }),
         vmbus_devices,
         chipset_devices,
+        chipset_capabilities: capabilities,
         #[cfg(windows)]
         vpci_resources,
         vmgs,
