@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+/// The PCI bus name used by the Gen1 (i440BX + PIIX4) chipset.
+pub const LEGACY_CHIPSET_PCI_BUS_NAME: &str = "i440bx";
+
 pub mod i8042 {
     //! Resource definitions for the i8042 PS2 keyboard/mouse controller.
 
@@ -106,5 +109,24 @@ pub mod battery {
                 ac_online: true,
             }
         }
+    }
+}
+
+pub mod piix4_uhci {
+    //! Resource definitions for the PIIX4 USB UHCI stub device.
+
+    use mesh::MeshPayload;
+    use vm_resource::ResourceId;
+    use vm_resource::kind::ChipsetDeviceHandleKind;
+
+    /// A handle to the PIIX4 USB UHCI stub controller.
+    #[derive(MeshPayload)]
+    pub struct Piix4PciUsbUhciStubDeviceHandle;
+
+    /// The fixed BDF used by the PIIX4 USB UHCI stub in the Gen1 chipset.
+    pub const PIIX4_PCI_USB_UHCI_STUB_BDF: (u8, u8, u8) = (0, 7, 2);
+
+    impl ResourceId<ChipsetDeviceHandleKind> for Piix4PciUsbUhciStubDeviceHandle {
+        const ID: &'static str = "piix4PciUsbUhciStub";
     }
 }

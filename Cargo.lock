@@ -648,6 +648,8 @@ version = "0.0.0"
 dependencies = [
  "chipset",
  "chipset_device",
+ "chipset_device_resources",
+ "chipset_resources",
  "floppy",
  "floppy_pcat_stub",
  "guestmem",
@@ -662,6 +664,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
+ "vm_resource",
  "vmcore",
 ]
 
@@ -5218,6 +5221,7 @@ dependencies = [
  "chipset_device_resources",
  "chipset_device_worker",
  "chipset_legacy",
+ "chipset_resources",
  "closeable_mutex",
  "crc32fast",
  "debug_ptr",
@@ -5429,6 +5433,7 @@ version = "0.0.0"
 dependencies = [
  "build_rs_guest_arch",
  "chipset",
+ "chipset_legacy",
  "debug_worker",
  "disk_striped",
  "hyperv_ic",
@@ -5502,6 +5507,7 @@ version = "0.0.0"
 dependencies = [
  "build_rs_guest_arch",
  "chipset",
+ "chipset_legacy",
  "debug_worker",
  "disk_blob",
  "disk_crypt",
