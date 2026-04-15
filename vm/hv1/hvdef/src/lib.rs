@@ -4096,12 +4096,14 @@ pub struct HvX64RegisterPage {
     pub is_valid: u8,
     pub vtl: u8,
     pub dirty: HvX64RegisterPageDirtyFlags,
+    /// General-purpose registers. These are in the order defined by the x86-64
+    /// architecture.
     pub gp_registers: [u64; 16],
     pub rip: u64,
     pub rflags: u64,
     pub reserved: u64,
     pub xmm: [u128; 6],
-    pub segment: [u128; 6],
+    pub segment: [HvX64SegmentRegister; 6],
     // Misc. control registers (cannot be set via this interface).
     pub cr0: u64,
     pub cr3: u64,
