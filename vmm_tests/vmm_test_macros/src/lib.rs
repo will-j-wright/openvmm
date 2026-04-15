@@ -174,11 +174,11 @@ impl ToTokens for PcatGuest {
         tokens.extend(match self {
             PcatGuest::Vhd(known_vhd) => {
                 let vhd = known_vhd.image_artifact.clone();
-                quote!(::petri::PcatGuest::Vhd(petri::BootImageConfig::from_vhd(resolver.require(#vhd))))
+                quote!(::petri::PcatGuest::Vhd(petri::BootImageConfig::from_vhd(resolver.require_source(#vhd, remote_access))))
             }
             PcatGuest::Iso(known_iso) => {
                 let iso = known_iso.image_artifact.clone();
-                quote!(::petri::PcatGuest::Iso(petri::BootImageConfig::from_iso(resolver.require(#iso))))
+                quote!(::petri::PcatGuest::Iso(petri::BootImageConfig::from_iso(resolver.require_source(#iso, remote_access))))
             }
         });
     }
@@ -199,7 +199,7 @@ impl ToTokens for UefiGuest {
         tokens.extend(match self {
             UefiGuest::Vhd(known_vhd) => {
                 let v = known_vhd.image_artifact.clone();
-                quote!(::petri::UefiGuest::Vhd(petri::BootImageConfig::from_vhd(resolver.require(#v))))
+                quote!(::petri::UefiGuest::Vhd(petri::BootImageConfig::from_vhd(resolver.require_source(#v, remote_access))))
             }
             UefiGuest::GuestTestUefi(arch) => {
                 let arch_tokens = arch_to_tokens(*arch);
@@ -857,6 +857,11 @@ fn make_vmm_test(args: ArgsWithOverrides, item: ItemFn) -> syn::Result<TokenStre
             ),
         };
 
+        let remote_access = match config.vmm {
+            Vmm::HyperV => quote!(::petri::RemoteAccess::LocalOnly),
+            Vmm::OpenVmm => quote!(::petri::RemoteAccess::Allow),
+        };
+
         let petri_vm_config = quote!(#petri_vm_config::new(params, artifacts, &driver)?);
         let unstable = config.unstable.to_token_stream();
 
@@ -865,6 +870,7 @@ fn make_vmm_test(args: ArgsWithOverrides, item: ItemFn) -> syn::Result<TokenStre
             ::petri::SimpleTest::new(
                 #name,
                 |resolver| {
+                    let remote_access = #remote_access;
                     let firmware = #firmware;
                     let arch = #arch;
                     let extra_deps = (#(resolver.require(#extra_deps),)*);

@@ -9981,6 +9981,7 @@ name = "vmm_test_images"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "petri_artifacts_core",
  "petri_artifacts_vmm_test",
  "serde",
 ]
