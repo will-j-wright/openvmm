@@ -16,6 +16,7 @@ use std::sync::Arc;
 use vm_resource::CanResolveTo;
 use vm_resource::kind::PciDeviceHandleKind;
 use vm_topology::memory::MemoryLayout;
+use vmcore::irqfd::IrqFd;
 use vmcore::vm_task::VmTaskDriverSource;
 
 impl CanResolveTo<ResolvedPciDevice> for PciDeviceHandleKind {
@@ -51,5 +52,5 @@ pub struct ResolvePciDeviceHandleParams<'a> {
     /// irqfd interface for kernel-mediated interrupt delivery. Used by
     /// device passthrough resolvers (VFIO, vhost-user) for irqfd-based
     /// MSI injection.
-    pub irqfd: Option<Arc<dyn virt::irqfd::IrqFd>>,
+    pub irqfd: Option<Arc<dyn IrqFd>>,
 }

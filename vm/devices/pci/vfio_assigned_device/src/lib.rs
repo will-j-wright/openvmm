@@ -23,13 +23,11 @@ use inspect::InspectMut;
 use pci_core::bar_mapping::BarMappings;
 use pci_core::capabilities::PciCapability;
 use pci_core::capabilities::msix::MsixEmulator;
-use pci_core::capabilities::msix::MsixRoute;
 use pci_core::msi::MsiTarget;
 use pci_core::spec::cfg_space;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use virt::irqfd::IrqFd;
-use virt::irqfd::IrqFdRoute;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::RestoreError;
 use vmcore::save_restore::SaveError;
@@ -338,9 +336,8 @@ impl VfioAssignedPciDevice {
 
     /// Set up irqfd-backed MSI-X interrupt delivery when the guest enables MSI-X.
     ///
-    /// Creates irqfd routes for each vector, installs them as MsixRoutes in the
-    /// emulator (so addr/data updates are handled automatically), then passes the
-    /// events to VFIO so the physical device signals the eventfds on interrupt.
+    /// Tells the emulator to create irqfd routes and passes the resulting
+    /// events to VFIO so the physical device signals them on interrupt.
     fn msix_enable(&mut self) -> anyhow::Result<()> {
         let msix = self.msix.as_mut().expect("msix must be present");
         let count = msix.vector_count;
@@ -351,31 +348,12 @@ impl VfioAssignedPciDevice {
             "MSI-X vector count ({count}) exceeds VFIO limit of 256"
         );
 
-        let mut irqfd_routes: Vec<Box<dyn IrqFdRoute>> = Vec::with_capacity(count as usize);
-
-        for i in 0..count {
-            let route = self
-                .irqfd
-                .new_irqfd_route()
-                .with_context(|| format!("failed to create irqfd route for MSI-X vector {i}"))?;
-            irqfd_routes.push(route);
-        }
-
-        // Collect event references from routes for VFIO map_msix.
-        let events: Vec<&pal_event::Event> = irqfd_routes.iter().map(|r| r.event()).collect();
-        self.vfio_device
-            .map_msix(0, &events)
-            .context("VFIO map_msix failed")?;
-
-        // Install routes in the emulator BEFORE updating the enabled flag.
-        // The emulator will call set_msi/mask/consume_pending on these routes
-        // when the guest modifies MSI-X table entries.
-        let msix = self.msix.as_mut().expect("msix must be present");
-        let routes: Vec<Box<dyn MsixRoute>> = irqfd_routes
-            .into_iter()
-            .map(|r| Box::new(IrqFdMsixRoute(r)) as Box<dyn MsixRoute>)
-            .collect();
-        msix.emulator.set_routes(routes);
+        let vfio_device = &self.vfio_device;
+        msix.emulator.enable_irqfd(self.irqfd.as_ref(), |events| {
+            vfio_device
+                .map_msix(0, events)
+                .context("VFIO map_msix failed")
+        })?;
 
         tracing::info!(
             count,
@@ -398,34 +376,11 @@ impl VfioAssignedPciDevice {
             );
         }
 
-        // Clearing routes drops the irqfd registrations and frees GSIs.
-        msix.emulator.clear_routes();
+        msix.emulator.disable_irqfd();
         tracing::info!(
             pci_id = self.pci_id.as_str(),
             "MSI-X disabled: unmapped vectors"
         );
-    }
-}
-
-/// Adapter wrapping an [`IrqFdRoute`] as a [`MsixRoute`] for use with
-/// [`MsixEmulator`].
-struct IrqFdMsixRoute(Box<dyn IrqFdRoute>);
-
-impl MsixRoute for IrqFdMsixRoute {
-    fn set_msi(&self, address: u64, data: u32) -> anyhow::Result<()> {
-        self.0.set_msi(address, data)
-    }
-
-    fn clear_msi(&self) -> anyhow::Result<()> {
-        self.0.clear_msi()
-    }
-
-    fn mask(&self) -> anyhow::Result<()> {
-        self.0.mask()
-    }
-
-    fn consume_pending(&self) -> bool {
-        self.0.consume_pending()
     }
 }
 
