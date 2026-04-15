@@ -5332,6 +5332,7 @@ dependencies = [
  "clap",
  "clap_dyn_complete",
  "console_relay",
+ "crypto",
  "debug_worker_defs",
  "diag_client",
  "dirs",
@@ -5363,7 +5364,6 @@ dependencies = [
  "net_tap",
  "netvsp_resources",
  "nvme_resources",
- "openssl",
  "openvmm_defs",
  "openvmm_helpers",
  "openvmm_pcat_locator",
@@ -8319,6 +8319,7 @@ dependencies = [
  "chipset_device_worker_defs",
  "chipset_legacy",
  "closeable_mutex",
+ "crypto",
  "cvm_tracing",
  "debug_ptr",
  "debug_worker_defs",
@@ -9845,6 +9846,7 @@ dependencies = [
 name = "vmgs_lib"
 version = "0.0.0"
 dependencies = [
+ "crypto",
  "disk_backend",
  "disk_vhd1",
  "futures",
@@ -9868,6 +9870,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "crypto",
  "disk_backend",
  "disk_vhd1",
  "fs-err",
