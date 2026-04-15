@@ -495,7 +495,7 @@ async fn vhost_user_blk_device<T>(
     use openvmm_defs::config::VirtioBus;
     use pal_async::pipe::PolledPipe;
     use pal_async::task::Spawn;
-    use virtio_resources::vhost_user::VhostUserDeviceHandle;
+    use virtio_resources::vhost_user::VhostUserBlkHandle;
     use vm_resource::IntoResource;
 
     let (openvmm_vhost_artifact,) = extra_deps;
@@ -573,9 +573,10 @@ async fn vhost_user_blk_device<T>(
     let stream =
         unix_socket::UnixStream::connect(&socket_path).context("connect to vhost-user socket")?;
 
-    let vhost_resource = VhostUserDeviceHandle {
+    let vhost_resource = VhostUserBlkHandle {
         socket: stream.into(),
-        device_id: 2, // VIRTIO_ID_BLOCK
+        num_queues: None,
+        queue_size: None,
     }
     .into_resource();
 
