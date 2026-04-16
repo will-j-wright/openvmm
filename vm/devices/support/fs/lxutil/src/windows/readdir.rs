@@ -709,18 +709,22 @@ impl DirectoryEnumerator {
                 break;
             }
 
-            // Try to grow the buffer. The size is guaranteed not to overflow as
-            // buffer_size is u32 and usize::MAX > u32::MAX.
+            // Try to grow the buffer.
             self.free_buffer();
+            let new_size = self
+                .buffer_size
+                .checked_add(BUFFER_EXTRA_SIZE as u32)
+                .ok_or(lx::Error::ENOMEM)?;
             let buf = unsafe {
                 FileSystem::RtlAllocateHeap(
                     Memory::GetProcessHeap().map_err(|_| lx::Error::ENOMEM)?.0,
                     None,
-                    self.buffer_size as usize + BUFFER_EXTRA_SIZE,
+                    new_size as usize,
                 )
             };
             assert!(!buf.is_null(), "out of memory");
             self.buffer = buf;
+            self.buffer_size = new_size;
         }
         Ok(iosb.Information as _)
     }
