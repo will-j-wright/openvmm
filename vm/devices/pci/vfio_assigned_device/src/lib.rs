@@ -587,15 +587,18 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                 let i = (offset - CFG_BAR0) as usize / 4;
                 self.bars[i]
             }
-            // MSI-X capability control register: return emulator state for
-            // the first DWORD only (which contains the enable/function-mask
-            // bits). The table offset (DWORD 1) and PBA offset (DWORD 2)
-            // must come from hardware — the emulator uses different offsets
-            // than the physical device, and the MMIO handler translates
-            // based on the physical offsets.
+            // MSI-X capability first DWORD: merge hardware ID/NextPtr (low
+            // 16 bits) with emulator's Message Control (high 16 bits). The
+            // emulator tracks the enable/function-mask bits; the hardware
+            // provides the correct capability ID and Next Pointer so the
+            // capability chain remains intact.
             offset if self.msix.as_ref().is_some_and(|m| offset == m.cap_offset) => {
                 let msix = self.msix.as_ref().unwrap();
-                msix.capability.read_u32(0)
+                let hw = self.read_phys_config(offset);
+                let emu = msix.capability.read_u32(0);
+                // Low 16 bits from hardware (cap ID + next ptr),
+                // high 16 bits from emulator (message control).
+                (hw & 0xFFFF) | (emu & 0xFFFF0000)
             }
             // Everything else: read from physical device.
             _ => self.read_phys_config(offset),

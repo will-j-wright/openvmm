@@ -137,7 +137,9 @@ impl Container {
 
         // SAFETY: sysconf(_SC_PAGESIZE) is always safe and returns the
         // host page size.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(page_size > 0, "sysconf(_SC_PAGESIZE) failed");
+        let page_size = page_size as u64;
         let page_mask = page_size - 1;
         anyhow::ensure!(
             iova & page_mask == 0 && vaddr & page_mask == 0 && size & page_mask == 0,
