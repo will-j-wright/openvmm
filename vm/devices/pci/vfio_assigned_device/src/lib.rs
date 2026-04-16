@@ -19,6 +19,7 @@ use chipset_device::ChipsetDevice;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::pci::PciConfigSpace;
+use inspect::Inspect;
 use inspect::InspectMut;
 use pci_core::bar_mapping::BarMappings;
 use pci_core::capabilities::PciCapability;
@@ -41,37 +42,47 @@ const CFG_STATUS_COMMAND: u16 = 0x04;
 const CFG_CAP_PTR: u16 = 0x34;
 
 /// VFIO BAR region information (offset and size within the device fd).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Inspect)]
 pub struct VfioBarInfo {
     /// Offset within the VFIO device fd where this BAR region starts.
+    #[inspect(hex)]
     pub vfio_offset: u64,
     /// Size of the BAR region in bytes.
+    #[inspect(hex)]
     pub size: u64,
 }
 
 /// MSI-X emulation state, discovered from the physical device's capabilities.
+#[derive(Inspect)]
 struct MsixEmulationState {
     /// Software MSI-X table emulator (handles table entries, PBA,
     /// enable/disable state transitions, and irqfd route management).
+    #[inspect(skip)]
     emulator: MsixEmulator,
     /// MSI-X PCI capability handler (shared state with emulator; used to
     /// forward config space writes so the emulator tracks enable/disable).
+    #[inspect(skip)]
     capability: Box<dyn PciCapability>,
     /// Offset of the MSI-X capability in PCI config space.
+    #[inspect(hex)]
     cap_offset: u16,
     /// Number of MSI-X vectors.
     vector_count: u16,
     /// BAR index containing the MSI-X table.
     table_bar: u8,
     /// Byte offset of the MSI-X table within its BAR.
+    #[inspect(hex)]
     table_offset: u32,
     /// Total size of the MSI-X table in bytes (vector_count * 16).
+    #[inspect(hex)]
     table_size: u64,
     /// BAR index containing the PBA.
     pba_bar: u8,
     /// Byte offset of the PBA within its BAR.
+    #[inspect(hex)]
     pba_offset: u32,
     /// Total size of the PBA in bytes.
+    #[inspect(hex)]
     pba_size: u64,
     /// Whether MSI-X is currently enabled by the guest.
     enabled: bool,
@@ -107,22 +118,21 @@ pub struct VfioAssignedPciDevice {
     config_size: u64,
 
     /// BAR masks as read from the physical device (write 0xFFFFFFFF, read back).
-    #[inspect(skip)]
+    #[inspect(iter_by_index, hex)]
     bar_masks: [u32; 6],
 
     /// Current BAR values as seen by the guest.
-    #[inspect(skip)]
+    #[inspect(iter_by_index, hex)]
     bars: [u32; 6],
 
     /// Low bits of each BAR that encode type/prefetch flags.
-    #[inspect(skip)]
+    #[inspect(iter_by_index, hex)]
     bar_flags: [u32; 6],
 
     /// Current MMIO-enabled state (from PCI Command register bit 1).
     mmio_enabled: bool,
 
     /// Decoded BAR mappings when MMIO is enabled.
-    #[inspect(skip)]
     active_bars: BarMappings,
 
     /// Chipset MMIO region controls per BAR — used to register/unregister
@@ -132,11 +142,10 @@ pub struct VfioAssignedPciDevice {
     bar_mmio_controls: Vec<Box<dyn chipset_device::mmio::ControlMmioIntercept>>,
 
     /// VFIO region info per BAR for MMIO proxying via pread/pwrite.
-    #[inspect(skip)]
+    #[inspect(iter_by_index)]
     bar_regions: [Option<VfioBarInfo>; 6],
 
     /// MSI-X emulation state (None if device has no MSI-X capability).
-    #[inspect(skip)]
     msix: Option<MsixEmulationState>,
 
     /// VFIO container and group handles. These must be kept alive for the
@@ -179,8 +188,8 @@ pub struct VfioAssignedPciDeviceConfig {
 impl VfioAssignedPciDevice {
     /// Create a new VFIO assigned PCI device.
     ///
-    /// Probes the physical device's BAR masks by writing 0xFFFFFFFF to each BAR
-    /// and reading back the result (standard PCI BAR sizing). Discovers MSI-X
+    /// Reads BAR flags from config space and derives BAR masks from the VFIO
+    /// region sizes (avoiding the write-all-ones probe cycle). Discovers MSI-X
     /// capability if present and creates a software emulator for it.
     pub fn new(config: VfioAssignedPciDeviceConfig) -> anyhow::Result<Self> {
         let vfio_device = config.vfio_device;
@@ -188,7 +197,9 @@ impl VfioAssignedPciDevice {
         let config_size = config.config_size;
         let device_file = vfio_device.as_ref();
 
-        // Read original BAR values and probe masks.
+        // Read BAR values and derive masks from VFIO region sizes.
+        // This avoids the standard write-all-ones probe cycle — VFIO already
+        // knows the BAR sizes from the host kernel.
         let mut bar_masks = [0u32; 6];
         let mut bars = [0u32; 6];
         let mut bar_flags = [0u32; 6];
@@ -196,42 +207,30 @@ impl VfioAssignedPciDevice {
         let mut i = 0;
         while i < 6 {
             let offset = CFG_BAR0 + (i as u16) * 4;
-
-            // Save original value.
             let original = read_config_u32(device_file, config_offset, config_size, offset)?;
             bars[i] = original;
+            bar_flags[i] = original & 0xf;
 
-            // Write all-ones to probe the mask.
-            write_config_u32(device_file, config_offset, config_size, offset, !0)?;
-            let mask = read_config_u32(device_file, config_offset, config_size, offset)?;
-
-            // Restore original value.
-            write_config_u32(device_file, config_offset, config_size, offset, original)?;
-
-            bar_masks[i] = mask;
-            bar_flags[i] = original & 0xf; // type (IO/Mem), locatable, prefetchable flags
+            // Derive the mask from the VFIO region size. For a BAR of size N
+            // (power of 2), the mask is ~(N - 1) with the low flag bits clear.
+            if let Some(info) = &config.bar_info[i] {
+                bar_masks[i] = (!(info.size as u32 - 1)) & !0xf;
+            }
 
             // Skip the upper 32 bits of a 64-bit BAR.
-            if cfg_space::BarEncodingBits::from_bits(mask).type_64_bit() {
+            if cfg_space::BarEncodingBits::from_bits(original).type_64_bit() {
                 if i + 1 < 6 {
                     let upper_offset = CFG_BAR0 + ((i + 1) as u16) * 4;
                     let upper_original =
                         read_config_u32(device_file, config_offset, config_size, upper_offset)?;
                     bars[i + 1] = upper_original;
-
-                    write_config_u32(device_file, config_offset, config_size, upper_offset, !0)?;
-                    let upper_mask =
-                        read_config_u32(device_file, config_offset, config_size, upper_offset)?;
-                    write_config_u32(
-                        device_file,
-                        config_offset,
-                        config_size,
-                        upper_offset,
-                        upper_original,
-                    )?;
-
-                    bar_masks[i + 1] = upper_mask;
                     bar_flags[i + 1] = 0;
+
+                    // Upper 32 bits of a 64-bit BAR: mask from the upper
+                    // portion of the size.
+                    if let Some(info) = &config.bar_info[i] {
+                        bar_masks[i + 1] = (!((info.size - 1) >> 32)) as u32;
+                    }
                 }
                 i += 2;
             } else {
