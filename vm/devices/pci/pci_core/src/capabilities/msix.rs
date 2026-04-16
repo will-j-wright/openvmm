@@ -228,28 +228,6 @@ impl MsiInterrupt {
         self.0.lock().route = None;
     }
 
-    /// Update the kernel route's MSI address/data without changing
-    /// enable/disable state. Called when addr/data changes while the
-    /// vector is already enabled.
-    pub(crate) fn update_route(&self, address: u64, data: u32) {
-        let state = self.0.lock();
-        if let Some(route) = &state.route {
-            if address == 0 && data == 0 {
-                if let Err(e) = route.clear_msi() {
-                    tracelimit::warn_ratelimited!(
-                        error = ?e,
-                        "failed to clear MSI-X route on addr/data zeroed"
-                    );
-                }
-            } else if let Err(e) = route.set_msi(address, data) {
-                tracelimit::warn_ratelimited!(
-                    error = ?e,
-                    "failed to update MSI-X route on addr/data change"
-                );
-            }
-        }
-    }
-
     pub fn interrupt(&self) -> Interrupt {
         let state = self.0.clone();
         Interrupt::from_fn(move || {
@@ -462,10 +440,8 @@ impl MsixEmulator {
                     // Vector just masked.
                     entry.msi.disable();
                 } else if is_enabled {
-                    // Still enabled. addr/data may have changed.
-                    entry
-                        .msi
-                        .update_route(entry.state.address, entry.state.data);
+                    // Still enabled. addr/data may have changed — enable()
+                    // will update the route if present.
                     entry
                         .msi
                         .enable(entry.state.address, entry.state.data, false);

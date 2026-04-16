@@ -213,8 +213,10 @@ impl VfioAssignedPciDevice {
 
             // Derive the mask from the VFIO region size. For a BAR of size N
             // (power of 2), the mask is ~(N - 1) with the low flag bits clear.
+            // Use the full u64 size to avoid truncation for 64-bit BARs.
             if let Some(info) = &config.bar_info[i] {
-                bar_masks[i] = (!(info.size as u32 - 1)) & !0xf;
+                let mask64 = !(info.size.wrapping_sub(1));
+                bar_masks[i] = (mask64 as u32) & !0xf;
             }
 
             // Skip the upper 32 bits of a 64-bit BAR.
@@ -227,9 +229,10 @@ impl VfioAssignedPciDevice {
                     bar_flags[i + 1] = 0;
 
                     // Upper 32 bits of a 64-bit BAR: mask from the upper
-                    // portion of the size.
+                    // portion of the full 64-bit mask.
                     if let Some(info) = &config.bar_info[i] {
-                        bar_masks[i + 1] = (!((info.size - 1) >> 32)) as u32;
+                        let mask64 = !(info.size.wrapping_sub(1));
+                        bar_masks[i + 1] = (mask64 >> 32) as u32;
                     }
                 }
                 i += 2;
