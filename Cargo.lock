@@ -5396,6 +5396,7 @@ dependencies = [
  "uidevices_resources",
  "unicycle",
  "unix_socket",
+ "vfio_assigned_device_resources",
  "video_core",
  "virt_whp",
  "virtio_resources",
@@ -5547,6 +5548,7 @@ dependencies = [
  "storvsp",
  "tpm_device",
  "uidevices",
+ "vfio_assigned_device",
  "vhost_user_frontend",
  "virtio",
  "virtio_blk",
@@ -5824,12 +5826,14 @@ dependencies = [
 name = "pci_core"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "bitfield-struct 0.11.0",
  "chipset_device",
  "guestmem",
  "inspect",
  "mesh",
  "open_enum",
+ "pal_event",
  "parking_lot",
  "thiserror 2.0.16",
  "tracelimit",
@@ -8721,6 +8725,34 @@ name = "vfio-bindings"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7adc40b84dd8c9c8838758ea7611413a30a0f6c8c31aa865a6c13ac0ed089990"
+
+[[package]]
+name = "vfio_assigned_device"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chipset_device",
+ "inspect",
+ "pci_core",
+ "pci_resources",
+ "tracelimit",
+ "tracing",
+ "vfio-bindings",
+ "vfio_assigned_device_resources",
+ "vfio_sys",
+ "virt",
+ "vm_resource",
+ "vmcore",
+]
+
+[[package]]
+name = "vfio_assigned_device_resources"
+version = "0.0.0"
+dependencies = [
+ "mesh",
+ "vm_resource",
+]
 
 [[package]]
 name = "vfio_sys"

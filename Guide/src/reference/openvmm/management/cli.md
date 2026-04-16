@@ -138,3 +138,9 @@ For `--virtio-rng` and `--virtio-console`, use their separate PCIe port flags:
 --vhost-user /tmp/vhost-blk.sock,type=blk,pcie_port=rp0
 --vhost-user /tmp/virtiofsd.sock,type=fs,tag=myfs,pcie_port=rp0
 ```
+
+**VFIO device assignment** (Linux only): `--vfio`
+
+```sh
+--vfio rp0:0000:01:00.0
+```

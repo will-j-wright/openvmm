@@ -1809,6 +1809,7 @@ impl InitializedVm {
                 partition.clone().into_doorbell_registration(Vtl::Vtl0),
                 Some(&mapper),
                 partition.as_signal_msi(Vtl::Vtl0),
+                partition.irqfd(),
             )
             .await?;
         }
@@ -2835,6 +2836,7 @@ impl LoadedVm {
                                                 guest_memory: &self.inner.gm,
                                                 doorbell_registration: self.inner.partition.clone().into_doorbell_registration(Vtl::Vtl0),
                                                 shared_mem_mapper: None,
+                                                irqfd: self.inner.partition.irqfd(),
                                             },
                                         )
                                         .await
