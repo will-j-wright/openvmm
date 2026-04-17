@@ -279,7 +279,9 @@ pub fn check_security(
         if status == Foundation::STATUS_BUFFER_TOO_SMALL {
             current_size = length_needed as usize;
             LX_UTIL_FS_SECURITY_DESCRIPTOR_SIZE.store(current_size, Ordering::Relaxed);
-            sd.reserve_tail(current_size);
+            let tail_size =
+                current_size.saturating_sub(size_of::<Security::SECURITY_DESCRIPTOR>());
+            sd.reserve_tail(tail_size);
         } else {
             return Err(nt_status_to_lx(status));
         }

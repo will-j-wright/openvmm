@@ -888,10 +888,9 @@ pub fn read_link_length(file_handle: &OwnedHandle, state: &VolumeState) -> lx::R
                     // SAFETY: Accessing union field of type returned from Win32 API
                     let data_length =
                         unsafe { reparse_buffer.head.header.ReparseDataLength } as u32;
-                    if data_length < LX_UTIL_SYMLINK_TARGET_OFFSET {
-                        return Err(lx::Error::EIO);
-                    }
-                    Ok(data_length - LX_UTIL_SYMLINK_TARGET_OFFSET)
+                    data_length
+                        .checked_sub(LX_UTIL_SYMLINK_TARGET_OFFSET)
+                        .ok_or(lx::Error::EIO)
                 }
                 _ => Err(lx::Error::EIO),
             }
@@ -935,10 +934,9 @@ pub fn read_reparse_link(
                 LX_UTIL_SYMLINK_DATA_VERSION_2 => {
                     // SAFETY: Accessing union field of type returned from Win32 API
                     let data_length = unsafe { reparse_buffer.head.header.ReparseDataLength };
-                    if (data_length as u32) < LX_UTIL_SYMLINK_TARGET_OFFSET {
-                        return Err(lx::Error::EIO);
-                    }
-                    let path_length = data_length - LX_UTIL_SYMLINK_TARGET_OFFSET as u16;
+                    let path_length = data_length
+                        .checked_sub(LX_UTIL_SYMLINK_TARGET_OFFSET as u16)
+                        .ok_or(lx::Error::EIO)?;
                     if iosb.Information < LX_UTIL_SYMLINK_REPARSE_BASE_SIZE as usize
                         || iosb.Information
                             != REPARSE_DATA_BUFFER_HEADER_SIZE + data_length as usize
