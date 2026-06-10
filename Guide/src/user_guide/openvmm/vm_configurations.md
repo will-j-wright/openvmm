@@ -61,19 +61,19 @@ details on PCAT boot, including floppy and optical boot order.
 
 ## With OpenHCL (VTL2)
 
-To run with OpenHCL, add `--hv --vtl2` and `--igvm`. You don't need to
+To run with OpenHCL, add `--hv --vtl 2` and `--igvm`. You don't need to
 separately specify `--uefi` or `--pcat` — the IGVM file contains the OpenHCL
 paravisor, and most IGVM builds bundle the
 [mu_msvm UEFI firmware](../../reference/devices/firmware/mu_msvm_uefi.md)
 for VTL0 guest boot. The build recipe controls whether UEFI is included
 (see [IGVM architecture](../../reference/architecture/openhcl/igvm.md)).
 
-Note: `--vtl2` requires `--hv` to be passed explicitly on the command line,
+Note: `--vtl 2` requires `--hv` to be passed explicitly on the command line,
 even though other flags like `--uefi` imply it internally.
 
 ```bash
 cargo run -- \
-  --hv --vtl2 \
+  --hv --vtl 2 \
   --igvm path/to/openhcl.igvm \
   --vmbus-scsi id=scsi0 \
   --disk memdiff:file:path/to/disk.vhdx,on=scsi0 \
@@ -97,6 +97,6 @@ for full setup instructions.
 | Modern Windows/Linux guest | `--uefi --vmbus-scsi id=scsi0 --disk memdiff:file:disk.vhdx,on=scsi0` | Most common |
 | With graphical console | add `--gfx` | VNC-based, see [Graphical Console](../../reference/openvmm/graphical_console.md) |
 | With networking | add `--nic` | Consomme user-mode NAT |
-| With OpenHCL | `--hv --vtl2 --igvm path/to/openhcl.igvm --vmbus-scsi id=scsi0 --disk memdiff:file:disk.vhdx,on=scsi0` | IGVM carries the paravisor; no `--uefi`/`--pcat` needed |
+| With OpenHCL | `--hv --vtl 2 --igvm path/to/openhcl.igvm --vmbus-scsi id=scsi0 --disk memdiff:file:disk.vhdx,on=scsi0` | IGVM carries the paravisor; no `--uefi`/`--pcat` needed |
 | Legacy OS (DOS, old Windows) | `--pcat --ide memdiff:file:disk.vhd --gfx` | IDE storage, BIOS boot |
 | Linux direct boot (no firmware) | `--kernel vmlinux --initrd initrd` | Skips UEFI/PCAT entirely |

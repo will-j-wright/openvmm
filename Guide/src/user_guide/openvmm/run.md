@@ -180,7 +180,7 @@ This places `openvmm.exe` and `openhcl-x64-test-linux-direct.bin` in the
 ```powershell
 .\openvmm.exe `
     --hv `
-    --vtl2 `
+    --vtl 2 `
     --igvm openhcl-x64-test-linux-direct.bin `
     -c "panic=-1 reboot=triple UNDERHILL_SERIAL_WAIT_FOR_RTS=1 UNDERHILL_CMDLINE_APPEND=rdinit=/bin/sh" `
     -m 2GB `

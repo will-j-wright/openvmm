@@ -86,6 +86,7 @@ use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
+use openvmm_defs::config::VsmConfig;
 use openvmm_defs::config::Vtl2Config;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
@@ -231,10 +232,12 @@ async fn vm_config_from_command_line(
     opt: &Options,
 ) -> anyhow::Result<(Config, VmResources)> {
     opt.validate_isolation_options()?;
+    opt.validate_vtl_options()?;
+    let vtl2_enabled = opt.vtl2_enabled();
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
 
-    let openhcl_vtl = if opt.vtl2 {
+    let openhcl_vtl = if vtl2_enabled {
         DeviceVtl::Vtl2
     } else {
         DeviceVtl::Vtl0
@@ -464,7 +467,7 @@ async fn vm_config_from_command_line(
         );
     }
 
-    let with_get = opt.get || (opt.vtl2 && !opt.no_get);
+    let with_get = opt.get || (vtl2_enabled && !opt.no_get);
 
     let mut storage = storage_builder::StorageBuilder::new(with_get.then_some(openhcl_vtl));
 
@@ -1489,7 +1492,7 @@ async fn vm_config_from_command_line(
         ]);
     }
 
-    if opt.tpm && !opt.vtl2 {
+    if opt.tpm && !vtl2_enabled {
         let register_layout = if cfg!(guest_arch = "x86_64") {
             TpmRegisterLayout::IoPort
         } else {
@@ -1623,7 +1626,7 @@ async fn vm_config_from_command_line(
         match isolation {
             cli_args::IsolationCli::Vbs => {
                 // TODO: For now, VBS isolation is only supported with VTL2.
-                if !opt.vtl2 {
+                if !vtl2_enabled {
                     anyhow::bail!("VBS isolation is only currently supported with vtl2");
                 }
 
@@ -1990,7 +1993,10 @@ async fn vm_config_from_command_line(
         },
         hypervisor: HypervisorConfig {
             with_hv,
-            with_vtl2: opt.vtl2.then_some(Vtl2Config {
+            with_vsm: opt.whp_vsm.then(|| VsmConfig {
+                max_vtl: opt.selected_vtl().expect("--whp-vsm requires --vtl"),
+            }),
+            with_vtl2: vtl2_enabled.then_some(Vtl2Config {
                 vtl0_alias_map: !opt.no_alias_map,
                 late_map_vtl0_memory: match opt.late_map_vtl0_policy {
                     cli_args::Vtl0LateMapPolicyCli::Off => None,
@@ -2019,7 +2025,7 @@ async fn vm_config_from_command_line(
             #[cfg(windows)]
             vmbusproxy_handle,
         }),
-        vtl2_vmbus: (with_hv && opt.vtl2).then_some(VmbusConfig {
+        vtl2_vmbus: (with_hv && vtl2_enabled).then_some(VmbusConfig {
             vsock_listener: vtl2_vsock_listener,
             vsock_path: opt.vmbus_vtl2_vsock_path.clone(),
             ..Default::default()
@@ -2796,7 +2802,7 @@ async fn run_control_inner(
         DiagDialer {
             driver: driver.clone(),
             vm_rpc: vm_rpc.clone(),
-            openhcl_vtl: if opt.vtl2 {
+            openhcl_vtl: if opt.vtl2_enabled() {
                 DeviceVtl::Vtl2
             } else {
                 DeviceVtl::Vtl0

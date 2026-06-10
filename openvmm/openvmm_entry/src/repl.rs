@@ -1156,7 +1156,7 @@ pub(crate) async fn run_repl(
                 vtl0_lun,
             } => {
                 if !has_vtl2 {
-                    eprintln!("error: add-nvme-ns requires --vtl2 mode");
+                    eprintln!("error: add-nvme-ns requires --vtl 2 mode");
                     continue;
                 }
                 let action = async {
@@ -1226,7 +1226,7 @@ pub(crate) async fn run_repl(
             }
             InteractiveCommand::RmNvmeNs { nsid, vtl0 } => {
                 if !has_vtl2 {
-                    eprintln!("error: rm-nvme-ns requires --vtl2 mode");
+                    eprintln!("error: rm-nvme-ns requires --vtl 2 mode");
                     continue;
                 }
                 let action = async {

@@ -138,6 +138,27 @@ pub struct NumaDistanceCli {
     pub distance: u8,
 }
 
+/// Highest virtual trust level enabled for the guest.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum VtlCli {
+    /// Enable VTL1.
+    #[value(name = "1")]
+    Vtl1,
+    /// Enable VTL2.
+    #[value(name = "2")]
+    Vtl2,
+}
+
+impl VtlCli {
+    /// Convert to the shared configuration representation.
+    pub fn device_vtl(self) -> DeviceVtl {
+        match self {
+            Self::Vtl1 => DeviceVtl::Vtl1,
+            Self::Vtl2 => DeviceVtl::Vtl2,
+        }
+    }
+}
+
 /// OpenVMM virtual machine monitor.
 ///
 /// This is not yet a stable interface and may change radically between
@@ -299,11 +320,21 @@ Examples:
     #[clap(long, conflicts_with_all = ["uefi", "pcat", "igvm"])]
     pub device_tree: bool,
 
-    /// enable vtl2 - only supported in WHP and simulated without hypervisor support currently
+    /// enable the specified maximum VTL
     ///
-    /// Currently implies --get.
-    #[clap(long, requires("hv"))]
-    pub vtl2: bool,
+    /// VTL1 requires --whp-vsm. VTL2 implies --get.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "VTL",
+        requires("hv"),
+        requires_if("1", "whp_vsm")
+    )]
+    pub vtl: Option<VtlCli>,
+
+    /// use WHP VSM for the VTL selected by --vtl
+    #[clap(long, requires_all = ["hv", "vtl"])]
+    pub whp_vsm: bool,
 
     /// Add GET and related devices for using the OpenHCL paravisor to the
     /// highest enabled VTL.
@@ -311,7 +342,7 @@ Examples:
     pub get: bool,
 
     /// Disable GET and related devices for using the OpenHCL paravisor, even
-    /// when --vtl2 is passed.
+    /// when --vtl 2 is passed.
     #[clap(long, conflicts_with("get"))]
     pub no_get: bool,
 
@@ -325,7 +356,6 @@ Examples:
             "vmbus_max_version",
             "vmbus_com1_serial",
             "vmbus_com2_serial",
-            "vtl2",
             "get",
             "pcat",
         ],
@@ -333,11 +363,11 @@ Examples:
     pub no_vmbus: bool,
 
     /// disable the VTL0 alias map presented to VTL2 by default
-    #[clap(long, requires("vtl2"))]
+    #[clap(long, requires("vtl"))]
     pub no_alias_map: bool,
 
     /// enable isolation
-    #[clap(long)]
+    #[clap(long, conflicts_with("whp_vsm"))]
     pub isolation: Option<IsolationCli>,
 
     /// the hybrid vsock listener path
@@ -345,11 +375,11 @@ Examples:
     pub vmbus_vsock_path: Option<String>,
 
     /// the VTL2 hybrid vsock listener path
-    #[clap(long, value_name = "PATH", requires("vtl2"), alias = "vtl2-vsock-path")]
+    #[clap(long, value_name = "PATH", requires("vtl"), alias = "vtl2-vsock-path")]
     pub vmbus_vtl2_vsock_path: Option<String>,
 
     /// the late map vtl0 ram access policy when vtl2 is enabled
-    #[clap(long, requires("vtl2"), default_value = "halt")]
+    #[clap(long, requires("vtl"), default_value = "halt")]
     pub late_map_vtl0_policy: Vtl0LateMapPolicyCli,
 
     /// attach a disk (can be passed multiple times)
@@ -583,7 +613,7 @@ options:
     pub gfx: bool,
 
     /// support a graphics device in vtl2
-    #[clap(long, requires("vtl2"), conflicts_with("gfx"))]
+    #[clap(long, requires("vtl"), conflicts_with("gfx"))]
     pub vtl2_gfx: bool,
 
     /// VNC server configuration (listen address, port, client limit, etc.).
@@ -877,7 +907,7 @@ Examples:
     pub internal_worker: Option<Option<String>>,
 
     /// redirect the VTL 0 vmbus control plane to a proxy in VTL 2.
-    #[clap(long, requires("vtl2"))]
+    #[clap(long, requires("vtl"))]
     pub vmbus_redirect: bool,
 
     /// limit the maximum protocol version allowed by vmbus; used for testing purposes
@@ -1331,6 +1361,47 @@ Syntax: id=<name>
 }
 
 impl Options {
+    /// Returns whether VTL2 is enabled.
+    pub fn vtl2_enabled(&self) -> bool {
+        self.vtl == Some(VtlCli::Vtl2)
+    }
+
+    /// Returns the selected maximum VTL.
+    pub fn selected_vtl(&self) -> Option<DeviceVtl> {
+        self.vtl.map(VtlCli::device_vtl)
+    }
+
+    /// Validates VTL and WHP VSM option combinations.
+    pub fn validate_vtl_options(&self) -> anyhow::Result<()> {
+        if self.vtl == Some(VtlCli::Vtl1) && !self.whp_vsm {
+            anyhow::bail!("--vtl 1 requires --whp-vsm");
+        }
+        if self.whp_vsm && self.vtl.is_none() {
+            anyhow::bail!("--whp-vsm requires --vtl");
+        }
+        if !self.vtl2_enabled() {
+            if self.no_alias_map {
+                anyhow::bail!("--no-alias-map requires --vtl 2");
+            }
+            if self.isolation.is_some() {
+                anyhow::bail!("--isolation requires --vtl 2");
+            }
+            if self.vmbus_vtl2_vsock_path.is_some() {
+                anyhow::bail!("--vmbus-vtl2-vsock-path requires --vtl 2");
+            }
+            if self.vtl2_gfx {
+                anyhow::bail!("--vtl2-gfx requires --vtl 2");
+            }
+            if self.vmbus_redirect {
+                anyhow::bail!("--vmbus-redirect requires --vtl 2");
+            }
+        }
+        if self.no_vmbus && self.vtl2_enabled() {
+            anyhow::bail!("--no-vmbus conflicts with --vtl 2");
+        }
+        Ok(())
+    }
+
     /// Returns the effective guest RAM size.
     pub fn memory_size(&self) -> u64 {
         self.memory.size.map(|m| m.0).unwrap_or(DEFAULT_MEMORY_SIZE)
@@ -4992,6 +5063,48 @@ mod tests {
     fn test_pidfile_option_parsed() {
         let opt = Options::try_parse_from(["openvmm", "--pidfile", "/tmp/test.pid"]).unwrap();
         assert_eq!(opt.pidfile, Some(PathBuf::from("/tmp/test.pid")));
+    }
+
+    #[test]
+    fn test_whp_vsm_cli_requires_hv_and_vtl() {
+        let opt = Options::try_parse_from(["openvmm", "--hv", "--whp-vsm", "--vtl", "1"]).unwrap();
+        assert!(opt.whp_vsm);
+        assert_eq!(opt.vtl, Some(VtlCli::Vtl1));
+        opt.validate_vtl_options().unwrap();
+
+        assert!(Options::try_parse_from(["openvmm", "--whp-vsm", "--vtl", "1"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--hv", "--whp-vsm"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--hv", "--vtl", "1"]).is_err());
+    }
+
+    #[test]
+    fn test_vtl_cli_supports_legacy_and_whp_vsm_vtl2() {
+        let legacy = Options::try_parse_from(["openvmm", "--hv", "--vtl", "2"]).unwrap();
+        assert!(!legacy.whp_vsm);
+        assert!(legacy.vtl2_enabled());
+        legacy.validate_vtl_options().unwrap();
+
+        let whp_vsm =
+            Options::try_parse_from(["openvmm", "--hv", "--whp-vsm", "--vtl", "2"]).unwrap();
+        assert!(whp_vsm.whp_vsm);
+        assert!(whp_vsm.vtl2_enabled());
+        whp_vsm.validate_vtl_options().unwrap();
+
+        assert!(Options::try_parse_from(["openvmm", "--hv", "--vtl", "0"]).is_err());
+        assert!(Options::try_parse_from(["openvmm", "--hv", "--vtl", "3"]).is_err());
+    }
+
+    #[test]
+    fn test_vtl2_only_options_reject_vtl1() {
+        for option in ["--no-alias-map", "--vtl2-gfx", "--vmbus-redirect"] {
+            let opt =
+                Options::try_parse_from(["openvmm", "--hv", "--whp-vsm", "--vtl", "1", option])
+                    .unwrap();
+            assert!(opt.validate_vtl_options().is_err(), "{option}");
+        }
+
+        let opt = Options::try_parse_from(["openvmm", "--hv", "--vtl", "2", "--no-vmbus"]).unwrap();
+        assert!(opt.validate_vtl_options().is_err());
     }
 
     #[test]

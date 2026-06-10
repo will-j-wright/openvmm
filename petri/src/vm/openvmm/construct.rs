@@ -657,6 +657,7 @@ impl PetriVmConfigOpenVmm {
             // Basic virtualization device support
             hypervisor: HypervisorConfig {
                 with_hv: !properties.no_hv,
+                with_vsm: None,
                 with_vtl2,
                 with_isolation: match firmware.isolation() {
                     Some(IsolationType::Vbs) => Some(openvmm_defs::config::IsolationType::Vbs),

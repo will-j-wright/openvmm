@@ -79,6 +79,7 @@ use openvmm_defs::config::ProcessorTopologyConfig;
 use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpciDeviceConfig;
+use openvmm_defs::config::VsmConfig;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::Vtl2Config;
 use openvmm_defs::config::X2ApicConfig;
@@ -947,7 +948,28 @@ fn convert_vtl2_config(
     Ok(Some(config))
 }
 
-/// A source for an SRAT generic-initiator entry.
+ fn device_vtl_to_vtl(vtl: DeviceVtl) -> Vtl {
+     match vtl {
+         DeviceVtl::Vtl0 => Vtl::Vtl0,
+         DeviceVtl::Vtl1 => Vtl::Vtl1,
+         DeviceVtl::Vtl2 => Vtl::Vtl2,
+     }
+ }
+
+ fn convert_vsm_config(
+     vsm_cfg: Option<&VsmConfig>,
+     vtl2_cfg: Option<&Vtl2Config>,
+ ) -> Option<virt::VsmConfig> {
+     if let Some(cfg) = vsm_cfg {
+         return Some(virt::VsmConfig {
+             max_vtl: device_vtl_to_vtl(cfg.max_vtl),
+         });
+     }
+
+     vtl2_cfg.map(|_| virt::VsmConfig { max_vtl: Vtl::Vtl2 })
+ }
+
+ /// A source for an SRAT generic-initiator entry.
 ///
 /// A generic-initiator entry declares that the device directly behind a named
 /// port (device 0, function 0 on the port's secondary bus) is a generic
@@ -1031,6 +1053,10 @@ impl InitializedVm {
 
             Some(virt::HvConfig {
                 allow_device_assignment,
+                vsm: convert_vsm_config(
+                    cfg.hypervisor.with_vsm.as_ref(),
+                    cfg.hypervisor.with_vtl2.as_ref(),
+                ),
                 vtl2: convert_vtl2_config(
                     cfg.hypervisor.with_vtl2.as_ref(),
                     &cfg.load_mode,
