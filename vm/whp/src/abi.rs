@@ -210,6 +210,10 @@ pub const WHvPartitionPropertyCodeAllowDeviceAssignment: WHV_PARTITION_PROPERTY_
     WHV_PARTITION_PROPERTY_CODE(0x0000000c);
 pub const WHvPartitionPropertyCodeDisableSmt: WHV_PARTITION_PROPERTY_CODE =
     WHV_PARTITION_PROPERTY_CODE(0x0000000d);
+pub const WHvPartitionPropertyCodeVtl1: WHV_PARTITION_PROPERTY_CODE =
+    WHV_PARTITION_PROPERTY_CODE(0x0000000f);
+pub const WHvPartitionPropertyCodeVtl2: WHV_PARTITION_PROPERTY_CODE =
+    WHV_PARTITION_PROPERTY_CODE(0x00000010);
 
 pub const WHvPartitionPropertyCodeProcessorFeatures: WHV_PARTITION_PROPERTY_CODE =
     WHV_PARTITION_PROPERTY_CODE(0x00001001);
@@ -263,6 +267,8 @@ pub const WHvPartitionPropertyCodeProcessorCount: WHV_PARTITION_PROPERTY_CODE =
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WHV_REGISTER_NAME(pub u32);
+
+pub const WHvRegisterVsmPartitionConfig: WHV_REGISTER_NAME = WHV_REGISTER_NAME(0x000D0007);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
@@ -463,7 +469,8 @@ impl WHV_SYNTHETIC_PROCESSOR_FEATURES {
     #[cfg(target_arch = "x86_64")]
     pub const EnableExtendedGvaRangesForFlushVirtualAddressList: Self = Self(1 << 15);
 
-    // pub const ReservedZ16: Self = Self(1 << 16);
+    /// Access to VSM. Corresponds to AccessVsm privilege.
+    pub const AccessVsm: Self = Self(1 << 16);
     // pub const ReservedZ17: Self = Self(1 << 17);
 
     /// Use fast hypercall output. Corresponds to privilege.
@@ -471,7 +478,9 @@ impl WHV_SYNTHETIC_PROCESSOR_FEATURES {
 
     // pub const ReservedZ19: Self = Self(1 << 19);
 
-    // pub const ReservedZ20: Self = Self(1 << 20);
+    /// HvCallStartVirtualProcessor is supported.
+    /// This feature only affects exo partitions.
+    pub const StartVirtualProcessor: Self = Self(1 << 20);
 
     // pub const ReservedZ21: Self = Self(1 << 21);
 
@@ -653,12 +662,119 @@ pub struct WHV_MEMORY_RANGE_ENTRY {
     pub SizeInBytes: u64,
 }
 
+pub type WHV_VTL = u8;
+pub const WHV_VTL_ALL: WHV_VTL = 0xf;
+
+#[repr(transparent)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct WHV_INPUT_VTL(pub u8);
+
+impl WHV_INPUT_VTL {
+    pub const fn current() -> Self {
+        Self(0)
+    }
+
+    pub const fn target(vtl: WHV_VTL) -> Self {
+        Self((vtl & 0xf) | 0x10)
+    }
+
+    pub const fn all() -> Self {
+        Self::target(WHV_VTL_ALL)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct WHV_ENABLE_PARTITION_VTL_FLAGS(pub u8);
+bitops!(WHV_ENABLE_PARTITION_VTL_FLAGS);
+
+impl WHV_ENABLE_PARTITION_VTL_FLAGS {
+    pub const EnableMbec: Self = Self(1 << 0);
+    pub const EnableSupervisorShadowStack: Self = Self(1 << 1);
+    pub const EnableHardwareHvpt: Self = Self(1 << 2);
+}
+
+#[repr(transparent)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct WHV_DISABLE_VP_VTL_FLAGS(pub u8);
+bitops!(WHV_DISABLE_VP_VTL_FLAGS);
+
+impl WHV_DISABLE_VP_VTL_FLAGS {
+    pub const ScrubOnly: Self = Self(1 << 0);
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct WHV_INITIAL_VP_CONTEXT {
+    #[cfg(target_arch = "aarch64")]
+    pub Pc: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub Sp_ELh: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub SCTLR_EL1: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub MAIR_EL1: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub TCR_EL1: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub VBAR_EL1: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub TTBR0_EL1: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub TTBR1_EL1: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub X18: u64,
+
+    #[cfg(target_arch = "x86_64")]
+    pub Rip: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub Rsp: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub Rflags: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub Cs: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Ds: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Es: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Fs: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Gs: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Ss: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Tr: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Ldtr: WHV_X64_SEGMENT_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Idtr: WHV_X64_TABLE_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Gdtr: WHV_X64_TABLE_REGISTER,
+    #[cfg(target_arch = "x86_64")]
+    pub Efer: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub Cr0: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub Cr3: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub Cr4: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub MsrCrPat: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct WHV_VTL_PERMISSION_SET {
+    pub VtlPermissionFrom1: [u16; 2],
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct WHV_SYNIC_EVENT_PARAMETERS {
     pub VpIndex: u32,
     pub TargetSint: u8,
-    pub Reserved: u8,
+    pub TargetVtl: WHV_VTL,
     pub FlagNumber: u16,
 }
 
@@ -752,7 +868,9 @@ pub const WHvNotificationPortTypeDoorbell: WHV_NOTIFICATION_PORT_TYPE =
 #[derive(Copy, Clone)]
 pub struct WHV_NOTIFICATION_PORT_PARAMETERS {
     pub NotificationPortType: WHV_NOTIFICATION_PORT_TYPE,
-    pub Reserved: u32,
+    pub Reserved: u16,
+    pub Reserved1: u8,
+    pub ConnectionVtl: WHV_VTL,
     pub u: WHV_NOTIFICATION_PORT_PARAMETERS_u,
 }
 

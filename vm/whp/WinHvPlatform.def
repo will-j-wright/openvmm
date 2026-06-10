@@ -17,3 +17,14 @@ EXPORTS
     WHvTranslateGva
     WHvMapGpaRange
     WHvUnmapGpaRange
+    WHvEnablePartitionVtl
+    WHvEnableVpVtl
+    WHvDisableVpVtl
+    WHvStartVirtualProcessor
+    WHvModifyVtlProtectionMask
+    WHvAcquireSparseGpaPageHostAccess
+    WHvReleaseSparseGpaPageHostAccess
+    WHvQueryVtlProtectionMaskRange
+    WHvModifyVtlProtectionMaskRange
+    WHvGetVirtualProcessorRegisters2
+    WHvSetVirtualProcessorRegisters2
