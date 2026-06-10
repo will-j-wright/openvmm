@@ -147,6 +147,24 @@ pub mod capabilities {
     pub fn reset_partition() -> bool {
         api::is_supported::WHvResetPartition()
     }
+
+    pub fn start_virtual_processor() -> bool {
+        api::is_supported::WHvStartVirtualProcessor()
+    }
+
+    pub fn vsm() -> bool {
+        api::is_supported::WHvEnablePartitionVtl()
+            && api::is_supported::WHvEnableVpVtl()
+            && api::is_supported::WHvDisableVpVtl()
+            && api::is_supported::WHvModifyVtlProtectionMask()
+            && api::is_supported::WHvAcquireSparseGpaPageHostAccess()
+            && api::is_supported::WHvReleaseSparseGpaPageHostAccess()
+            && api::is_supported::WHvQueryVtlProtectionMaskRange()
+            && api::is_supported::WHvModifyVtlProtectionMaskRange()
+            && api::is_supported::WHvGetVirtualProcessorRegisters2()
+            && api::is_supported::WHvSetVirtualProcessorRegisters2()
+            && start_virtual_processor()
+    }
 }
 
 #[non_exhaustive]
@@ -233,6 +251,8 @@ pub enum PartitionProperty<'a> {
     ProcessorFrequencyCap(u32),
     AllowDeviceAssignment(bool),
     DisableSmt(bool),
+    Vtl1(bool),
+    Vtl2(bool),
     ProcessorFeatures(ProcessorFeatures),
     ProcessorClFlushSize(u8),
     #[cfg(target_arch = "x86_64")]
@@ -409,6 +429,14 @@ impl Partition {
                 abi_bool = (*val).into();
                 set(partition_prop::DisableSmt, &abi_bool)
             }
+            PartitionProperty::Vtl1(val) => {
+                abi_bool = (*val).into();
+                set(partition_prop::Vtl1, &abi_bool)
+            }
+            PartitionProperty::Vtl2(val) => {
+                abi_bool = (*val).into();
+                set(partition_prop::Vtl2, &abi_bool)
+            }
             PartitionProperty::ProcessorFeatures(val) => {
                 let ProcessorFeatures {
                     bank0: b0,
@@ -561,6 +589,173 @@ impl Partition {
 
     pub fn unmap_range(&self, addr: u64, size: u64) -> Result<()> {
         unsafe { check_hresult(api::WHvUnmapGpaRange(self.handle, addr, size)) }
+    }
+
+    pub fn enable_partition_vtl(
+        &self,
+        vtl: abi::WHV_VTL,
+        flags: abi::WHV_ENABLE_PARTITION_VTL_FLAGS,
+    ) -> Result<()> {
+        unsafe { check_hresult(api::WHvEnablePartitionVtl(self.handle, vtl, flags)) }
+    }
+
+    pub fn enable_vp_vtl(
+        &self,
+        vp_index: u32,
+        vtl: abi::WHV_VTL,
+        vp_vtl_context: &abi::WHV_INITIAL_VP_CONTEXT,
+    ) -> Result<()> {
+        unsafe {
+            check_hresult(api::WHvEnableVpVtl(
+                self.handle,
+                vp_index,
+                vtl,
+                vp_vtl_context,
+            ))
+        }
+    }
+
+    pub fn disable_vp_vtl(
+        &self,
+        vp_index: u32,
+        vtl: abi::WHV_VTL,
+        flags: abi::WHV_DISABLE_VP_VTL_FLAGS,
+    ) -> Result<()> {
+        unsafe { check_hresult(api::WHvDisableVpVtl(self.handle, vp_index, vtl, flags)) }
+    }
+
+    pub fn start_virtual_processor(
+        &self,
+        vp_index: u32,
+        vtl: abi::WHV_VTL,
+        vp_context: &abi::WHV_INITIAL_VP_CONTEXT,
+    ) -> Result<()> {
+        unsafe {
+            check_hresult(api::WHvStartVirtualProcessor(
+                self.handle,
+                vp_index,
+                vtl,
+                vp_context,
+            ))
+        }
+    }
+
+    pub fn modify_vtl_protection_mask(
+        &self,
+        vp_index: u32,
+        map_flags: abi::WHV_MAP_GPA_RANGE_FLAGS,
+        guest_addresses: &[u64],
+        target_vtl: abi::WHV_INPUT_VTL,
+    ) -> Result<u64> {
+        if guest_addresses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pages_processed = 0;
+        unsafe {
+            check_hresult(api::WHvModifyVtlProtectionMask(
+                self.handle,
+                vp_index,
+                map_flags,
+                guest_addresses.as_ptr(),
+                guest_addresses.len() as u64,
+                target_vtl,
+                &mut pages_processed,
+            ))?;
+        }
+        Ok(pages_processed)
+    }
+
+    pub fn acquire_sparse_gpa_page_host_access(
+        &self,
+        host_access: abi::WHV_MAP_GPA_RANGE_FLAGS,
+        guest_addresses: &[u64],
+    ) -> Result<u64> {
+        if guest_addresses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pages_processed = 0;
+        unsafe {
+            check_hresult(api::WHvAcquireSparseGpaPageHostAccess(
+                self.handle,
+                host_access,
+                guest_addresses.as_ptr(),
+                guest_addresses.len() as u64,
+                &mut pages_processed,
+            ))?;
+        }
+        Ok(pages_processed)
+    }
+
+    pub fn release_sparse_gpa_page_host_access(
+        &self,
+        host_access: abi::WHV_MAP_GPA_RANGE_FLAGS,
+        guest_addresses: &[u64],
+    ) -> Result<u64> {
+        if guest_addresses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pages_processed = 0;
+        unsafe {
+            check_hresult(api::WHvReleaseSparseGpaPageHostAccess(
+                self.handle,
+                host_access,
+                guest_addresses.as_ptr(),
+                guest_addresses.len() as u64,
+                &mut pages_processed,
+            ))?;
+        }
+        Ok(pages_processed)
+    }
+
+    pub fn query_vtl_protection_mask_range(
+        &self,
+        guest_address: u64,
+        vtl_set: u16,
+        vtl_permissions: &mut [abi::WHV_VTL_PERMISSION_SET],
+    ) -> Result<u64> {
+        if vtl_permissions.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pages_processed = 0;
+        unsafe {
+            check_hresult(api::WHvQueryVtlProtectionMaskRange(
+                self.handle,
+                guest_address,
+                vtl_set,
+                vtl_permissions.as_mut_ptr(),
+                vtl_permissions.len() as u64,
+                &mut pages_processed,
+            ))?;
+        }
+        Ok(pages_processed)
+    }
+
+    pub fn modify_vtl_protection_mask_range(
+        &self,
+        guest_address: u64,
+        vtl_set: u16,
+        vtl_permissions: &[abi::WHV_VTL_PERMISSION_SET],
+    ) -> Result<u64> {
+        if vtl_permissions.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pages_processed = 0;
+        unsafe {
+            check_hresult(api::WHvModifyVtlProtectionMaskRange(
+                self.handle,
+                guest_address,
+                vtl_set,
+                vtl_permissions.as_ptr(),
+                vtl_permissions.len() as u64,
+                &mut pages_processed,
+            ))?;
+        }
+        Ok(pages_processed)
     }
 
     pub fn populate_ranges(
@@ -756,6 +951,8 @@ impl Partition {
                     abi::WHV_NOTIFICATION_PORT_PARAMETERS {
                         NotificationPortType: abi::WHvNotificationPortTypeEvent,
                         Reserved: 0,
+                        Reserved1: 0,
+                        ConnectionVtl: 0,
                         u: abi::WHV_NOTIFICATION_PORT_PARAMETERS_u {
                             Event: abi::WHV_NOTIFICATION_PORT_PARAMETERS_u_Event {
                                 ConnectionId: connection_id,
@@ -767,6 +964,8 @@ impl Partition {
                     abi::WHV_NOTIFICATION_PORT_PARAMETERS {
                         NotificationPortType: abi::WHvNotificationPortTypeDoorbell,
                         Reserved: 0,
+                        Reserved1: 0,
+                        ConnectionVtl: 0,
                         u: abi::WHV_NOTIFICATION_PORT_PARAMETERS_u {
                             Doorbell: match_data.data(),
                         },
@@ -1065,7 +1264,7 @@ impl From<TriggerParameters> for abi::WHV_TRIGGER_PARAMETERS {
                     SynicEvent: abi::WHV_SYNIC_EVENT_PARAMETERS {
                         VpIndex: vp_index,
                         TargetSint: sint,
-                        Reserved: 0,
+                        TargetVtl: 0,
                         FlagNumber: flag,
                     },
                 },
@@ -1458,6 +1657,54 @@ impl<'a> Processor<'a> {
         }
     }
 
+    pub fn set_registers_for_vtl(
+        &self,
+        input_vtl: abi::WHV_INPUT_VTL,
+        names: &[abi::WHV_REGISTER_NAME],
+        values: &[abi::WHV_REGISTER_VALUE],
+    ) -> Result<()> {
+        assert_eq!(names.len(), values.len());
+        if names.is_empty() {
+            Ok(())
+        } else {
+            unsafe {
+                check_hresult(api::WHvSetVirtualProcessorRegisters2(
+                    self.partition.handle,
+                    self.index,
+                    input_vtl,
+                    names.as_ptr(),
+                    names.len() as u32,
+                    values.as_ptr(),
+                ))
+            }
+        }
+    }
+
+    pub fn get_registers_for_vtl(
+        &self,
+        input_vtl: abi::WHV_INPUT_VTL,
+        names: &[abi::WHV_REGISTER_NAME],
+        values: &mut [abi::WHV_REGISTER_VALUE],
+    ) -> Result<()> {
+        if names.len() != values.len() {
+            panic!();
+        }
+        if names.is_empty() {
+            Ok(())
+        } else {
+            unsafe {
+                check_hresult(api::WHvGetVirtualProcessorRegisters2(
+                    self.partition.handle,
+                    self.index,
+                    input_vtl,
+                    names.as_ptr(),
+                    names.len() as u32,
+                    values.as_mut_ptr(),
+                ))
+            }
+        }
+    }
+
     pub fn get_register<T: RegisterName>(&self, v: T) -> Result<T::Value> {
         get_registers!(self, [v])
     }
@@ -1607,7 +1854,7 @@ impl<'a> Processor<'a> {
                 abi::WHV_SYNIC_EVENT_PARAMETERS {
                     VpIndex: self.index,
                     TargetSint: sint,
-                    Reserved: 0,
+                    TargetVtl: 0,
                     FlagNumber: flag,
                 },
                 &mut newly_signaled,
@@ -1696,6 +1943,10 @@ pub struct ProcessorRunner<'a> {
 
 impl ProcessorRunner<'_> {
     pub fn run(&mut self) -> Result<Exit<'_>> {
+        // WHP does not fully rewrite every bit of the exit context on every
+        // exit. Clear it first so stale bitfields from a previous exit do not
+        // leak into the next one.
+        self.ctx = unsafe { std::mem::zeroed() };
         unsafe {
             check_hresult(api::WHvRunVirtualProcessor(
                 self.vp.partition.handle,

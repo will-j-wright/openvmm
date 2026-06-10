@@ -47,6 +47,8 @@ pp! {
     (ProcessorFrequencyCap, WHvPartitionPropertyCodeProcessorFrequencyCap, u32),
     (AllowDeviceAssignment, WHvPartitionPropertyCodeAllowDeviceAssignment, BOOL),
     (DisableSmt, WHvPartitionPropertyCodeDisableSmt, BOOL),
+    (Vtl1, WHvPartitionPropertyCodeVtl1, BOOL),
+    (Vtl2, WHvPartitionPropertyCodeVtl2, BOOL),
 
     (ProcessorFeatures, WHvPartitionPropertyCodeProcessorFeatures, abi::WHV_PROCESSOR_FEATURES),
     (ProcessorClFlushSize, WHvPartitionPropertyCodeProcessorClFlushSize, u8),

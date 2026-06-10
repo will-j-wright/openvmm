@@ -223,6 +223,95 @@ pal::delayload!("WinHvPlatform.dll" {
         Flags: WHV_MAP_GPA_RANGE_FLAGS,
     ) -> HRESULT;
 
+    pub fn WHvEnablePartitionVtl(
+        Partition: WHV_PARTITION_HANDLE,
+        Vtl: WHV_VTL,
+        Flags: WHV_ENABLE_PARTITION_VTL_FLAGS,
+    ) -> HRESULT;
+
+    pub fn WHvEnableVpVtl(
+        Partition: WHV_PARTITION_HANDLE,
+        VpIndex: u32,
+        Vtl: WHV_VTL,
+        VpVtlContext: &WHV_INITIAL_VP_CONTEXT,
+    ) -> HRESULT;
+
+    pub fn WHvDisableVpVtl(
+        Partition: WHV_PARTITION_HANDLE,
+        VpIndex: u32,
+        Vtl: WHV_VTL,
+        Flags: WHV_DISABLE_VP_VTL_FLAGS,
+    ) -> HRESULT;
+
+    pub fn WHvStartVirtualProcessor(
+        Partition: WHV_PARTITION_HANDLE,
+        VpIndex: u32,
+        Vtl: WHV_VTL,
+        VpContext: &WHV_INITIAL_VP_CONTEXT,
+    ) -> HRESULT;
+
+    pub fn WHvModifyVtlProtectionMask(
+        Partition: WHV_PARTITION_HANDLE,
+        VpIndex: u32,
+        MapFlags: WHV_MAP_GPA_RANGE_FLAGS,
+        GuestAddressList: *const u64,
+        GuestAddressListCount: u64,
+        TargetVtl: WHV_INPUT_VTL,
+        PagesProcessed: &mut u64,
+    ) -> HRESULT;
+
+    pub fn WHvAcquireSparseGpaPageHostAccess(
+        Partition: WHV_PARTITION_HANDLE,
+        HostAccess: WHV_MAP_GPA_RANGE_FLAGS,
+        GuestAddressList: *const u64,
+        GuestAddressListCount: u64,
+        PagesProcessed: &mut u64,
+    ) -> HRESULT;
+
+    pub fn WHvReleaseSparseGpaPageHostAccess(
+        Partition: WHV_PARTITION_HANDLE,
+        HostAccess: WHV_MAP_GPA_RANGE_FLAGS,
+        GuestAddressList: *const u64,
+        GuestAddressListCount: u64,
+        PagesProcessed: &mut u64,
+    ) -> HRESULT;
+
+    pub fn WHvQueryVtlProtectionMaskRange(
+        Partition: WHV_PARTITION_HANDLE,
+        GuestAddress: u64,
+        VtlSet: u16,
+        VtlPermissionList: *mut WHV_VTL_PERMISSION_SET,
+        PageCount: u64,
+        PagesProcessed: &mut u64,
+    ) -> HRESULT;
+
+    pub fn WHvModifyVtlProtectionMaskRange(
+        Partition: WHV_PARTITION_HANDLE,
+        GuestAddress: u64,
+        VtlSet: u16,
+        VtlPermissionList: *const WHV_VTL_PERMISSION_SET,
+        PageCount: u64,
+        PagesProcessed: &mut u64,
+    ) -> HRESULT;
+
+    pub fn WHvGetVirtualProcessorRegisters2(
+        Partition: WHV_PARTITION_HANDLE,
+        VpIndex: u32,
+        InputVtl: WHV_INPUT_VTL,
+        RegisterNames: *const WHV_REGISTER_NAME,
+        RegisterCount: u32,
+        RegisterValues: *mut WHV_REGISTER_VALUE,
+    ) -> HRESULT;
+
+    pub fn WHvSetVirtualProcessorRegisters2(
+        Partition: WHV_PARTITION_HANDLE,
+        VpIndex: u32,
+        InputVtl: WHV_INPUT_VTL,
+        RegisterNames: *const WHV_REGISTER_NAME,
+        RegisterCount: u32,
+        RegisterValues: *const WHV_REGISTER_VALUE,
+    ) -> HRESULT;
+
     pub fn WHvStartPartitionMigration(
         Partition: WHV_PARTITION_HANDLE,
         MigrationHandle: *mut HANDLE,
