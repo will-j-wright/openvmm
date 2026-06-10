@@ -44,10 +44,16 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--hv`: Exposes Hyper-V enlightenments. VMBus is enabled by default
   when `--hv` is active; pass `--no-vmbus` to suppress VMBus while keeping
   enlightenments.
+* `--vtl <1|2>`: Enables the specified maximum virtual trust level. Requires
+  `--hv`. VTL1 additionally requires `--whp-vsm`. VTL2 uses the legacy
+  OpenHCL-specific VTL2 path unless `--whp-vsm` is also specified, and implies
+  `--get` unless `--no-get` is passed.
+* `--whp-vsm`: Uses WHP VSM for the VTL selected by `--vtl`. Requires both
+  `--hv` and `--vtl`. WHP VSM is currently incompatible with `--isolation`.
 * `--no-vmbus`: Disables the VMBus server and all VMBus devices, even when
   `--hv` or `--uefi` is active. The guest boots using only standard PCIe
   devices and virtio transports. Incompatible with `--disk`, `--pcat`,
-  `--vtl2`, and VMBus serial options.
+  `--vtl 2`, and VMBus serial options.
 * `--hypervisor <SPEC>`: Select a specific hypervisor backend, optionally with
   backend-specific parameters. The format is `name` or `name:key=val,key,...`.
   Available backends: `whp` (Windows), `kvm` (Linux), `mshv` (Linux,

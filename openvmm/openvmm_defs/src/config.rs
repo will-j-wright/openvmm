@@ -472,8 +472,23 @@ pub struct VmbusConfig {
 #[derive(Debug, MeshPayload, Default)]
 pub struct HypervisorConfig {
     pub with_hv: bool,
+    /// WHP VSM configuration.
+    ///
+    /// During migration this may be derived from [`Self::with_vtl2`], which
+    /// still carries legacy OpenHCL-specific VTL2 options.
+    pub with_vsm: Option<VsmConfig>,
     pub with_vtl2: Option<Vtl2Config>,
     pub with_isolation: Option<IsolationType>,
+}
+
+/// Configuration for WHP VSM.
+///
+/// This is separate from [`Vtl2Config`] so WHP VSM can be modeled as a
+/// VTL-generic feature instead of an OpenHCL-specific VTL2 path.
+#[derive(Debug, Clone, MeshPayload)]
+pub struct VsmConfig {
+    /// The highest VTL enabled for the guest partition.
+    pub max_vtl: DeviceVtl,
 }
 
 #[derive(Debug, MeshPayload)]

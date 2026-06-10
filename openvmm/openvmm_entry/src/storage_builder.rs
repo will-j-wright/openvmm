@@ -713,7 +713,7 @@ impl StorageBuilder {
                 .as_ref()
                 .is_none_or(|c| c.vtl0_alias_map)
             {
-                anyhow::bail!("must specify --vtl2 and --no-alias-map to offer disks to VTL2");
+                anyhow::bail!("must specify --vtl 2 and --no-alias-map to offer disks to VTL2");
             }
             config.vmbus_devices.push((
                 DeviceVtl::Vtl2,
@@ -825,7 +825,7 @@ impl StorageBuilder {
             .is_none_or(|c| c.vtl0_alias_map)
         {
             if !self.vtl2_nvme_namespaces.is_empty() {
-                anyhow::bail!("must specify --vtl2 and --no-alias-map to offer disks to VTL2");
+                anyhow::bail!("must specify --vtl 2 and --no-alias-map to offer disks to VTL2");
             }
         } else {
             // If VTL2 is being used, always add an NVMe controller, even

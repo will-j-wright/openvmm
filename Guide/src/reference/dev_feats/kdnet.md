@@ -27,7 +27,7 @@ cargo run -- --uefi --hv --net consomme \
   --disk memdiff:file:path/to/windows.vhdx,on=scsi0
 
 # With OpenHCL
-cargo run -- --uefi --hv --vtl2 --net consomme \
+cargo run -- --uefi --hv --vtl 2 --net consomme \
   --igvm path/to/openhcl.igvm \
   --vmbus-scsi id=scsi0 \
   --disk memdiff:file:path/to/windows.vhdx,on=scsi0
