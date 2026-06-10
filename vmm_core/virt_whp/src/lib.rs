@@ -19,6 +19,7 @@ mod synic;
 mod vm_state;
 mod vp;
 mod vp_state;
+mod vsm;
 mod vtl2;
 
 use crate::memory::vtl2_mapper::MappingState;
@@ -115,6 +116,7 @@ struct WhpPartitionInner {
     #[inspect(skip)]
     #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
     fault_resolver: Option<Arc<dyn virt::ResolveMemoryFault>>,
+    vsm: vsm::VsmController,
     vtl2_emulation: Option<vtl2::Vtl2Emulation>,
     #[cfg(guest_arch = "x86_64")]
     irq_routes: virt::irqcon::IrqRoutes,
@@ -792,6 +794,19 @@ struct WhpVpRef<'a> {
     index: VpIndex,
 }
 
+#[derive(Error, Debug)]
+pub enum VsmError {
+    #[error("WHP VSM requires a maximum VTL above VTL0")]
+    Vtl0Only,
+    #[cfg(not(guest_arch = "x86_64"))]
+    #[error("WHP VSM is currently only supported for x64 guests")]
+    UnsupportedArchitecture,
+    #[error("WHP VSM is incompatible with isolated partitions in this prototype")]
+    IncompatibleWithIsolation,
+    #[error("the host does not support the WHP VSM APIs")]
+    HostUnsupported,
+}
+
 // TODO: Chunk this up into smaller types.
 #[derive(Error, Debug)]
 pub enum Error {
@@ -831,6 +846,8 @@ pub enum Error {
     NestedVirtIncompatibleWithVtl2,
     #[error("nested_virt is incompatible with isolation")]
     NestedVirtIncompatibleWithIsolation,
+    #[error(transparent)]
+    Vsm(#[from] VsmError),
 }
 
 trait WhpResultExt<T> {
@@ -844,6 +861,10 @@ impl<T> WhpResultExt<T> for Result<T, whp::WHvError> {
             source: err,
         })
     }
+}
+
+fn use_legacy_vtl2(whp_vsm_configured: bool, vtl2_configured: bool) -> bool {
+    vtl2_configured && !whp_vsm_configured
 }
 
 impl virt::Hypervisor for Whp {
@@ -902,24 +923,33 @@ impl virt::Hypervisor for Whp {
             }
         }
 
+        let legacy_vtl2 = config
+            .hv_config
+            .as_ref()
+            .is_some_and(|cfg| use_legacy_vtl2(cfg.vsm.is_some(), cfg.vtl2.is_some()));
+        let mut vsm = vsm::VsmController::new(
+            config.hv_config.as_ref().and_then(|cfg| cfg.vsm.as_ref()),
+            legacy_vtl2,
+            config.processor_topology.vp_count(),
+            config.isolation,
+        )?;
+
         let vtl0 = VtlPartition::new(
             &config,
             Vtl::Vtl0,
             user_mode_apic,
             offload_enlightenments,
             nested_virt,
+            Some(&mut vsm),
         )?;
-        let vtl2 = if config
-            .hv_config
-            .as_ref()
-            .is_some_and(|cfg| cfg.vtl2.is_some())
-        {
+        let vtl2 = if legacy_vtl2 {
             Some(VtlPartition::new(
                 &config,
                 Vtl::Vtl2,
                 user_mode_apic,
                 offload_enlightenments,
                 nested_virt,
+                None,
             )?)
         } else {
             None
@@ -932,6 +962,7 @@ impl virt::Hypervisor for Whp {
             user_mode_apic,
             offload_enlightenments,
             nested_virt,
+            vsm,
         })
     }
 }
@@ -949,6 +980,7 @@ pub struct WhpProtoPartition<'a> {
     user_mode_apic: bool,
     offload_enlightenments: bool,
     nested_virt: bool,
+    vsm: vsm::VsmController,
 }
 
 impl ProtoPartition for WhpProtoPartition<'_> {
@@ -1002,6 +1034,7 @@ impl ProtoPartition for WhpProtoPartition<'_> {
             self.user_mode_apic,
             self.offload_enlightenments,
             self.nested_virt,
+            self.vsm,
         )?);
 
         let with_vtl0 = Arc::new(WhpPartitionAndVtl {
@@ -1092,6 +1125,7 @@ impl WhpPartitionInner {
         user_mode_apic: bool,
         offload_enlightenments: bool,
         nested_virt: bool,
+        vsm: vsm::VsmController,
     ) -> Result<Self, Error> {
         // These are validated by VtlPartition::new and only consumed on x86_64.
         let _ = (user_mode_apic, offload_enlightenments, nested_virt);
@@ -1300,6 +1334,7 @@ impl WhpPartitionInner {
             mem_layout: config.mem_layout.clone(),
             gm: config.guest_memory.clone(),
             fault_resolver: config.fault_resolver.clone(),
+            vsm,
             vtl2_emulation,
             #[cfg(guest_arch = "x86_64")]
             irq_routes: Default::default(),
@@ -1411,6 +1446,7 @@ impl VtlPartition {
         user_mode_apic: bool,
         offload_enlightenments: bool,
         nested_virt: bool,
+        mut vsm: Option<&mut vsm::VsmController>,
     ) -> Result<Self, Error> {
         #[cfg(not(guest_arch = "x86_64"))]
         {
@@ -1673,11 +1709,21 @@ impl VtlPartition {
             .set_property(whp::PartitionProperty::ExtendedVmExits(extended_exits))
             .for_op("set extended vm exits")?;
 
+        if let Some(vsm) = vsm.as_deref_mut().filter(|_| vtl == Vtl::Vtl0) {
+            vsm.set_partition_properties_before_setup(&mut whp_config)
+                .for_op("set WHP VSM partition properties")?;
+        }
+
         let whp = whp_config.create().for_op("set up partition")?;
 
         for vp in config.processor_topology.vps() {
             let index = vp.vp_index.index();
             whp.create_vp(index).create().for_op("create vp")?;
+        }
+
+        if let Some(vsm) = vsm.filter(|_| vtl == Vtl::Vtl0) {
+            vsm.enable_partition_vtls_after_setup(&whp)
+                .for_op("enable WHP VSM partition VTLs")?;
         }
 
         let vplcs = config
