@@ -116,7 +116,7 @@ struct WhpPartitionInner {
     #[inspect(skip)]
     #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
     fault_resolver: Option<Arc<dyn virt::ResolveMemoryFault>>,
-    vsm: vsm::VsmController,
+    vsm: Mutex<vsm::VsmController>,
     vtl2_emulation: Option<vtl2::Vtl2Emulation>,
     #[cfg(guest_arch = "x86_64")]
     irq_routes: virt::irqcon::IrqRoutes,
@@ -1334,7 +1334,7 @@ impl WhpPartitionInner {
             mem_layout: config.mem_layout.clone(),
             gm: config.guest_memory.clone(),
             fault_resolver: config.fault_resolver.clone(),
-            vsm,
+            vsm: Mutex::new(vsm),
             vtl2_emulation,
             #[cfg(guest_arch = "x86_64")]
             irq_routes: Default::default(),

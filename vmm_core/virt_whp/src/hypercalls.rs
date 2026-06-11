@@ -707,6 +707,7 @@ mod x86 {
     use super::WhpHypercallExit;
     use crate::WhpProcessor;
     use crate::regs;
+    use crate::vsm;
     use crate::vtl2;
     use arrayvec::ArrayVec;
     use hv1_hypercall::HvInterruptParameters;
@@ -721,8 +722,10 @@ mod x86 {
     use hvdef::HvInterceptAccessType;
     use hvdef::HvInterruptType;
     use hvdef::HvMessageType;
+    use hvdef::HvRegisterGuestVsmPartitionConfig;
     use hvdef::HvRegisterName;
     use hvdef::HvRegisterValue;
+    use hvdef::HvRegisterVsmPartitionConfig;
     use hvdef::HvRegisterVsmVpSecureVtlConfig;
     use hvdef::HvResult;
     use hvdef::HvVpAssistPageActionSignalEvent;
@@ -745,6 +748,104 @@ mod x86 {
     use zerocopy::FromBytes;
     use zerocopy::FromZeros;
     use zerocopy::IntoBytes;
+
+    fn whp_segment_register(
+        reg: hvdef::HvX64SegmentRegister,
+    ) -> whp::abi::WHV_X64_SEGMENT_REGISTER {
+        whp::abi::WHV_X64_SEGMENT_REGISTER {
+            Base: reg.base,
+            Limit: reg.limit,
+            Selector: reg.selector,
+            Attributes: reg.attributes,
+        }
+    }
+
+    fn whp_table_register(reg: hvdef::HvX64TableRegister) -> whp::abi::WHV_X64_TABLE_REGISTER {
+        whp::abi::WHV_X64_TABLE_REGISTER {
+            Pad: reg.pad,
+            Limit: reg.limit,
+            Base: reg.base,
+        }
+    }
+
+    fn whp_initial_vp_context(
+        context: &hvdef::hypercall::InitialVpContextX64,
+    ) -> whp::abi::WHV_INITIAL_VP_CONTEXT {
+        whp::abi::WHV_INITIAL_VP_CONTEXT {
+            Rip: context.rip,
+            Rsp: context.rsp,
+            Rflags: context.rflags,
+            Cs: whp_segment_register(context.cs),
+            Ds: whp_segment_register(context.ds),
+            Es: whp_segment_register(context.es),
+            Fs: whp_segment_register(context.fs),
+            Gs: whp_segment_register(context.gs),
+            Ss: whp_segment_register(context.ss),
+            Tr: whp_segment_register(context.tr),
+            Ldtr: whp_segment_register(context.ldtr),
+            Idtr: whp_table_register(context.idtr),
+            Gdtr: whp_table_register(context.gdtr),
+            Efer: context.efer,
+            Cr0: context.cr0,
+            Cr3: context.cr3,
+            Cr4: context.cr4,
+            MsrCrPat: context.msr_cr_pat,
+        }
+    }
+
+    fn vsm_access_error_to_hv_error(err: vsm::VpVtlAccessError) -> HvError {
+        let hv_error = match err {
+            vsm::VpVtlAccessError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
+            vsm::VpVtlAccessError::WhpDisabled => HvError::AccessDenied,
+            vsm::VpVtlAccessError::VtlNotEnabled { .. }
+            | vsm::VpVtlAccessError::VpVtlNotEnabled { .. }
+            | vsm::VpVtlAccessError::InvalidRegisterVtl { .. } => HvError::InvalidParameter,
+            vsm::VpVtlAccessError::InvalidRegisterValue => HvError::InvalidRegisterValue,
+        };
+        tracing::trace!(
+            error = &err as &dyn std::error::Error,
+            ?hv_error,
+            "WHP VSM access validation failed"
+        );
+        hv_error
+    }
+
+    fn vsm_register_error_to_hv_error(err: vsm::RegisterAccessError) -> HvError {
+        match err {
+            vsm::RegisterAccessError::Access(err) => vsm_access_error_to_hv_error(err),
+            vsm::RegisterAccessError::Whp(err) => {
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "WHP VSM register access failed"
+                );
+                err.hv_result()
+                    .map_or(HvError::InvalidParameter, HvError::from)
+            }
+        }
+    }
+
+    fn enable_vp_vtl_error_to_hv_error(err: vsm::EnableVpVtlError) -> HvError {
+        match err {
+            vsm::EnableVpVtlError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
+            vsm::EnableVpVtlError::AlreadyEnabled { .. } => HvError::VtlAlreadyEnabled,
+            vsm::EnableVpVtlError::NotEnabled { .. } => {
+                tracing::trace!(
+                    error = &err as &dyn std::error::Error,
+                    "WHP VSM VP VTL enable rejected"
+                );
+                HvError::InvalidParameter
+            }
+            vsm::EnableVpVtlError::Whp(err) => {
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to enable WHP VSM VP VTL"
+                );
+                err.hv_result()
+                    .map_or(HvError::OperationFailed, HvError::from)
+            }
+        }
+    }
+
     pub(super) struct WhpHypercallRegisters<'a> {
         info: whp::abi::WHV_HYPERCALL_CONTEXT,
         rip: u64,
@@ -1417,12 +1518,46 @@ mod x86 {
     {
         fn enable_vp_vtl(
             &mut self,
-            _partition_id: u64,
+            partition_id: u64,
             vp_index: u32,
             vtl: Vtl,
             vp_context: &hvdef::hypercall::InitialVpContextX64,
         ) -> HvResult<()> {
+            if partition_id != HV_PARTITION_ID_SELF {
+                return Err(HvError::AccessDenied);
+            }
+
             let vp_index = VpIndex::new(vp_index);
+            let partition = self.vp.vp.partition;
+            if partition.vsm.lock().is_whp() {
+                let initial_context = whp_initial_vp_context(vp_context);
+
+                tracing::debug!(vp_index = vp_index.index(), ?vtl, "enabling WHP VSM VTL");
+                partition
+                    .vsm
+                    .lock()
+                    .enable_vp_vtl(&partition.vtl0.whp, vp_index, vtl, &initial_context)
+                    .map_err(enable_vp_vtl_error_to_hv_error)?;
+
+                if vp_index != self.vp.vp.index {
+                    partition
+                        .vtl0
+                        .whp
+                        .vp(vp_index.index())
+                        .cancel_run()
+                        .map_err(|err| {
+                            tracing::error!(
+                                vp_index = vp_index.index(),
+                                error = &err as &dyn std::error::Error,
+                                "failed to cancel WHP VSM target VP"
+                            );
+                            HvError::OperationFailed
+                        })?;
+                }
+
+                return Ok(());
+            }
+
             if self.vp.state.active_vtl != Vtl::Vtl2 {
                 return Err(HvError::AccessDenied);
             }
@@ -1460,11 +1595,145 @@ mod x86 {
     }
 
     impl WhpProcessor<'_> {
+        fn get_whp_vsm_register(
+            &mut self,
+            vtl: Vtl,
+            name: HvRegisterName,
+        ) -> HvResult<Option<HvRegisterValue>> {
+            let partition = self.vp.partition;
+            let vsm = partition.vsm.lock();
+            if !vsm.is_whp() {
+                return Ok(None);
+            }
+
+            let value = match name.into() {
+                HvX64RegisterName::VsmPartitionConfig => {
+                    let config = vsm
+                        .vsm_partition_config(self.vp.index, vtl)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    u64::from(config).into()
+                }
+                HvX64RegisterName::GuestVsmPartitionConfig => {
+                    let config = vsm
+                        .guest_vsm_partition_config(self.vp.index, vtl)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    u64::from(config).into()
+                }
+                HvX64RegisterName::VsmVpStatus => {
+                    vsm.validate_vp_vtl_enabled(self.vp.index, vtl)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    let enabled_vtl_set = vsm
+                        .vp_enabled_vtl_bits(self.vp.index)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    let status = hvdef::HvRegisterVsmVpStatus::new()
+                        .with_active_vtl(self.state.active_vtl as u8)
+                        .with_active_mbec_enabled(false)
+                        .with_enabled_vtl_set(enabled_vtl_set);
+                    tracing::trace!(
+                        active_vtl = ?self.state.active_vtl,
+                        enabled_vtl_set,
+                        "WHP VSM VP status returned"
+                    );
+                    u64::from(status).into()
+                }
+                HvX64RegisterName::TimeRefCount => {
+                    vsm.validate_vp_vtl_enabled(self.vp.index, vtl)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    partition
+                        .vtl0
+                        .whp
+                        .reference_time()
+                        .map_err(|err| {
+                            tracing::error!(
+                                error = &err as &dyn std::error::Error,
+                                "failed to read WHP VSM reference time"
+                            );
+                            HvError::InvalidParameter
+                        })?
+                        .into()
+                }
+                reg => {
+                    let Ok(name) = regs::hv_register_to_whp(reg) else {
+                        return Ok(None);
+                    };
+
+                    let mut whp_value = [Default::default(); 1];
+                    vsm.get_vp_registers(
+                        self.vp.index,
+                        partition.vtl0.whp.vp(self.vp.index.index()),
+                        vtl,
+                        &[name],
+                        &mut whp_value,
+                    )
+                    .map_err(vsm_register_error_to_hv_error)?;
+
+                    // SAFETY: HvRegisterValue and WHV_REGISTER_VALUE are the same.
+                    unsafe {
+                        std::mem::transmute::<WHV_REGISTER_VALUE, HvRegisterValue>(whp_value[0])
+                    }
+                }
+            };
+
+            Ok(Some(value))
+        }
+
+        fn set_whp_vsm_register(
+            &mut self,
+            vtl: Vtl,
+            name: HvRegisterName,
+            value: &HvRegisterValue,
+        ) -> HvResult<Option<()>> {
+            let partition = self.vp.partition;
+            let mut vsm = partition.vsm.lock();
+            if !vsm.is_whp() {
+                return Ok(None);
+            }
+
+            match name.into() {
+                HvX64RegisterName::VsmPartitionConfig => {
+                    let vsm_config = HvRegisterVsmPartitionConfig::from(value.as_u64());
+                    vsm.set_vsm_partition_config(self.vp.index, vtl, vsm_config)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    tracing::trace!(?vsm_config, "set WHP VSM partition config");
+                }
+                HvX64RegisterName::GuestVsmPartitionConfig => {
+                    let guest_vsm_config = HvRegisterGuestVsmPartitionConfig::from(value.as_u64());
+                    vsm.validate_guest_vsm_partition_config(self.vp.index, vtl, guest_vsm_config)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    tracing::trace!(?guest_vsm_config, "set WHP guest VSM partition config");
+                }
+                reg => {
+                    let Ok(name) = regs::hv_register_to_whp(reg) else {
+                        return Ok(None);
+                    };
+
+                    // SAFETY: HvRegisterValue and WHV_REGISTER_VALUE are the same.
+                    let whp_value = unsafe {
+                        std::mem::transmute::<HvRegisterValue, WHV_REGISTER_VALUE>(*value)
+                    };
+                    vsm.set_vp_registers(
+                        self.vp.index,
+                        partition.vtl0.whp.vp(self.vp.index.index()),
+                        vtl,
+                        &[name],
+                        &[whp_value],
+                    )
+                    .map_err(vsm_register_error_to_hv_error)?;
+                }
+            }
+
+            Ok(Some(()))
+        }
+
         pub(super) fn get_vp_register(
             &mut self,
             vtl: Vtl,
             name: HvRegisterName,
         ) -> HvResult<HvRegisterValue> {
+            if let Some(value) = self.get_whp_vsm_register(vtl, name)? {
+                return Ok(value);
+            }
+
             let value = match name.into() {
                 HvX64RegisterName::VsmCodePageOffsets => {
                     // TODO: active VTL must be 2 and only allow target current VTL.
@@ -1541,8 +1810,7 @@ mod x86 {
                         return Err(HvError::AccessDenied);
                     }
 
-                    u64::from(hvdef::HvRegisterGuestVsmPartitionConfig::new().with_maximum_vtl(0))
-                        .into()
+                    u64::from(HvRegisterGuestVsmPartitionConfig::new().with_maximum_vtl(0)).into()
                 }
                 HvX64RegisterName::VsmVpStatus => {
                     let status = hvdef::HvRegisterVsmVpStatus::new()
@@ -1636,6 +1904,10 @@ mod x86 {
             name: HvRegisterName,
             value: &HvRegisterValue,
         ) -> HvResult<()> {
+            if self.set_whp_vsm_register(vtl, name, value)?.is_some() {
+                return Ok(());
+            }
+
             match name.into() {
                 HvX64RegisterName::VsmPartitionConfig => {
                     // TODO: active VTL must be 2 and only allow target current VTL.
@@ -1655,7 +1927,7 @@ mod x86 {
                         .vsm_config_raw
                         .store(value, Ordering::Relaxed);
 
-                    let vsm_config = hvdef::HvRegisterVsmPartitionConfig::from(value);
+                    let vsm_config = HvRegisterVsmPartitionConfig::from(value);
 
                     tracing::trace!(?vsm_config, "set VsmPartitionConfig");
                 }
