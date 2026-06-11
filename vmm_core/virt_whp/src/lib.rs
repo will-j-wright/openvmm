@@ -113,7 +113,7 @@ struct WhpPartitionInner {
     mem_layout: MemoryLayout,
     #[inspect(skip)]
     gm: GuestMemory,
-    vsm: vsm::VsmController,
+    vsm: Mutex<vsm::VsmController>,
     vtl2_emulation: Option<vtl2::Vtl2Emulation>,
     #[cfg(guest_arch = "x86_64")]
     irq_routes: virt::irqcon::IrqRoutes,
@@ -1238,7 +1238,7 @@ impl WhpPartitionInner {
             vps,
             mem_layout: config.mem_layout.clone(),
             gm: config.guest_memory.clone(),
-            vsm,
+            vsm: Mutex::new(vsm),
             vtl2_emulation,
             #[cfg(guest_arch = "x86_64")]
             irq_routes: Default::default(),

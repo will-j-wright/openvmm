@@ -3,6 +3,8 @@
 
 use crate::VsmError;
 use hv1_structs::VtlSet;
+use hvdef::HvRegisterGuestVsmPartitionConfig;
+use hvdef::HvRegisterVsmPartitionConfig;
 use hvdef::Vtl;
 use inspect::Inspect;
 use thiserror::Error;
@@ -32,6 +34,8 @@ struct VtlState {
     partition_vtls: VtlSet,
     #[inspect(skip)]
     vp_vtls: Vec<VtlSet>,
+    #[inspect(skip)]
+    vsm_partition_configs: [u64; 3],
 }
 
 #[derive(Debug, Error)]
@@ -40,7 +44,33 @@ pub(crate) enum EnableVpVtlError {
     NotEnabled { vtl: Vtl },
     #[error("invalid VP index {0}")]
     InvalidVpIndex(u32),
+    #[error("WHP VSM VP {vp_index} {vtl:?} is already enabled")]
+    AlreadyEnabled { vp_index: u32, vtl: Vtl },
     #[error("failed to enable WHP VSM VP VTL")]
+    Whp(#[from] whp::WHvError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum VpVtlAccessError {
+    #[error("WHP VSM is not enabled")]
+    WhpDisabled,
+    #[error("WHP VSM target {vtl:?} is not enabled")]
+    VtlNotEnabled { vtl: Vtl },
+    #[error("invalid VP index {0}")]
+    InvalidVpIndex(u32),
+    #[error("WHP VSM VP {vp_index} target {vtl:?} is not enabled")]
+    VpVtlNotEnabled { vp_index: u32, vtl: Vtl },
+    #[error("WHP VSM register is not valid for target {vtl:?}")]
+    InvalidRegisterVtl { vtl: Vtl },
+    #[error("invalid WHP VSM register value")]
+    InvalidRegisterValue,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum RegisterAccessError {
+    #[error(transparent)]
+    Access(#[from] VpVtlAccessError),
+    #[error("failed to access WHP VSM VP registers")]
     Whp(#[from] whp::WHvError),
 }
 
@@ -55,6 +85,7 @@ fn vtl_state(max_vtl: Vtl, vp_count: u32) -> VtlState {
         max_vtl,
         partition_vtls: vtl0_set(),
         vp_vtls: vec![vtl0_set(); vp_count as usize],
+        vsm_partition_configs: [0; 3],
     }
 }
 
@@ -66,6 +97,17 @@ fn configured_vtls(max_vtl: Vtl) -> impl Iterator<Item = Vtl> {
 
 fn whp_vtl(vtl: Vtl) -> whp::abi::WHV_VTL {
     vtl.into()
+}
+
+fn vtl_bit(vtl: Vtl) -> u16 {
+    1 << u8::from(vtl)
+}
+
+fn vtl_set_bits(vtls: &VtlSet) -> u16 {
+    [Vtl::Vtl0, Vtl::Vtl1, Vtl::Vtl2]
+        .into_iter()
+        .filter(|&vtl| vtls.is_set(vtl))
+        .fold(0, |bits, vtl| bits | vtl_bit(vtl))
 }
 
 impl VsmController {
@@ -112,16 +154,14 @@ impl VsmController {
         })
     }
 
-    fn is_whp(&self) -> bool {
+    pub(crate) fn is_whp(&self) -> bool {
         matches!(self.mode, VsmMode::Whp)
     }
 
-    #[expect(dead_code)]
     pub(crate) fn max_vtl(&self) -> Vtl {
         self.state.max_vtl
     }
 
-    #[expect(dead_code)]
     pub(crate) fn is_partition_vtl_enabled(&self, vtl: Vtl) -> bool {
         self.state.partition_vtls.is_set(vtl)
     }
@@ -131,6 +171,107 @@ impl VsmController {
             .vp_vtls
             .get(vp_index.index() as usize)
             .is_some_and(|vtls| vtls.is_set(vtl))
+    }
+
+    pub(crate) fn vp_enabled_vtl_bits(&self, vp_index: VpIndex) -> Result<u16, VpVtlAccessError> {
+        if !self.is_whp() {
+            return Err(VpVtlAccessError::WhpDisabled);
+        }
+
+        let Some(vp_vtls) = self.state.vp_vtls.get(vp_index.index() as usize) else {
+            return Err(VpVtlAccessError::InvalidVpIndex(vp_index.index()));
+        };
+
+        Ok(vtl_set_bits(vp_vtls))
+    }
+
+    pub(crate) fn validate_vp_vtl_enabled(
+        &self,
+        vp_index: VpIndex,
+        vtl: Vtl,
+    ) -> Result<(), VpVtlAccessError> {
+        if !self.is_whp() {
+            return Err(VpVtlAccessError::WhpDisabled);
+        }
+
+        if vtl > self.state.max_vtl || !self.is_partition_vtl_enabled(vtl) {
+            return Err(VpVtlAccessError::VtlNotEnabled { vtl });
+        }
+
+        let Some(vp_vtls) = self.state.vp_vtls.get(vp_index.index() as usize) else {
+            return Err(VpVtlAccessError::InvalidVpIndex(vp_index.index()));
+        };
+
+        if !vp_vtls.is_set(vtl) {
+            return Err(VpVtlAccessError::VpVtlNotEnabled {
+                vp_index: vp_index.index(),
+                vtl,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate_vsm_register_vtl(
+        &self,
+        vp_index: VpIndex,
+        vtl: Vtl,
+    ) -> Result<(), VpVtlAccessError> {
+        self.validate_vp_vtl_enabled(vp_index, vtl)?;
+        if vtl == Vtl::Vtl0 {
+            return Err(VpVtlAccessError::InvalidRegisterVtl { vtl });
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn vsm_partition_config(
+        &self,
+        vp_index: VpIndex,
+        vtl: Vtl,
+    ) -> Result<HvRegisterVsmPartitionConfig, VpVtlAccessError> {
+        self.validate_vsm_register_vtl(vp_index, vtl)?;
+        Ok(HvRegisterVsmPartitionConfig::from(
+            self.state.vsm_partition_configs[vtl as usize],
+        ))
+    }
+
+    pub(crate) fn set_vsm_partition_config(
+        &mut self,
+        vp_index: VpIndex,
+        vtl: Vtl,
+        config: HvRegisterVsmPartitionConfig,
+    ) -> Result<(), VpVtlAccessError> {
+        self.validate_vsm_register_vtl(vp_index, vtl)?;
+        self.state.vsm_partition_configs[vtl as usize] = u64::from(config);
+        Ok(())
+    }
+
+    pub(crate) fn guest_vsm_partition_config(
+        &self,
+        vp_index: VpIndex,
+        vtl: Vtl,
+    ) -> Result<HvRegisterGuestVsmPartitionConfig, VpVtlAccessError> {
+        self.validate_vsm_register_vtl(vp_index, vtl)?;
+        Ok(HvRegisterGuestVsmPartitionConfig::new().with_maximum_vtl(u8::from(self.max_vtl())))
+    }
+
+    pub(crate) fn validate_guest_vsm_partition_config(
+        &self,
+        vp_index: VpIndex,
+        vtl: Vtl,
+        config: HvRegisterGuestVsmPartitionConfig,
+    ) -> Result<(), VpVtlAccessError> {
+        self.validate_vsm_register_vtl(vp_index, vtl)?;
+
+        let allowed_bits = HvRegisterGuestVsmPartitionConfig::new().with_maximum_vtl(0xf);
+        if u64::from(config) & !u64::from(allowed_bits) != 0
+            || config.maximum_vtl() > u8::from(self.max_vtl())
+        {
+            return Err(VpVtlAccessError::InvalidRegisterValue);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn set_partition_properties_before_setup(
@@ -175,7 +316,6 @@ impl VsmController {
         Ok(())
     }
 
-    #[expect(dead_code)]
     pub(crate) fn enable_vp_vtl(
         &mut self,
         partition: &whp::Partition,
@@ -195,6 +335,13 @@ impl VsmController {
             return Err(EnableVpVtlError::InvalidVpIndex(vp_index.index()));
         };
 
+        if vp_vtls.is_set(vtl) {
+            return Err(EnableVpVtlError::AlreadyEnabled {
+                vp_index: vp_index.index(),
+                vtl,
+            });
+        }
+
         partition.enable_vp_vtl(vp_index.index(), whp_vtl(vtl), initial_context)?;
         vp_vtls.set(vtl);
         Ok(())
@@ -207,26 +354,30 @@ impl VsmController {
         }
     }
 
-    #[expect(dead_code)]
     pub(crate) fn get_vp_registers(
         &self,
+        vp_index: VpIndex,
         vp: whp::Processor<'_>,
-        target_vtl: Option<Vtl>,
+        target_vtl: Vtl,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &mut [whp::abi::WHV_REGISTER_VALUE],
-    ) -> Result<(), whp::WHvError> {
-        vp.get_registers_for_vtl(self.input_vtl(target_vtl), names, values)
+    ) -> Result<(), RegisterAccessError> {
+        self.validate_vp_vtl_enabled(vp_index, target_vtl)?;
+        vp.get_registers_for_vtl(self.input_vtl(Some(target_vtl)), names, values)?;
+        Ok(())
     }
 
-    #[expect(dead_code)]
     pub(crate) fn set_vp_registers(
         &self,
+        vp_index: VpIndex,
         vp: whp::Processor<'_>,
-        target_vtl: Option<Vtl>,
+        target_vtl: Vtl,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &[whp::abi::WHV_REGISTER_VALUE],
-    ) -> Result<(), whp::WHvError> {
-        vp.set_registers_for_vtl(self.input_vtl(target_vtl), names, values)
+    ) -> Result<(), RegisterAccessError> {
+        self.validate_vp_vtl_enabled(vp_index, target_vtl)?;
+        vp.set_registers_for_vtl(self.input_vtl(Some(target_vtl)), names, values)?;
+        Ok(())
     }
 
     #[expect(dead_code)]
