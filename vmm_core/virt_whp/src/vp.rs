@@ -5,6 +5,7 @@ use super::Vplc;
 use super::VtlPartition;
 use super::vtl2::Vtl2InterceptState;
 use crate::WhpProcessor;
+use crate::vsm::RegisterAccessError;
 use guestmem::GuestMemoryError;
 use hvdef::HvDeliverabilityNotificationsRegister;
 use hvdef::HvError;
@@ -51,25 +52,100 @@ pub(crate) struct ExitStats {
 #[error("failed to run")]
 pub struct WhpRunVpError(#[source] whp::WHvError);
 
+#[derive(Debug, Error)]
+#[error("unsupported WHP exit {exit} while active VTL is {active_vtl:?}")]
+struct UnsupportedWhpExit {
+    exit: String,
+    active_vtl: Vtl,
+}
+
 impl<'a> WhpProcessor<'a> {
     pub(crate) fn current_vtlp(&self) -> &'a VtlPartition {
         self.vp.partition.vtlp(self.state.active_vtl)
     }
 
     pub(crate) fn vplc(&self, vtl: Vtl) -> &'a Vplc {
-        match vtl {
+        match self.vp.partition.backend_vtl(vtl) {
             Vtl::Vtl0 => self.vplc0,
             Vtl::Vtl1 => unimplemented!(),
             Vtl::Vtl2 => self.vplc2.unwrap(),
         }
     }
 
-    pub(crate) fn current_vplc(&self) -> &'a Vplc {
-        self.vplc(self.state.active_vtl)
-    }
-
     pub(crate) fn current_whp(&self) -> whp::Processor<'a> {
         self.vp.whp(self.state.active_vtl)
+    }
+
+    pub(crate) fn active_backend_vtl(&self) -> Vtl {
+        self.vp.partition.backend_vtl(self.state.active_vtl)
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    pub(crate) fn get_vtl_registers(
+        &self,
+        vtl: Vtl,
+        names: &[whp::abi::WHV_REGISTER_NAME],
+        values: &mut [whp::abi::WHV_REGISTER_VALUE],
+    ) -> Result<(), RegisterAccessError> {
+        let vsm = self.vp.partition.vsm.lock();
+        if vsm.is_whp() {
+            vsm.get_vp_registers(
+                self.vp.index,
+                self.vp.partition.vtl0.whp.vp(self.vp.index.index()),
+                Some(vtl),
+                names,
+                values,
+            )
+        } else {
+            self.vp.whp(vtl).get_registers(names, values)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    pub(crate) fn get_active_registers(
+        &self,
+        names: &[whp::abi::WHV_REGISTER_NAME],
+        values: &mut [whp::abi::WHV_REGISTER_VALUE],
+    ) -> Result<(), RegisterAccessError> {
+        let vsm = self.vp.partition.vsm.lock();
+        if vsm.is_whp() {
+            vsm.get_vp_registers(
+                self.vp.index,
+                self.vp.partition.vtl0.whp.vp(self.vp.index.index()),
+                None,
+                names,
+                values,
+            )
+        } else {
+            self.vp
+                .whp(self.state.active_vtl)
+                .get_registers(names, values)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    pub(crate) fn set_active_registers(
+        &self,
+        names: &[whp::abi::WHV_REGISTER_NAME],
+        values: &[whp::abi::WHV_REGISTER_VALUE],
+    ) -> Result<(), RegisterAccessError> {
+        let vsm = self.vp.partition.vsm.lock();
+        if vsm.is_whp() {
+            vsm.set_vp_registers(
+                self.vp.index,
+                self.vp.partition.vtl0.whp.vp(self.vp.index.index()),
+                None,
+                names,
+                values,
+            )
+        } else {
+            self.vp
+                .whp(self.state.active_vtl)
+                .set_registers(names, values)?;
+            Ok(())
+        }
     }
 
     pub(crate) fn intercept_state(&self) -> Option<&Vtl2InterceptState> {
@@ -232,6 +308,7 @@ impl<'a> WhpProcessor<'a> {
     ) -> Result<Infallible, VpHaltReason> {
         tracing::trace!(vtl = ?self.state.active_vtl, "current vtl");
         let mut last_waker = None;
+        let whp_vsm = self.vp.partition.vsm.lock().is_whp();
         loop {
             self.inner.interrupt.maybe_yield().await;
             poll_fn(|cx| {
@@ -250,7 +327,8 @@ impl<'a> WhpProcessor<'a> {
                 // following.
                 self.state.vmtime.cancel_timeout();
 
-                if self.state.enabled_vtls.is_clear(Vtl::Vtl2)
+                if !whp_vsm
+                    && self.state.enabled_vtls.is_clear(Vtl::Vtl2)
                     && self.inner.vtl2_enable.load(Ordering::SeqCst)
                 {
                     tracing::debug!("enabled vtl2");
@@ -273,7 +351,8 @@ impl<'a> WhpProcessor<'a> {
                 // These steps are only necessary if using the hypervisor APIC,
                 // since otherwise we know exactly when to make VTL2 runnable.
                 #[cfg(guest_arch = "x86_64")]
-                if self.state.enabled_vtls.is_set(Vtl::Vtl2)
+                if !whp_vsm
+                    && self.state.enabled_vtls.is_set(Vtl::Vtl2)
                     && self.state.vtls.lapic(Vtl::Vtl2).is_none()
                 {
                     if self.state.runnable_vtls.is_clear(Vtl::Vtl2)
@@ -359,28 +438,38 @@ impl<'a> WhpProcessor<'a> {
             })
             .await?;
 
-            let next_vtl = self
-                .state
-                .runnable_vtls
-                .highest_set()
-                .expect("no runnable vtls");
+            let run_vtl = if whp_vsm {
+                Vtl::Vtl0
+            } else {
+                self.state
+                    .runnable_vtls
+                    .highest_set()
+                    .expect("no runnable vtls")
+            };
 
-            if next_vtl != self.state.active_vtl {
-                self.switch_vtl(next_vtl);
+            if !whp_vsm && run_vtl != self.state.active_vtl {
+                self.switch_vtl(run_vtl);
             }
 
-            if self.current_vplc().check_queues.load(Ordering::Relaxed) {
-                self.current_vplc()
+            let queue_vtl = self.vp.partition.backend_vtl(self.state.active_vtl);
+            if self.vplc(queue_vtl).check_queues.load(Ordering::Relaxed) {
+                self.vplc(queue_vtl)
                     .check_queues
                     .store(false, Ordering::SeqCst);
 
-                self.flush_messages(self.state.active_vtl, !0);
+                self.flush_messages(queue_vtl, !0);
             }
 
             // Set the lazy EOI bit just before running.
-            let lazy_eoi = self.sync_lazy_eoi();
+            let lazy_eoi = !whp_vsm && self.sync_lazy_eoi();
 
-            let mut runner = self.current_whp().runner();
+            tracing::trace!(
+                active_vtl = ?self.state.active_vtl,
+                ?run_vtl,
+                whp_vsm,
+                "running vp"
+            );
+            let mut runner = self.vp.whp(run_vtl).runner();
             let exit = runner
                 .run()
                 .map_err(|err| dev.fatal_error(WhpRunVpError(err).into()))?;
@@ -508,6 +597,7 @@ impl<'a> WhpProcessor<'a> {
 
 #[cfg(guest_arch = "x86_64")]
 mod x86 {
+    use super::UnsupportedWhpExit;
     use crate::Hv1State;
     use crate::WhpProcessor;
     use crate::emu;
@@ -528,7 +618,6 @@ mod x86 {
     use virt::state::StateElement;
     use virt::x86::MsrError;
     use virt::x86::MsrErrorExt;
-    use whp::get_registers;
     use whp::set_registers;
     use x86defs::X86X_MSR_APIC_BASE;
     use x86defs::apic::X2APIC_MSR_BASE;
@@ -609,8 +698,14 @@ mod x86 {
                     self.handle_exception(dev, info, exit);
                     &mut self.state.exits.exception
                 }
-                _ => {
-                    unreachable!("unsupported exit reason: {:?}", exit);
+                other => {
+                    return Err(dev.fatal_error(
+                        UnsupportedWhpExit {
+                            exit: format!("{other:?}"),
+                            active_vtl: self.state.active_vtl,
+                        }
+                        .into(),
+                    ));
                 }
             };
             stat.increment();
@@ -668,7 +763,7 @@ mod x86 {
 
         fn handle_sint_deliverable(&mut self, ctx: &whp::abi::WHV_SYNIC_SINT_DELIVERABLE_CONTEXT) {
             tracing::trace!(sints = ctx.DeliverableSints, "sints deliverable");
-            self.sints_deliverable(self.state.active_vtl, ctx.DeliverableSints);
+            self.sints_deliverable(self.active_backend_vtl(), ctx.DeliverableSints);
         }
 
         fn handle_halt(&mut self, exit: whp::Exit<'_>) {
@@ -837,9 +932,11 @@ mod x86 {
                                 .with_deliver_error_code(true)
                                 .with_vector(0xd);
 
-                            self.current_whp()
-                                .set_register(whp::Register128::PendingEvent, event.into())
-                                .unwrap();
+                            set_active_registers!(
+                                self,
+                                [(whp::Register128::PendingEvent, event.into())]
+                            )
+                            .unwrap();
 
                             return Ok(());
                         }
@@ -929,8 +1026,8 @@ mod x86 {
                 }
             }
 
-            let notifications =
-                &mut self.state.vtls[self.state.active_vtl].deliverability_notifications;
+            let state_vtl = self.active_backend_vtl();
+            let notifications = &mut self.state.vtls[state_vtl].deliverability_notifications;
             notifications.set_interrupt_notification(false);
             notifications.set_nmi_notification(false);
             notifications.set_interrupt_priority(0);
@@ -1022,8 +1119,8 @@ mod x86 {
                     .Rip
                     .wrapping_add(exit.vp_context.InstructionLength() as u64);
 
-                set_registers!(
-                    self.current_whp(),
+                set_active_registers!(
+                    self,
                     [(whp::Register64::Rax, rax), (whp::Register64::Rip, rip),]
                 )
                 .unwrap();
@@ -1137,8 +1234,8 @@ mod x86 {
             }
 
             let rip = exit.vp_context.Rip.wrapping_add(2);
-            set_registers!(
-                self.current_whp(),
+            set_active_registers!(
+                self,
                 [
                     (whp::Register64::Rax, eax.into()),
                     (whp::Register64::Rbx, ebx.into()),
@@ -1197,8 +1294,7 @@ mod x86 {
                     .with_deliver_error_code(true)
                     .with_vector(0xd);
 
-                self.current_whp()
-                    .set_register(whp::Register128::PendingEvent, event.into())
+                set_active_registers!(self, [(whp::Register128::PendingEvent, event.into())])
                     .unwrap();
             }
         }
@@ -1263,7 +1359,63 @@ mod x86 {
                         Ok(())
                     }
                     0x40000000..=0x4fffffff => {
-                        if let Some(hv) = &mut self.state.vtls[self.state.active_vtl].hv {
+                        if self.vp.partition.vsm.lock().is_whp() {
+                            match msr {
+                                hvdef::HV_X64_MSR_GUEST_OS_ID => {
+                                    let value = whp::abi::WHV_REGISTER_VALUE(v.into());
+                                    return self
+                                        .set_active_registers(
+                                            &[whp::abi::WHvRegisterGuestOsId],
+                                            &[value],
+                                        )
+                                        .map(|_| {
+                                            tracing::debug!(
+                                                active_vtl = ?self.state.active_vtl,
+                                                value = v,
+                                                "forwarded WHP VSM GuestOsId MSR write"
+                                            );
+                                        })
+                                        .map_err(|err| {
+                                            tracelimit::error_ratelimited!(
+                                                error = &err as &dyn std::error::Error,
+                                                "failed to forward WHP VSM GuestOsId MSR write"
+                                            );
+                                            MsrError::InvalidAccess
+                                        });
+                                }
+                                hvdef::HV_X64_MSR_HYPERCALL => {
+                                    let value = whp::abi::WHV_REGISTER_VALUE(v.into());
+                                    return self
+                                        .set_active_registers(
+                                            &[whp::abi::WHvX64RegisterHypercall],
+                                            &[value],
+                                        )
+                                        .map(|_| {
+                                            let hypercall_msr =
+                                                hvdef::hypercall::MsrHypercallContents::from(v);
+                                            tracing::info!(
+                                                active_vtl = ?self.state.active_vtl,
+                                                value = v,
+                                                enable = hypercall_msr.enable(),
+                                                locked = hypercall_msr.locked(),
+                                                gpn = hypercall_msr.gpn(),
+                                                "forwarded WHP VSM Hypercall MSR write"
+                                            );
+                                        })
+                                        .map_err(|err| {
+                                            tracelimit::error_ratelimited!(
+                                                error = &err as &dyn std::error::Error,
+                                                "failed to forward WHP VSM Hypercall MSR write"
+                                            );
+                                            MsrError::InvalidAccess
+                                        });
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let state_vtl = self.active_backend_vtl();
+                        if let Some(hv) = &mut self.state.vtls[state_vtl].hv {
                             hv.msr_write(
                                 msr,
                                 v,
@@ -1274,7 +1426,7 @@ mod x86 {
                                 hvdef::HV_X64_MSR_VP_ASSIST_PAGE
                                     if self.state.active_vtl == Vtl::Vtl2 =>
                                 {
-                                    self.state.vtls[self.state.active_vtl].vp_assist_page = v;
+                                    self.state.vtls[state_vtl].vp_assist_page = v;
                                     Ok(())
                                 }
                                 _ => Err(MsrError::Unknown),
@@ -1329,9 +1481,7 @@ mod x86 {
 
             if !gpf {
                 let rip = exit.vp_context.Rip.wrapping_add(2);
-                self.current_whp()
-                    .set_register(whp::Register64::Rip, rip)
-                    .unwrap();
+                set_active_registers!(self, [(whp::Register64::Rip, rip)]).unwrap();
             }
 
             !gpf
@@ -1353,14 +1503,74 @@ mod x86 {
                     }
                     x86defs::X86X_MSR_EBL_CR_POWERON => Ok(0),
                     0x40000000..=0x4fffffff => {
-                        if let Some(hv) = &mut self.state.vtls[self.state.active_vtl].hv {
+                        if self.vp.partition.vsm.lock().is_whp() {
+                            match msr {
+                                hvdef::HV_X64_MSR_GUEST_OS_ID => {
+                                    let mut value = [whp::abi::WHV_REGISTER_VALUE::default()];
+                                    return self
+                                        .get_active_registers(
+                                            &[whp::abi::WHvRegisterGuestOsId],
+                                            &mut value,
+                                        )
+                                        .map(|_| {
+                                            let value = u128::from(value[0].0) as u64;
+                                            tracing::info!(
+                                                active_vtl = ?self.state.active_vtl,
+                                                value,
+                                                "forwarded WHP VSM GuestOsId MSR read"
+                                            );
+                                            value
+                                        })
+                                        .map_err(|err| {
+                                            tracelimit::error_ratelimited!(
+                                                error = &err as &dyn std::error::Error,
+                                                "failed to forward WHP VSM GuestOsId MSR read"
+                                            );
+                                            MsrError::InvalidAccess
+                                        });
+                                }
+                                hvdef::HV_X64_MSR_HYPERCALL => {
+                                    let mut value = [whp::abi::WHV_REGISTER_VALUE::default()];
+                                    return self
+                                        .get_active_registers(
+                                            &[whp::abi::WHvX64RegisterHypercall],
+                                            &mut value,
+                                        )
+                                        .map(|_| {
+                                            let value = u128::from(value[0].0) as u64;
+                                            let hypercall_msr =
+                                                hvdef::hypercall::MsrHypercallContents::from(value);
+                                            tracing::debug!(
+                                                active_vtl = ?self.state.active_vtl,
+                                                value,
+                                                enable = hypercall_msr.enable(),
+                                                locked = hypercall_msr.locked(),
+                                                gpn = hypercall_msr.gpn(),
+                                                "forwarded WHP VSM Hypercall MSR read"
+                                            );
+                                            value
+                                        })
+                                        .map_err(|err| {
+                                            tracelimit::error_ratelimited!(
+                                                error = &err as &dyn std::error::Error,
+                                                "failed to forward WHP VSM Hypercall MSR read"
+                                            );
+                                            MsrError::InvalidAccess
+                                        });
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let state_vtl = self.active_backend_vtl();
+                        if let Some(hv) = &mut self.state.vtls[state_vtl].hv {
                             hv.msr_read(msr)
                         } else {
                             match msr {
                                 hvdef::HV_X64_MSR_VP_ASSIST_PAGE
                                     if self.state.active_vtl == Vtl::Vtl2 =>
                                 {
-                                    Ok(self.state.vtls[self.state.active_vtl].vp_assist_page)
+                                    Ok(self.state.vtls[state_vtl].vp_assist_page)
                                 }
                                 _ => Err(MsrError::Unknown),
                             }
@@ -1414,8 +1624,8 @@ mod x86 {
                 let rdx = v >> 32;
                 let rip = exit.vp_context.Rip.wrapping_add(2);
 
-                set_registers!(
-                    &self.current_whp(),
+                set_active_registers!(
+                    self,
                     [
                         (whp::Register64::Rax, rax),
                         (whp::Register64::Rdx, rdx),
@@ -1442,8 +1652,8 @@ mod x86 {
                 match info.InstructionBytes[..info.InstructionByteCount as usize] {
                     [0x0f, 0x30, ..] => {
                         // wrmsr
-                        let (rcx, rax, rdx) = get_registers!(
-                            self.current_whp(),
+                        let (rcx, rax, rdx) = get_active_registers!(
+                            self,
                             [
                                 whp::Register64::Rcx,
                                 whp::Register64::Rax,
@@ -1458,10 +1668,7 @@ mod x86 {
                     }
                     [0x0f, 0x32, ..] => {
                         // rdmsr
-                        let rcx = self
-                            .current_whp()
-                            .get_register(whp::Register64::Rcx)
-                            .unwrap();
+                        let rcx = get_active_registers!(self, [whp::Register64::Rcx]).unwrap();
 
                         if self.msr_read(dev, exit, rcx as u32) {
                             return;
@@ -1471,7 +1678,7 @@ mod x86 {
                 }
             }
 
-            let event = if info.ExceptionInfo.SoftwareException() {
+            let event: u128 = if info.ExceptionInfo.SoftwareException() {
                 todo!()
             } else {
                 hvdef::HvX64PendingExceptionEvent::new()
@@ -1485,9 +1692,7 @@ mod x86 {
                     .into()
             };
 
-            self.current_whp()
-                .set_register(whp::Register128::PendingEvent, event)
-                .unwrap();
+            set_active_registers!(self, [(whp::Register128::PendingEvent, event)]).unwrap();
         }
 
         /// Emulates an instruction due to a memory access exit.
@@ -1660,6 +1865,7 @@ mod x86 {
 
 #[cfg(guest_arch = "aarch64")]
 mod aarch64 {
+    use super::UnsupportedWhpExit;
     use crate::InitialVpContext;
     use crate::WhpProcessor;
     use aarch64defs::EsrEl2;
@@ -1742,8 +1948,14 @@ mod aarch64 {
                     HvMessageType::HvMessageTypeArm64ResetIntercept => {
                         return Err(self.handle_reset(message_ref(message)));
                     }
-                    _ => {
-                        unreachable!("unsupported exit reason: {:?}", exit);
+                    other => {
+                        return Err(dev.fatal_error(
+                            UnsupportedWhpExit {
+                                exit: format!("{other:?}"),
+                                active_vtl: self.state.active_vtl,
+                            }
+                            .into(),
+                        ));
                     }
                 },
             };

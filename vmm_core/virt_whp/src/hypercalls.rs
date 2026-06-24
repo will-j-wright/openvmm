@@ -1617,7 +1617,7 @@ mod x86 {
                     vsm.get_vp_registers(
                         self.vp.index,
                         partition.vtl0.whp.vp(self.vp.index.index()),
-                        vtl,
+                        Some(vtl),
                         &[name],
                         &mut whp_value,
                     )
@@ -1670,7 +1670,7 @@ mod x86 {
                     vsm.set_vp_registers(
                         self.vp.index,
                         partition.vtl0.whp.vp(self.vp.index.index()),
-                        vtl,
+                        Some(vtl),
                         &[name],
                         &[whp_value],
                     )

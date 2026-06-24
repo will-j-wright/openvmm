@@ -11,6 +11,8 @@
 
 mod apic;
 pub mod device;
+#[macro_use]
+mod register_macros;
 mod emu;
 mod hypercalls;
 mod memory;
@@ -423,7 +425,7 @@ impl<'a> WhpVpRef<'a> {
     }
 
     fn vplc(&self, vtl: Vtl) -> &'a Vplc {
-        match vtl {
+        match self.partition.backend_vtl(vtl) {
             Vtl::Vtl0 => &self.partition.vtl0.vplcs[self.index.index() as usize],
             Vtl::Vtl1 => unreachable!(),
             Vtl::Vtl2 => &self.partition.vtl2.as_ref().unwrap().vplcs[self.index.index() as usize],
@@ -431,7 +433,7 @@ impl<'a> WhpVpRef<'a> {
     }
 
     fn whp(&self, vtl: Vtl) -> whp::Processor<'a> {
-        match vtl {
+        match self.partition.backend_vtl(vtl) {
             Vtl::Vtl0 => self.partition.vtl0.whp.vp(self.index.index()),
             Vtl::Vtl1 => unreachable!(),
             Vtl::Vtl2 => self
@@ -1258,10 +1260,18 @@ impl WhpPartitionInner {
     }
 
     fn vtlp(&self, vtl: Vtl) -> &VtlPartition {
-        match vtl {
+        match self.backend_vtl(vtl) {
             Vtl::Vtl0 => &self.vtl0,
             Vtl::Vtl1 => unreachable!(),
             Vtl::Vtl2 => self.vtl2.as_ref().unwrap(),
+        }
+    }
+
+    fn backend_vtl(&self, vtl: Vtl) -> Vtl {
+        if self.vsm.lock().is_whp() {
+            Vtl::Vtl0
+        } else {
+            vtl
         }
     }
 

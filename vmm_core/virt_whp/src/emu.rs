@@ -111,7 +111,7 @@ impl<T: CpuIo> virt_support_x86emu::emulate::EmulatorSupport for WhpEmulationSta
         assert!(reg < 16);
         let reg = whp::abi::WHV_REGISTER_NAME(whp::abi::WHvX64RegisterXmm0.0 + reg as u32);
         let mut value = [Default::default()];
-        let _ = self.vp.current_whp().get_registers(&[reg], &mut value);
+        let _ = self.vp.get_active_registers(&[reg], &mut value);
         value[0].0.into()
     }
 
@@ -119,7 +119,7 @@ impl<T: CpuIo> virt_support_x86emu::emulate::EmulatorSupport for WhpEmulationSta
         assert!(reg < 16);
         let reg = whp::abi::WHV_REGISTER_NAME(whp::abi::WHvX64RegisterXmm0.0 + reg as u32);
         let value = [whp::abi::WHV_REGISTER_VALUE(value.into())];
-        self.vp.current_whp().set_registers(&[reg], &value).unwrap();
+        self.vp.set_active_registers(&[reg], &value).unwrap();
     }
 
     fn flush(&mut self) {
@@ -224,8 +224,8 @@ impl<T: CpuIo> virt_support_x86emu::emulate::EmulatorSupport for WhpEmulationSta
     }
 
     fn inject_pending_event(&mut self, event_info: hvdef::HvX64PendingEvent) {
-        whp::set_registers!(
-            self.vp.current_whp(),
+        set_active_registers!(
+            self.vp,
             [(whp::Register128::PendingEvent, event_info.reg_0.into()),]
         )
         .expect("set registers should not fail");
@@ -236,8 +236,8 @@ impl<T: CpuIo> virt_support_x86emu::emulate::EmulatorSupport for WhpEmulationSta
         // TODO: If it does need to be set, and fails, just panic for now.
         // We'll figure something better out later.
         if event_info.reg_1 != 0u128.into() {
-            whp::set_registers!(
-                self.vp.current_whp(),
+            set_active_registers!(
+                self.vp,
                 [(
                     whp::Register128::PendingEvent1,
                     u128::from(event_info.reg_1)
@@ -285,7 +285,7 @@ impl<T: CpuIo> virt_support_x86emu::emulate::EmulatorSupport for WhpEmulationSta
     }
 
     fn lapic_base_address(&self) -> Option<u64> {
-        self.vp.state.vtls[self.vp.state.active_vtl]
+        self.vp.state.vtls[self.vp.active_backend_vtl()]
             .lapic
             .as_ref()
             .and_then(|lapic| lapic.apic.base_address())
@@ -369,8 +369,8 @@ impl WhpProcessor<'_> {
             ss,
             cr0,
             efer,
-        ) = whp::get_registers!(
-            self.current_whp(),
+        ) = get_active_registers!(
+            self,
             [
                 whp::Register64::Rip,
                 whp::Register64::Rflags,
@@ -422,8 +422,8 @@ impl WhpProcessor<'_> {
     }
 
     pub(crate) fn set_emulator_state(&mut self, state: &WhpEmuCache) {
-        whp::set_registers!(
-            self.current_whp(),
+        set_active_registers!(
+            self,
             [
                 (whp::Register64::Rip, state.rip),
                 (whp::Register64::Rflags, state.rflags.into()),
@@ -449,8 +449,9 @@ impl WhpProcessor<'_> {
     }
 
     pub(crate) fn translation_registers(&self, vtl: Vtl) -> TranslationRegisters {
-        let (cr0, cr4, efer, cr3, rflags, ss) = whp::get_registers!(
-            self.vp.whp(vtl),
+        let (cr0, cr4, efer, cr3, rflags, ss) = get_vtl_registers!(
+            self,
+            vtl,
             [
                 whp::Register64::Cr0,
                 whp::Register64::Cr4,

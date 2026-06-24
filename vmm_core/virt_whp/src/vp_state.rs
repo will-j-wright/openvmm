@@ -36,11 +36,22 @@ impl WhpVpRef<'_> {
         let names = regs.names().map(|name| hv_register_to_whp(name).unwrap());
         let mut values = [HvRegisterValue::new_zeroed(); N];
         regs.get_values(values.iter_mut());
-        self.whp(vtl)
-            .set_registers(&names, unsafe {
-                std::mem::transmute::<&[HvRegisterValue], &[WHV_REGISTER_VALUE]>(&values[..])
-            })
-            .for_op("set registers")?;
+        let whp_values = unsafe {
+            std::mem::transmute::<&[HvRegisterValue], &[WHV_REGISTER_VALUE]>(&values[..])
+        };
+        let vsm = self.partition.vsm.lock();
+        if vsm.is_whp() {
+            self.partition
+                .vtl0
+                .whp
+                .vp(self.index.index())
+                .set_registers_for_vtl(vsm.input_vtl(Some(vtl)), &names, whp_values)
+                .for_op("set registers")?;
+        } else {
+            self.whp(vtl)
+                .set_registers(&names, whp_values)
+                .for_op("set registers")?;
+        }
         Ok(())
     }
 
@@ -54,13 +65,24 @@ impl WhpVpRef<'_> {
         let mut regs = T::default();
         let names = regs.names().map(|name| hv_register_to_whp(name).unwrap());
         let mut values = [HvRegisterValue::new_zeroed(); N];
-        self.whp(vtl)
-            .get_registers(&names, unsafe {
-                std::mem::transmute::<&mut [HvRegisterValue], &mut [WHV_REGISTER_VALUE]>(
-                    &mut values[..],
-                )
-            })
-            .for_op("get registers")?;
+        let whp_values = unsafe {
+            std::mem::transmute::<&mut [HvRegisterValue], &mut [WHV_REGISTER_VALUE]>(
+                &mut values[..],
+            )
+        };
+        let vsm = self.partition.vsm.lock();
+        if vsm.is_whp() {
+            self.partition
+                .vtl0
+                .whp
+                .vp(self.index.index())
+                .get_registers_for_vtl(vsm.input_vtl(Some(vtl)), &names, whp_values)
+                .for_op("get registers")?;
+        } else {
+            self.whp(vtl)
+                .get_registers(&names, whp_values)
+                .for_op("get registers")?;
+        }
         regs.set_values(values.into_iter());
         Ok(regs)
     }

@@ -418,6 +418,9 @@ impl WHV_X64_VP_EXECUTION_STATE {
     pub fn InterruptionPending(self) -> bool {
         (self.0 & 0x40) != 0
     }
+    pub fn Vtl(self) -> u8 {
+        ((self.0 >> 7) & 0xf) as u8
+    }
     pub fn InterruptShadow(self) -> bool {
         (self.0 & 0x1000) != 0
     }
