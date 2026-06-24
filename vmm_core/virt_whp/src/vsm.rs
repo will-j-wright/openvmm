@@ -166,13 +166,6 @@ impl VsmController {
         self.state.partition_vtls.is_set(vtl)
     }
 
-    pub(crate) fn is_vp_vtl_enabled(&self, vp_index: VpIndex, vtl: Vtl) -> bool {
-        self.state
-            .vp_vtls
-            .get(vp_index.index() as usize)
-            .is_some_and(|vtls| vtls.is_set(vtl))
-    }
-
     pub(crate) fn vp_enabled_vtl_bits(&self, vp_index: VpIndex) -> Result<u16, VpVtlAccessError> {
         if !self.is_whp() {
             return Err(VpVtlAccessError::WhpDisabled);
@@ -354,16 +347,32 @@ impl VsmController {
         }
     }
 
+    fn validate_vp_register_target(
+        &self,
+        vp_index: VpIndex,
+        target_vtl: Option<Vtl>,
+    ) -> Result<(), VpVtlAccessError> {
+        if let Some(target_vtl) = target_vtl {
+            self.validate_vp_vtl_enabled(vp_index, target_vtl)
+        } else if !self.is_whp() {
+            Err(VpVtlAccessError::WhpDisabled)
+        } else if self.state.vp_vtls.get(vp_index.index() as usize).is_none() {
+            Err(VpVtlAccessError::InvalidVpIndex(vp_index.index()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn get_vp_registers(
         &self,
         vp_index: VpIndex,
         vp: whp::Processor<'_>,
-        target_vtl: Vtl,
+        target_vtl: Option<Vtl>,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &mut [whp::abi::WHV_REGISTER_VALUE],
     ) -> Result<(), RegisterAccessError> {
-        self.validate_vp_vtl_enabled(vp_index, target_vtl)?;
-        vp.get_registers_for_vtl(self.input_vtl(Some(target_vtl)), names, values)?;
+        self.validate_vp_register_target(vp_index, target_vtl)?;
+        vp.get_registers_for_vtl(self.input_vtl(target_vtl), names, values)?;
         Ok(())
     }
 
@@ -371,19 +380,12 @@ impl VsmController {
         &self,
         vp_index: VpIndex,
         vp: whp::Processor<'_>,
-        target_vtl: Vtl,
+        target_vtl: Option<Vtl>,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &[whp::abi::WHV_REGISTER_VALUE],
     ) -> Result<(), RegisterAccessError> {
-        self.validate_vp_vtl_enabled(vp_index, target_vtl)?;
-        vp.set_registers_for_vtl(self.input_vtl(Some(target_vtl)), names, values)?;
+        self.validate_vp_register_target(vp_index, target_vtl)?;
+        vp.set_registers_for_vtl(self.input_vtl(target_vtl), names, values)?;
         Ok(())
-    }
-
-    #[expect(dead_code)]
-    pub(crate) fn active_vtl_after_exit(&self, vp_index: VpIndex, exit_vtl: Option<Vtl>) -> Vtl {
-        exit_vtl
-            .filter(|&vtl| self.is_vp_vtl_enabled(vp_index, vtl))
-            .unwrap_or(Vtl::Vtl0)
     }
 }

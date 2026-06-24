@@ -2027,7 +2027,7 @@ impl<'a> ExitReason<'a> {
                 Self::SynicSintDeliverable(unsafe { &ctx.u.SynicSintDeliverable })
             }
             abi::WHvRunVpExitReasonCanceled => Self::Canceled,
-            abi::WHV_RUN_VP_EXIT_REASON(reason) => panic!("unknown exit reason: {reason:#x}"),
+            reason => Self::Unknown(reason),
         }
     }
 
@@ -2074,6 +2074,7 @@ pub enum ExitReason<'a> {
     #[cfg(target_arch = "x86_64")]
     ApicWriteTrap(&'a abi::WHV_X64_APIC_WRITE_CONTEXT),
     SynicSintDeliverable(&'a abi::WHV_SYNIC_SINT_DELIVERABLE_CONTEXT),
+    Unknown(abi::WHV_RUN_VP_EXIT_REASON),
     #[cfg(target_arch = "aarch64")]
     Arm64Reset(&'a abi::WHV_ARM64_RESET_CONTEXT),
     Canceled,
