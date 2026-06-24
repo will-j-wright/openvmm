@@ -2248,3 +2248,16 @@ macro_rules! get_registers {
     };
     (@def $_:expr) => { Default::default() };
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_vtl_encoding_is_vtl_generic() {
+        assert_eq!(abi::WHV_INPUT_VTL::current().0, 0);
+        assert_eq!(abi::WHV_INPUT_VTL::target(1).0, 0x11);
+        assert_eq!(abi::WHV_INPUT_VTL::target(2).0, 0x12);
+        assert_eq!(abi::WHV_INPUT_VTL::all().0, 0x1f);
+    }
+}

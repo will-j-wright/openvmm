@@ -48,6 +48,9 @@ virt_support_aarch64emu.workspace = true
 virt_support_x86emu.workspace = true
 x86emu.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+test_with_tracing.workspace = true
+
 [build-dependencies]
 build_rs_guest_arch.workspace = true
 
