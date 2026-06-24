@@ -4,8 +4,8 @@
 use super::Vplc;
 use super::VtlPartition;
 use super::vtl2::Vtl2InterceptState;
+use crate::VsmError;
 use crate::WhpProcessor;
-use crate::vsm::RegisterAccessError;
 use guestmem::GuestMemoryError;
 use hvdef::HvDeliverabilityNotificationsRegister;
 use hvdef::HvError;
@@ -86,7 +86,7 @@ impl<'a> WhpProcessor<'a> {
         vtl: Vtl,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &mut [whp::abi::WHV_REGISTER_VALUE],
-    ) -> Result<(), RegisterAccessError> {
+    ) -> Result<(), VsmError> {
         let vsm = self.vp.partition.vsm.lock();
         if vsm.is_whp() {
             vsm.get_vp_registers(
@@ -107,7 +107,7 @@ impl<'a> WhpProcessor<'a> {
         &self,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &mut [whp::abi::WHV_REGISTER_VALUE],
-    ) -> Result<(), RegisterAccessError> {
+    ) -> Result<(), VsmError> {
         let vsm = self.vp.partition.vsm.lock();
         if vsm.is_whp() {
             vsm.get_vp_registers(
@@ -130,7 +130,7 @@ impl<'a> WhpProcessor<'a> {
         &self,
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &[whp::abi::WHV_REGISTER_VALUE],
-    ) -> Result<(), RegisterAccessError> {
+    ) -> Result<(), VsmError> {
         let vsm = self.vp.partition.vsm.lock();
         if vsm.is_whp() {
             vsm.set_vp_registers(

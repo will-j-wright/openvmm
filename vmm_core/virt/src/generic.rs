@@ -260,7 +260,7 @@ pub struct Vtl2Config {
     pub late_map_vtl0_memory: Option<LateMapVtl0MemoryConfig>,
 }
 
-/// Native VSM configuration.
+/// VSM configuration.
 #[derive(Debug)]
 pub struct VsmConfig {
     /// The highest VTL enabled for the guest partition.
@@ -272,7 +272,7 @@ pub struct VsmConfig {
 pub struct HvConfig {
     /// Allow device assignment on the partition.
     pub allow_device_assignment: bool,
-    /// Enable native VSM support if set.
+    /// Enable VSM support if set.
     ///
     /// During migration this may be set alongside [`Self::vtl2`], which still
     /// carries legacy OpenHCL-specific VTL2 options.

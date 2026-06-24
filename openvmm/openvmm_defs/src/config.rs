@@ -472,7 +472,7 @@ pub struct VmbusConfig {
 #[derive(Debug, MeshPayload, Default)]
 pub struct HypervisorConfig {
     pub with_hv: bool,
-    /// WHP VSM configuration.
+    /// VSM configuration.
     ///
     /// During migration this may be derived from [`Self::with_vtl2`], which
     /// still carries legacy OpenHCL-specific VTL2 options.
@@ -481,7 +481,7 @@ pub struct HypervisorConfig {
     pub with_isolation: Option<IsolationType>,
 }
 
-/// Configuration for WHP VSM.
+/// Configuration for VSM.
 ///
 /// This is separate from [`Vtl2Config`] so WHP VSM can be modeled as a
 /// VTL-generic feature instead of an OpenHCL-specific VTL2 path.

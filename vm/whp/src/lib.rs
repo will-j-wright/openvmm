@@ -31,6 +31,7 @@ use std::ptr::NonNull;
 use std::ptr::null;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::ERROR_BAD_PATHNAME;
+use windows_sys::Win32::Foundation::ERROR_TIMEOUT;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::System::Power::DEVICE_POWER_STATE;
 
@@ -195,6 +196,10 @@ impl WHvError {
 
     const ERROR_BAD_PATHNAME: Self = Self(NonZeroI32::new(ERROR_BAD_PATHNAME as i32).unwrap());
 
+    pub fn from_hresult(code: i32) -> Option<Self> {
+        NonZeroI32::new(code).map(Self)
+    }
+
     pub fn code(&self) -> i32 {
         self.0.get()
     }
@@ -207,6 +212,15 @@ impl WHvError {
         } else {
             None
         }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        const HV_STATUS_TIMEOUT: u16 = 0x0078;
+        const HRESULT_FROM_WIN32_ERROR_TIMEOUT: i32 = (0x80070000_u32 | ERROR_TIMEOUT) as i32;
+
+        self.hv_result()
+            .is_some_and(|status| status.get() == HV_STATUS_TIMEOUT)
+            || self.code() == HRESULT_FROM_WIN32_ERROR_TIMEOUT
     }
 }
 
@@ -227,6 +241,42 @@ impl std::error::Error for WHvError {}
 impl From<WHvError> for std::io::Error {
     fn from(err: WHvError) -> Self {
         std::io::Error::from_raw_os_error(err.0.get())
+    }
+}
+
+#[derive(Debug)]
+pub struct WHvOperationError {
+    error: WHvError,
+    elements_processed: u64,
+}
+
+impl WHvOperationError {
+    pub fn error(&self) -> &WHvError {
+        &self.error
+    }
+
+    pub fn elements_processed(&self) -> u64 {
+        self.elements_processed
+    }
+
+    pub fn into_parts(self) -> (WHvError, u64) {
+        (self.error, self.elements_processed)
+    }
+}
+
+impl fmt::Display for WHvOperationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} after processing {} elements",
+            self.error, self.elements_processed
+        )
+    }
+}
+
+impl std::error::Error for WHvOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -646,14 +696,14 @@ impl Partition {
         map_flags: abi::WHV_MAP_GPA_RANGE_FLAGS,
         guest_addresses: &[u64],
         target_vtl: abi::WHV_INPUT_VTL,
-    ) -> Result<u64> {
+    ) -> std::result::Result<u64, WHvOperationError> {
         if guest_addresses.is_empty() {
             return Ok(0);
         }
 
         let mut pages_processed = 0;
-        unsafe {
-            check_hresult(api::WHvModifyVtlProtectionMask(
+        let result = unsafe {
+            api::WHvModifyVtlProtectionMask(
                 self.handle,
                 vp_index,
                 map_flags,
@@ -661,7 +711,13 @@ impl Partition {
                 guest_addresses.len() as u64,
                 target_vtl,
                 &mut pages_processed,
-            ))?;
+            )
+        };
+        if let Err(error) = check_hresult(result) {
+            return Err(WHvOperationError {
+                error,
+                elements_processed: pages_processed,
+            });
         }
         Ok(pages_processed)
     }
@@ -670,20 +726,26 @@ impl Partition {
         &self,
         host_access: abi::WHV_MAP_GPA_RANGE_FLAGS,
         guest_addresses: &[u64],
-    ) -> Result<u64> {
+    ) -> std::result::Result<u64, WHvOperationError> {
         if guest_addresses.is_empty() {
             return Ok(0);
         }
 
         let mut pages_processed = 0;
-        unsafe {
-            check_hresult(api::WHvAcquireSparseGpaPageHostAccess(
+        let result = unsafe {
+            api::WHvAcquireSparseGpaPageHostAccess(
                 self.handle,
                 host_access,
                 guest_addresses.as_ptr(),
                 guest_addresses.len() as u64,
                 &mut pages_processed,
-            ))?;
+            )
+        };
+        if let Err(error) = check_hresult(result) {
+            return Err(WHvOperationError {
+                error,
+                elements_processed: pages_processed,
+            });
         }
         Ok(pages_processed)
     }
@@ -692,20 +754,26 @@ impl Partition {
         &self,
         host_access: abi::WHV_MAP_GPA_RANGE_FLAGS,
         guest_addresses: &[u64],
-    ) -> Result<u64> {
+    ) -> std::result::Result<u64, WHvOperationError> {
         if guest_addresses.is_empty() {
             return Ok(0);
         }
 
         let mut pages_processed = 0;
-        unsafe {
-            check_hresult(api::WHvReleaseSparseGpaPageHostAccess(
+        let result = unsafe {
+            api::WHvReleaseSparseGpaPageHostAccess(
                 self.handle,
                 host_access,
                 guest_addresses.as_ptr(),
                 guest_addresses.len() as u64,
                 &mut pages_processed,
-            ))?;
+            )
+        };
+        if let Err(error) = check_hresult(result) {
+            return Err(WHvOperationError {
+                error,
+                elements_processed: pages_processed,
+            });
         }
         Ok(pages_processed)
     }
@@ -715,21 +783,27 @@ impl Partition {
         guest_address: u64,
         vtl_set: u16,
         vtl_permissions: &mut [abi::WHV_VTL_PERMISSION_SET],
-    ) -> Result<u64> {
+    ) -> std::result::Result<u64, WHvOperationError> {
         if vtl_permissions.is_empty() {
             return Ok(0);
         }
 
         let mut pages_processed = 0;
-        unsafe {
-            check_hresult(api::WHvQueryVtlProtectionMaskRange(
+        let result = unsafe {
+            api::WHvQueryVtlProtectionMaskRange(
                 self.handle,
                 guest_address,
                 vtl_set,
                 vtl_permissions.as_mut_ptr(),
                 vtl_permissions.len() as u64,
                 &mut pages_processed,
-            ))?;
+            )
+        };
+        if let Err(error) = check_hresult(result) {
+            return Err(WHvOperationError {
+                error,
+                elements_processed: pages_processed,
+            });
         }
         Ok(pages_processed)
     }
@@ -739,21 +813,27 @@ impl Partition {
         guest_address: u64,
         vtl_set: u16,
         vtl_permissions: &[abi::WHV_VTL_PERMISSION_SET],
-    ) -> Result<u64> {
+    ) -> std::result::Result<u64, WHvOperationError> {
         if vtl_permissions.is_empty() {
             return Ok(0);
         }
 
         let mut pages_processed = 0;
-        unsafe {
-            check_hresult(api::WHvModifyVtlProtectionMaskRange(
+        let result = unsafe {
+            api::WHvModifyVtlProtectionMaskRange(
                 self.handle,
                 guest_address,
                 vtl_set,
                 vtl_permissions.as_ptr(),
                 vtl_permissions.len() as u64,
                 &mut pages_processed,
-            ))?;
+            )
+        };
+        if let Err(error) = check_hresult(result) {
+            return Err(WHvOperationError {
+                error,
+                elements_processed: pages_processed,
+            });
         }
         Ok(pages_processed)
     }

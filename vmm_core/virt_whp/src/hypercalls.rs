@@ -4,6 +4,7 @@
 use crate::Hv1State;
 use crate::WhpProcessor;
 use crate::memory::VtlAccess;
+use crate::vsm;
 use crate::vtl2;
 #[cfg(guest_arch = "aarch64")]
 use aarch64 as arch;
@@ -28,6 +29,92 @@ use x86 as arch;
 pub(crate) struct WhpHypercallExit<'a, 'b> {
     vp: &'a mut WhpProcessor<'b>,
     registers: arch::WhpHypercallRegisters<'a>,
+}
+
+fn whp_vsm_error_to_hv_error(err: &vsm::VsmError) -> HvError {
+    match err {
+        vsm::VsmError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
+        vsm::VsmError::VsmDisabled => HvError::AccessDenied,
+        vsm::VsmError::VtlNotEnabled { .. }
+        | vsm::VsmError::InvalidTargetVtl0
+        | vsm::VsmError::VpVtlNotEnabled { .. }
+        | vsm::VsmError::InvalidRegisterVtl { .. }
+        | vsm::VsmError::UnsupportedMapFlags { .. }
+        | vsm::VsmError::UnsupportedHostVisibility { .. }
+        | vsm::VsmError::GpaPageOverflow { .. } => HvError::InvalidParameter,
+        vsm::VsmError::InvalidRegisterValue => HvError::InvalidRegisterValue,
+        vsm::VsmError::VpVtlAlreadyEnabled { .. } => HvError::VtlAlreadyEnabled,
+        vsm::VsmError::WhpTimeout(_) => HvError::Timeout,
+        vsm::VsmError::GuestVsmHostSupportRequired(_) => HvError::UnknownRegisterName,
+        vsm::VsmError::Vtl0Only
+        | vsm::VsmError::IncompatibleWithIsolation
+        | vsm::VsmError::HostUnsupported
+        | vsm::VsmError::InvalidActiveVtl { .. }
+        | vsm::VsmError::ShortOperation { .. }
+        | vsm::VsmError::WhpOperation { .. }
+        | vsm::VsmError::Whp(_) => HvError::OperationFailed,
+        #[cfg(not(guest_arch = "x86_64"))]
+        vsm::VsmError::UnsupportedArchitecture => HvError::OperationFailed,
+    }
+}
+
+fn whp_vsm_protection_error_to_hv_result_ref(err: &vsm::VsmError) -> (HvError, usize) {
+    let completed = err.completed_pages();
+    let hv_error = match err {
+        vsm::VsmError::WhpTimeout(_) => HvError::Timeout,
+        vsm::VsmError::WhpOperation { source, .. } | vsm::VsmError::Whp(source) => {
+            if source.is_timeout() {
+                HvError::Timeout
+            } else {
+                source
+                    .hv_result()
+                    .map_or(HvError::OperationFailed, HvError::from)
+            }
+        }
+        _ => whp_vsm_error_to_hv_error(err),
+    };
+
+    (hv_error, completed)
+}
+
+fn whp_vsm_protection_error_to_hv_result(err: vsm::VsmError) -> (HvError, usize) {
+    let (hv_error, completed) = whp_vsm_protection_error_to_hv_result_ref(&err);
+    tracing::trace!(
+        error = &err as &dyn std::error::Error,
+        ?hv_error,
+        completed,
+        "VSM protection operation rejected"
+    );
+    (hv_error, completed)
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct WhpVsmProtectionPageSummary {
+    first_gpfn: Option<u64>,
+    last_gpfn: Option<u64>,
+    min_gpfn: Option<u64>,
+    max_gpfn: Option<u64>,
+    contiguous: bool,
+    first_gpa: Option<u64>,
+    last_gpa: Option<u64>,
+}
+
+fn whp_vsm_protection_page_summary(gpa_pages: &[u64]) -> WhpVsmProtectionPageSummary {
+    WhpVsmProtectionPageSummary {
+        first_gpfn: gpa_pages.first().copied(),
+        last_gpfn: gpa_pages.last().copied(),
+        min_gpfn: gpa_pages.iter().copied().min(),
+        max_gpfn: gpa_pages.iter().copied().max(),
+        contiguous: gpa_pages
+            .windows(2)
+            .all(|pages| pages[0].checked_add(1) == Some(pages[1])),
+        first_gpa: gpa_pages
+            .first()
+            .and_then(|gpfn| gpfn.checked_mul(HV_PAGE_SIZE)),
+        last_gpa: gpa_pages
+            .last()
+            .and_then(|gpfn| gpfn.checked_mul(HV_PAGE_SIZE)),
+    }
 }
 
 impl WhpHypercallExit<'_, '_> {
@@ -402,6 +489,60 @@ impl hv1_hypercall::ModifyVtlProtectionMask for WhpHypercallExit<'_, '_> {
             return Err((HvError::AccessDenied, 0));
         }
 
+        let partition = self.vp.vp.partition;
+        {
+            let vsm = partition.vsm.lock();
+            if vsm.is_whp() {
+                let vp_index = self.vp.vp.index;
+                let whp_input_vtl = vsm.input_vtl(target_vtl).0;
+                let pages = whp_vsm_protection_page_summary(gpa_pages);
+                let result = vsm.modify_vtl_protection_mask(
+                    &partition.vtl0.whp,
+                    vp_index,
+                    map_flags,
+                    target_vtl,
+                    gpa_pages,
+                );
+                if let Err(error) = &result {
+                    let (hv_error, processed) = whp_vsm_protection_error_to_hv_result_ref(error);
+                    let whp_error = error.whp_error();
+                    tracing::debug!(
+                        software_active_vtl = ?self.vp.state.active_vtl,
+                        vp_index = vp_index.index(),
+                        target_current = target_vtl.is_none(),
+                        ?target_vtl,
+                        whp_input_vtl,
+                        page_count = gpa_pages.len(),
+                        first_gpfn = pages.first_gpfn,
+                        last_gpfn = pages.last_gpfn,
+                        min_gpfn = pages.min_gpfn,
+                        max_gpfn = pages.max_gpfn,
+                        contiguous = pages.contiguous,
+                        first_gpa = pages.first_gpa,
+                        last_gpa = pages.last_gpa,
+                        flags = u32::from(map_flags),
+                        whp_hresult = whp_error.map(|error| error.code() as u32),
+                        whp_hv_status = whp_error
+                            .and_then(whp::WHvError::hv_result)
+                            .map(|status| status.get()),
+                        pages_processed = processed,
+                        failed_gpfn = gpa_pages.get(processed).copied(),
+                        ?hv_error,
+                        whp_result = if hv_error == HvError::Timeout {
+                            "timeout"
+                        } else {
+                            "failure"
+                        },
+                        error = error as &dyn std::error::Error,
+                        "WHP VSM protection failed"
+                    );
+                }
+                return result
+                    .map(|_| ())
+                    .map_err(whp_vsm_protection_error_to_hv_result);
+            }
+        }
+
         // TODO: Target VTL must be 2, or current executing VTL. Current VTL2
         //       must be 2. Do not support VTL changes from lower VTLs yet.
         if self.vp.state.active_vtl != Vtl::Vtl2 {
@@ -587,6 +728,22 @@ impl hv1_hypercall::AcceptGpaPages for WhpHypercallExit<'_, '_> {
             return Err((HvError::AccessDenied, 0));
         }
 
+        let partition = self.vp.vp.partition;
+        {
+            let vsm = partition.vsm.lock();
+            if vsm.is_whp() {
+                return vsm
+                    .accept_gpa_pages_no_security_shim(
+                        &partition.vtl0.whp,
+                        page_attributes,
+                        vtl_permission_set,
+                        gpa_page_base,
+                        page_count,
+                    )
+                    .map_err(whp_vsm_protection_error_to_hv_result);
+            }
+        }
+
         let visibility = match page_attributes.host_visibility() {
             HostVisibilityType::PRIVATE => PageVisibility::Exclusive,
             HostVisibilityType::SHARED => PageVisibility::Shared,
@@ -611,7 +768,6 @@ impl hv1_hypercall::AcceptGpaPages for WhpHypercallExit<'_, '_> {
 
         tracing::trace!(gpa_page_base, page_count, "accept gpa pages hypercall");
 
-        let partition = self.vp.vp.partition;
         let range =
             MemoryRange::from_4k_gpn_range(gpa_page_base..(gpa_page_base + page_count as u64));
         partition
@@ -650,13 +806,25 @@ impl hv1_hypercall::ModifySparseGpaPageHostVisibility for WhpHypercallExit<'_, '
             return Err((HvError::AccessDenied, 0));
         }
 
+        let partition = self.vp.vp.partition;
+        {
+            let vsm = partition.vsm.lock();
+            if vsm.is_whp() {
+                return vsm
+                    .modify_sparse_gpa_page_host_visibility(
+                        &partition.vtl0.whp,
+                        visibility,
+                        gpa_pages,
+                    )
+                    .map_err(whp_vsm_protection_error_to_hv_result);
+            }
+        }
+
         let visibility = match visibility {
             HostVisibilityType::PRIVATE => PageVisibility::Exclusive,
             HostVisibilityType::SHARED => PageVisibility::Shared,
             _ => return Err((HvError::InvalidParameter, 0)),
         };
-
-        let partition = self.vp.vp.partition;
 
         for (index, page) in gpa_pages.iter().enumerate() {
             let range = MemoryRange::from_4k_gpn_range(*page..(*page + 1));
@@ -793,55 +961,48 @@ mod x86 {
         }
     }
 
-    fn vsm_access_error_to_hv_error(err: vsm::VpVtlAccessError) -> HvError {
-        let hv_error = match err {
-            vsm::VpVtlAccessError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
-            vsm::VpVtlAccessError::WhpDisabled => HvError::AccessDenied,
-            vsm::VpVtlAccessError::VtlNotEnabled { .. }
-            | vsm::VpVtlAccessError::VpVtlNotEnabled { .. }
-            | vsm::VpVtlAccessError::InvalidRegisterVtl { .. } => HvError::InvalidParameter,
-            vsm::VpVtlAccessError::InvalidRegisterValue => HvError::InvalidRegisterValue,
-        };
+    fn vsm_access_error_to_hv_error(err: vsm::VsmError) -> HvError {
+        let hv_error = super::whp_vsm_error_to_hv_error(&err);
         tracing::trace!(
             error = &err as &dyn std::error::Error,
             ?hv_error,
-            "WHP VSM access validation failed"
+            "VSM access validation failed"
         );
         hv_error
     }
 
-    fn vsm_register_error_to_hv_error(err: vsm::RegisterAccessError) -> HvError {
+    fn vsm_register_error_to_hv_error(err: vsm::VsmError) -> HvError {
         match err {
-            vsm::RegisterAccessError::Access(err) => vsm_access_error_to_hv_error(err),
-            vsm::RegisterAccessError::Whp(err) => {
+            vsm::VsmError::Whp(err) => {
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
-                    "WHP VSM register access failed"
+                    "VSM register access failed"
                 );
                 err.hv_result()
                     .map_or(HvError::InvalidParameter, HvError::from)
             }
+            err => vsm_access_error_to_hv_error(err),
         }
     }
 
-    fn enable_vp_vtl_error_to_hv_error(err: vsm::EnableVpVtlError) -> HvError {
+    fn enable_vp_vtl_error_to_hv_error(err: vsm::VsmError) -> HvError {
         match err {
-            vsm::EnableVpVtlError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
-            vsm::EnableVpVtlError::AlreadyEnabled { .. } => HvError::VtlAlreadyEnabled,
-            vsm::EnableVpVtlError::NotEnabled { .. } => {
-                tracing::trace!(
-                    error = &err as &dyn std::error::Error,
-                    "WHP VSM VP VTL enable rejected"
-                );
-                HvError::InvalidParameter
-            }
-            vsm::EnableVpVtlError::Whp(err) => {
+            vsm::VsmError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
+            vsm::VsmError::VpVtlAlreadyEnabled { .. } => HvError::VtlAlreadyEnabled,
+            vsm::VsmError::Whp(err) => {
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
-                    "failed to enable WHP VSM VP VTL"
+                    "failed to enable VSM VP VTL"
                 );
                 err.hv_result()
                     .map_or(HvError::OperationFailed, HvError::from)
+            }
+            err => {
+                tracing::trace!(
+                    error = &err as &dyn std::error::Error,
+                    "VSM VP VTL enable rejected"
+                );
+                HvError::InvalidParameter
             }
         }
     }
@@ -1447,7 +1608,12 @@ mod x86 {
             if partition.vsm.lock().is_whp() {
                 let initial_context = whp_initial_vp_context(vp_context);
 
-                tracing::debug!(vp_index = vp_index.index(), ?vtl, "enabling WHP VSM VTL");
+                tracing::info!(
+                    vp_index = vp_index.index(),
+                    ?vtl,
+                    ?initial_context,
+                    "enabling VSM VP VTL"
+                );
                 partition
                     .vsm
                     .lock()
@@ -1464,7 +1630,7 @@ mod x86 {
                             tracing::error!(
                                 vp_index = vp_index.index(),
                                 error = &err as &dyn std::error::Error,
-                                "failed to cancel WHP VSM target VP"
+                                "failed to cancel VSM target VP"
                             );
                             HvError::OperationFailed
                         })?;
@@ -1588,7 +1754,7 @@ mod x86 {
                     tracing::trace!(
                         active_vtl = ?self.state.active_vtl,
                         enabled_vtl_set,
-                        "WHP VSM VP status returned"
+                        "VSM VP status returned"
                     );
                     u64::from(status).into()
                 }
@@ -1602,7 +1768,7 @@ mod x86 {
                         .map_err(|err| {
                             tracing::error!(
                                 error = &err as &dyn std::error::Error,
-                                "failed to read WHP VSM reference time"
+                                "failed to read VSM reference time"
                             );
                             HvError::InvalidParameter
                         })?
@@ -1650,13 +1816,12 @@ mod x86 {
                     let vsm_config = HvRegisterVsmPartitionConfig::from(value.as_u64());
                     vsm.set_vsm_partition_config(self.vp.index, vtl, vsm_config)
                         .map_err(vsm_access_error_to_hv_error)?;
-                    tracing::trace!(?vsm_config, "set WHP VSM partition config");
+                    tracing::trace!(?vsm_config, "set VSM partition config");
                 }
                 HvX64RegisterName::GuestVsmPartitionConfig => {
                     let guest_vsm_config = HvRegisterGuestVsmPartitionConfig::from(value.as_u64());
                     vsm.validate_guest_vsm_partition_config(self.vp.index, vtl, guest_vsm_config)
                         .map_err(vsm_access_error_to_hv_error)?;
-                    tracing::trace!(?guest_vsm_config, "set WHP guest VSM partition config");
                 }
                 reg => {
                     let Ok(name) = regs::hv_register_to_whp(reg) else {
