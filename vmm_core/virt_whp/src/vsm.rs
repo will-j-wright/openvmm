@@ -653,3 +653,102 @@ impl VsmController {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn whp_vsm_controller(max_vtl: Vtl, vp_count: u32) -> VsmController {
+        VsmController {
+            mode: VsmMode::Whp,
+            state: vtl_state(max_vtl, vp_count),
+        }
+    }
+
+    #[test]
+    fn configured_vtls_are_vtl_generic() {
+        assert_eq!(configured_vtls(Vtl::Vtl1).collect::<Vec<_>>(), [Vtl::Vtl1]);
+        assert_eq!(
+            configured_vtls(Vtl::Vtl2).collect::<Vec<_>>(),
+            [Vtl::Vtl1, Vtl::Vtl2]
+        );
+    }
+
+    #[test]
+    fn whp_vsm_configuration_overrides_legacy_vtl2() {
+        assert!(crate::use_legacy_vtl2(false, true));
+        assert!(!crate::use_legacy_vtl2(true, true));
+        assert!(!crate::use_legacy_vtl2(true, false));
+        assert!(!crate::use_legacy_vtl2(false, false));
+    }
+
+    #[test]
+    fn protection_gpfns_convert_to_byte_gpas_without_reordering() {
+        assert_eq!(
+            gpa_pages_to_addresses(&[0x123, 0x124, 0x200]).unwrap(),
+            [0x123000, 0x124000, 0x200000]
+        );
+    }
+
+    #[test]
+    fn whp_vsm_state_tracks_enabled_vtls_generically() {
+        let mut controller = whp_vsm_controller(Vtl::Vtl2, 2);
+        let vp_index = VpIndex::new(1);
+
+        assert_eq!(controller.vp_enabled_vtl_bits(vp_index).unwrap(), 1);
+        assert!(matches!(
+            controller.validate_vp_vtl_enabled(vp_index, Vtl::Vtl1),
+            Err(VsmError::VtlNotEnabled { vtl: Vtl::Vtl1 })
+        ));
+
+        for vtl in configured_vtls(controller.max_vtl()) {
+            controller.state.partition_vtls.set(vtl);
+            controller.state.vp_vtls[vp_index.index() as usize].set(vtl);
+        }
+
+        for vtl in [Vtl::Vtl0, Vtl::Vtl1, Vtl::Vtl2] {
+            controller.validate_vp_vtl_enabled(vp_index, vtl).unwrap();
+        }
+
+        assert_eq!(controller.vp_enabled_vtl_bits(vp_index).unwrap(), 0b111);
+        assert_eq!(controller.input_vtl(None).0, 0);
+        assert_eq!(controller.input_vtl(Some(Vtl::Vtl1)).0, 0x11);
+        assert_eq!(controller.input_vtl(Some(Vtl::Vtl2)).0, 0x12);
+    }
+
+    #[test]
+    fn whp_vsm_protection_current_target_uses_whp_current_vtl() {
+        let controller = whp_vsm_controller(Vtl::Vtl1, 1);
+
+        assert_eq!(
+            controller.protection_input_vtl(None).unwrap(),
+            whp::abi::WHV_INPUT_VTL::current()
+        );
+    }
+
+    #[test]
+    fn whp_vsm_protection_explicit_vtl1_does_not_require_software_active_vtl() {
+        let mut controller = whp_vsm_controller(Vtl::Vtl1, 1);
+        controller.state.partition_vtls.set(Vtl::Vtl1);
+
+        assert_eq!(
+            controller.protection_input_vtl(Some(Vtl::Vtl1)).unwrap(),
+            whp::abi::WHV_INPUT_VTL::target(1)
+        );
+    }
+
+    #[test]
+    fn whp_vsm_protection_rejects_vtl0_and_disabled_vtl() {
+        let controller = whp_vsm_controller(Vtl::Vtl1, 1);
+
+        assert!(matches!(
+            controller.protection_input_vtl(Some(Vtl::Vtl0)),
+            Err(VsmError::InvalidTargetVtl0)
+        ));
+        assert!(matches!(
+            controller.protection_input_vtl(Some(Vtl::Vtl1)),
+            Err(VsmError::VtlNotEnabled { vtl: Vtl::Vtl1 })
+        ));
+    }
+}
