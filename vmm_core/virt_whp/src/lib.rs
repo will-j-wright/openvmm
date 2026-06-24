@@ -24,6 +24,8 @@ mod vp_state;
 mod vsm;
 mod vtl2;
 
+pub use vsm::VsmError;
+
 use crate::memory::vtl2_mapper::MappingState;
 use crate::memory::vtl2_mapper::ResetMappingState;
 #[cfg(guest_arch = "aarch64")]
@@ -794,19 +796,6 @@ pub struct WhpProcessor<'a> {
 struct WhpVpRef<'a> {
     partition: &'a WhpPartitionInner,
     index: VpIndex,
-}
-
-#[derive(Error, Debug)]
-pub enum VsmError {
-    #[error("WHP VSM requires a maximum VTL above VTL0")]
-    Vtl0Only,
-    #[cfg(not(guest_arch = "x86_64"))]
-    #[error("WHP VSM is currently only supported for x64 guests")]
-    UnsupportedArchitecture,
-    #[error("WHP VSM is incompatible with isolated partitions in this prototype")]
-    IncompatibleWithIsolation,
-    #[error("the host does not support the WHP VSM APIs")]
-    HostUnsupported,
 }
 
 // TODO: Chunk this up into smaller types.
@@ -1721,7 +1710,7 @@ impl VtlPartition {
 
         if let Some(vsm) = vsm.as_deref_mut().filter(|_| vtl == Vtl::Vtl0) {
             vsm.set_partition_properties_before_setup(&mut whp_config)
-                .for_op("set WHP VSM partition properties")?;
+                .for_op("set VSM partition properties")?;
         }
 
         let whp = whp_config.create().for_op("set up partition")?;
@@ -1733,7 +1722,7 @@ impl VtlPartition {
 
         if let Some(vsm) = vsm.filter(|_| vtl == Vtl::Vtl0) {
             vsm.enable_partition_vtls_after_setup(&whp)
-                .for_op("enable WHP VSM partition VTLs")?;
+                .for_op("enable VSM partition VTLs")?;
         }
 
         let vplcs = config
