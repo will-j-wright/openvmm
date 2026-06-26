@@ -31,6 +31,35 @@ pub(crate) struct WhpHypercallExit<'a, 'b> {
     registers: arch::WhpHypercallRegisters<'a>,
 }
 
+#[derive(Debug, Copy, Clone)]
+enum RegisterTarget {
+    Current,
+    Vtl(Vtl),
+}
+
+impl RegisterTarget {
+    fn from_option(vtl: Option<Vtl>) -> Self {
+        match vtl {
+            Some(vtl) => Self::Vtl(vtl),
+            None => Self::Current,
+        }
+    }
+
+    fn explicit(self) -> Option<Vtl> {
+        match self {
+            Self::Current => None,
+            Self::Vtl(vtl) => Some(vtl),
+        }
+    }
+
+    fn resolve_for_emulation(self, active_vtl: Vtl) -> Vtl {
+        match self {
+            Self::Current => active_vtl,
+            Self::Vtl(vtl) => vtl,
+        }
+    }
+}
+
 fn whp_vsm_error_to_hv_error(err: &vsm::VsmError) -> HvError {
     match err {
         vsm::VsmError::InvalidVpIndex(_) => HvError::InvalidVpIndex,
@@ -114,6 +143,55 @@ fn whp_vsm_protection_page_summary(gpa_pages: &[u64]) -> WhpVsmProtectionPageSum
         last_gpa: gpa_pages
             .last()
             .and_then(|gpfn| gpfn.checked_mul(HV_PAGE_SIZE)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn whp_vsm_register_timeout_maps_to_hv_timeout() {
+        for hresult in [0x80350078_u32, 0x800705b4] {
+            let timeout = whp::WHvError::from_hresult(hresult as i32).expect("nonzero HRESULT");
+            assert!(timeout.is_timeout());
+            assert_eq!(
+                whp_vsm_error_to_hv_error(&vsm::VsmError::WhpTimeout(timeout)),
+                HvError::Timeout
+            );
+        }
+    }
+
+    #[test]
+    fn whp_vsm_protection_timeout_preserves_progress() {
+        let timeout = whp::WHvError::from_hresult(0x80350078_u32 as i32).expect("nonzero HRESULT");
+        let error = vsm::VsmError::WhpOperation {
+            source: timeout,
+            processed: 3,
+        };
+
+        assert_eq!(
+            whp_vsm_protection_error_to_hv_result_ref(&error),
+            (HvError::Timeout, 3)
+        );
+    }
+
+    #[test]
+    fn whp_vsm_protection_page_summary_preserves_gpfn_order_and_gpa_units() {
+        assert_eq!(
+            whp_vsm_protection_page_summary(&[0x123, 0x124, 0x125]),
+            WhpVsmProtectionPageSummary {
+                first_gpfn: Some(0x123),
+                last_gpfn: Some(0x125),
+                min_gpfn: Some(0x123),
+                max_gpfn: Some(0x125),
+                contiguous: true,
+                first_gpa: Some(0x123000),
+                last_gpa: Some(0x125000),
+            }
+        );
+        assert!(!whp_vsm_protection_page_summary(&[3, 5, 4]).contiguous);
     }
 }
 
@@ -325,22 +403,51 @@ impl hv1_hypercall::GetVpRegisters for WhpHypercallExit<'_, '_> {
         registers: &[hvdef::HvRegisterName],
         output: &mut [hvdef::HvRegisterValue],
     ) -> HvRepResult {
-        tracing::trace!(partition_id, vp_index, ?vtl, ?registers, "get_vp_registers");
+        let target = RegisterTarget::from_option(vtl);
+        tracing::debug!(
+            active_vtl = ?self.vp.state.active_vtl,
+            partition_id,
+            vp_index,
+            ?target,
+            ?registers,
+            "get_vp_registers"
+        );
         if partition_id != HV_PARTITION_ID_SELF || vp_index != HV_VP_INDEX_SELF {
             return Err((HvError::InvalidParameter, 0));
         }
 
-        let vtl = if let Some(vtl) = vtl {
-            if vtl > self.vp.state.active_vtl {
+        let whp_vsm = self.vp.vp.partition.vsm.lock().is_whp();
+        if !whp_vsm {
+            if let RegisterTarget::Vtl(vtl) = target
+                && vtl > self.vp.state.active_vtl
+            {
                 return Err((HvError::AccessDenied, 0));
             }
-            vtl
-        } else {
-            self.vp.state.active_vtl
-        };
+        }
 
         for (i, (&name, output)) in zip(registers, output).enumerate() {
-            *output = self.vp.get_vp_register(vtl, name).map_err(|e| (e, i))?;
+            match self.vp.get_vp_register(target, name) {
+                Ok(value) => {
+                    tracing::debug!(
+                        active_vtl = ?self.vp.state.active_vtl,
+                        ?target,
+                        ?name,
+                        ?value,
+                        "get_vp_registers returned register"
+                    );
+                    *output = value;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        active_vtl = ?self.vp.state.active_vtl,
+                        ?target,
+                        ?name,
+                        error = ?err,
+                        "get_vp_registers rejected register"
+                    );
+                    return Err((err, i));
+                }
+            }
         }
         Ok(())
     }
@@ -354,26 +461,25 @@ impl hv1_hypercall::SetVpRegisters for WhpHypercallExit<'_, '_> {
         vtl: Option<Vtl>,
         registers: &[hvdef::hypercall::HvRegisterAssoc],
     ) -> HvRepResult {
-        tracing::trace!(partition_id, vp_index, ?vtl, ?registers, "set_vp_registers");
+        let target = RegisterTarget::from_option(vtl);
         if partition_id != HV_PARTITION_ID_SELF || vp_index != HV_VP_INDEX_SELF {
             return Err((HvError::InvalidParameter, 0));
         }
 
-        let vtl = if let Some(vtl) = vtl {
-            if vtl > self.vp.state.active_vtl {
+        let whp_vsm = self.vp.vp.partition.vsm.lock().is_whp();
+        if !whp_vsm {
+            if let RegisterTarget::Vtl(vtl) = target
+                && vtl > self.vp.state.active_vtl
+            {
                 return Err((HvError::AccessDenied, 0));
             }
-            vtl
-        } else {
-            self.vp.state.active_vtl
-        };
-
-        for (i, reg) in registers.iter().enumerate() {
-            self.vp
-                .set_vp_register(vtl, reg.name, &reg.value)
-                .map_err(|e| (e, i))?;
         }
 
+        for (i, reg) in registers.iter().enumerate() {
+            if let Err(err) = self.vp.set_vp_register(target, reg.name, &reg.value) {
+                return Err((err, i));
+            }
+        }
         Ok(())
     }
 }
@@ -872,6 +978,7 @@ impl hv1_hypercall::VbsVmCallReport for WhpHypercallExit<'_, '_> {
 
 #[cfg(guest_arch = "x86_64")]
 mod x86 {
+    use super::RegisterTarget;
     use super::WhpHypercallExit;
     use crate::WhpProcessor;
     use crate::regs;
@@ -973,13 +1080,31 @@ mod x86 {
 
     fn vsm_register_error_to_hv_error(err: vsm::VsmError) -> HvError {
         match err {
+            vsm::VsmError::WhpTimeout(err) => {
+                tracing::debug!(
+                    error = &err as &dyn std::error::Error,
+                    "VSM register access timed out"
+                );
+                HvError::Timeout
+            }
+            vsm::VsmError::GuestVsmHostSupportRequired(err) => {
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "updated WHP Guest VSM host support required"
+                );
+                HvError::UnknownRegisterName
+            }
             vsm::VsmError::Whp(err) => {
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
                     "VSM register access failed"
                 );
-                err.hv_result()
-                    .map_or(HvError::InvalidParameter, HvError::from)
+                if err.is_timeout() {
+                    HvError::Timeout
+                } else {
+                    err.hv_result()
+                        .map_or(HvError::InvalidParameter, HvError::from)
+                }
             }
             err => vsm_access_error_to_hv_error(err),
         }
@@ -1003,6 +1128,23 @@ mod x86 {
                     "VSM VP VTL enable rejected"
                 );
                 HvError::InvalidParameter
+            }
+        }
+    }
+
+    fn whp_vsm_pseudo_register_target(
+        vsm: &vsm::VsmController,
+        target: RegisterTarget,
+    ) -> HvResult<Vtl> {
+        match target {
+            RegisterTarget::Vtl(vtl) => Ok(vtl),
+            RegisterTarget::Current if vsm.max_vtl() == Vtl::Vtl1 => Ok(Vtl::Vtl1),
+            RegisterTarget::Current => {
+                tracing::error!(
+                    max_vtl = ?vsm.max_vtl(),
+                    "cannot resolve WHP VSM target-current pseudo-register"
+                );
+                Err(HvError::InvalidParameter)
             }
         }
     }
@@ -1763,7 +1905,7 @@ mod x86 {
     impl WhpProcessor<'_> {
         fn get_whp_vsm_register(
             &mut self,
-            vtl: Vtl,
+            target: RegisterTarget,
             name: HvRegisterName,
         ) -> HvResult<Option<HvRegisterValue>> {
             let partition = self.vp.partition;
@@ -1772,27 +1914,60 @@ mod x86 {
                 return Ok(None);
             }
 
+            let get_whp_register = |name: HvRegisterName| {
+                let whp_name = regs::hv_register_to_whp(HvX64RegisterName::from(name))
+                    .unwrap_or(whp::abi::WHV_REGISTER_NAME(name.0));
+                let mut whp_value = [Default::default(); 1];
+                vsm.get_vp_registers(
+                    self.vp.index,
+                    partition.vtl0.whp.vp(self.vp.index.index()),
+                    target.explicit(),
+                    &[whp_name],
+                    &mut whp_value,
+                )
+                .map_err(vsm_register_error_to_hv_error)?;
+
+                // SAFETY: HvRegisterValue and WHV_REGISTER_VALUE are the same.
+                Ok(unsafe {
+                    std::mem::transmute::<WHV_REGISTER_VALUE, HvRegisterValue>(whp_value[0])
+                })
+            };
+
             let value = match name.into() {
+                HvX64RegisterName::VsmCodePageOffsets => {
+                    let value = get_whp_register(name)?;
+                    let offsets = hvdef::HvRegisterVsmCodePageOffsets::from(value.as_u64());
+                    tracing::info!(
+                        active_vtl = ?self.state.active_vtl,
+                        ?target,
+                        call_offset = offsets.call_offset(),
+                        return_offset = offsets.return_offset(),
+                        raw = value.as_u64(),
+                        "WHP VSM code page offsets returned by WHP"
+                    );
+                    value
+                }
                 HvX64RegisterName::VsmPartitionConfig => {
+                    let vtl = whp_vsm_pseudo_register_target(&vsm, target)?;
                     let config = vsm
                         .vsm_partition_config(self.vp.index, vtl)
                         .map_err(vsm_access_error_to_hv_error)?;
                     u64::from(config).into()
                 }
                 HvX64RegisterName::GuestVsmPartitionConfig => {
+                    let vtl = whp_vsm_pseudo_register_target(&vsm, target)?;
                     let config = vsm
                         .guest_vsm_partition_config(self.vp.index, vtl)
                         .map_err(vsm_access_error_to_hv_error)?;
                     u64::from(config).into()
                 }
                 HvX64RegisterName::VsmVpStatus => {
-                    vsm.validate_vp_vtl_enabled(self.vp.index, vtl)
-                        .map_err(vsm_access_error_to_hv_error)?;
+                    let vtl = whp_vsm_pseudo_register_target(&vsm, target)?;
                     let enabled_vtl_set = vsm
-                        .vp_enabled_vtl_bits(self.vp.index)
+                        .partition_enabled_vtl_bits()
                         .map_err(vsm_access_error_to_hv_error)?;
                     let status = hvdef::HvRegisterVsmVpStatus::new()
-                        .with_active_vtl(self.state.active_vtl as u8)
+                        .with_active_vtl(u8::from(vtl))
                         .with_active_mbec_enabled(false)
                         .with_enabled_vtl_set(enabled_vtl_set);
                     tracing::trace!(
@@ -1802,7 +1977,27 @@ mod x86 {
                     );
                     u64::from(status).into()
                 }
+                HvX64RegisterName::VsmCapabilities => {
+                    let vtl = whp_vsm_pseudo_register_target(&vsm, target)?;
+                    vsm.vsm_partition_config(self.vp.index, vtl)
+                        .map_err(vsm_access_error_to_hv_error)?;
+                    let capabilities = hvdef::HvRegisterVsmCapabilities::new()
+                        .with_dr6_shared(!partition.caps.vendor.is_amd_compatible())
+                        .with_mbec_vtl_mask(1)
+                        .with_deny_lower_vtl_startup(true)
+                        .with_intercept_page_available(true);
+                    tracing::trace!(
+                        active_vtl = ?self.state.active_vtl,
+                        ?vtl,
+                        ?capabilities,
+                        "VSM capabilities returned"
+                    );
+                    u64::from(capabilities).into()
+                }
                 HvX64RegisterName::TimeRefCount => {
+                    let Some(vtl) = target.explicit() else {
+                        return get_whp_register(name).map(Some);
+                    };
                     vsm.validate_vp_vtl_enabled(self.vp.index, vtl)
                         .map_err(vsm_access_error_to_hv_error)?;
                     partition
@@ -1819,24 +2014,8 @@ mod x86 {
                         .into()
                 }
                 reg => {
-                    let Ok(name) = regs::hv_register_to_whp(reg) else {
-                        return Ok(None);
-                    };
-
-                    let mut whp_value = [Default::default(); 1];
-                    vsm.get_vp_registers(
-                        self.vp.index,
-                        partition.vtl0.whp.vp(self.vp.index.index()),
-                        Some(vtl),
-                        &[name],
-                        &mut whp_value,
-                    )
-                    .map_err(vsm_register_error_to_hv_error)?;
-
-                    // SAFETY: HvRegisterValue and WHV_REGISTER_VALUE are the same.
-                    unsafe {
-                        std::mem::transmute::<WHV_REGISTER_VALUE, HvRegisterValue>(whp_value[0])
-                    }
+                    let name = HvRegisterName::from(reg);
+                    get_whp_register(name)?
                 }
             };
 
@@ -1845,33 +2024,88 @@ mod x86 {
 
         fn set_whp_vsm_register(
             &mut self,
-            vtl: Vtl,
+            target: RegisterTarget,
             name: HvRegisterName,
             value: &HvRegisterValue,
         ) -> HvResult<Option<()>> {
             let partition = self.vp.partition;
-            let mut vsm = partition.vsm.lock();
+            let vsm = partition.vsm.lock();
             if !vsm.is_whp() {
                 return Ok(None);
             }
 
             match name.into() {
                 HvX64RegisterName::VsmPartitionConfig => {
+                    let vtl = whp_vsm_pseudo_register_target(&vsm, target)?;
                     let vsm_config = HvRegisterVsmPartitionConfig::from(value.as_u64());
-                    vsm.set_vsm_partition_config(self.vp.index, vtl, vsm_config)
+                    let write = vsm
+                        .prepare_vsm_partition_config_write(self.vp.index, vtl, vsm_config)
                         .map_err(vsm_access_error_to_hv_error)?;
-                    tracing::trace!(?vsm_config, "set VSM partition config");
+                    drop(vsm);
+
+                    tracing::debug!(
+                        vp_index = write.vp_index().index(),
+                        target_vtl = ?write.target_vtl(),
+                        vsm_partition_config = write.value(),
+                        "WHP VSM partition config requested"
+                    );
+
+                    let whp_result = partition
+                        .vtl0
+                        .whp
+                        .vp(write.vp_index().index())
+                        .set_registers_for_vtl(
+                            whp::abi::WHV_INPUT_VTL::target(u8::from(write.target_vtl())),
+                            &[whp::abi::WHvRegisterVsmPartitionConfig],
+                            &[WHV_REGISTER_VALUE(write.value().into())],
+                        )
+                        .map_err(vsm::vsm_partition_config_whp_error);
+
+                    let result = partition
+                        .vsm
+                        .lock()
+                        .complete_vsm_partition_config_write(write, whp_result);
+                    match &result {
+                        Ok(()) => tracing::debug!(
+                            vp_index = write.vp_index().index(),
+                            target_vtl = ?write.target_vtl(),
+                            vsm_partition_config = write.value(),
+                            whp_result = "success",
+                            local_shadow_committed = true,
+                            "WHP VSM partition config completed"
+                        ),
+                        Err(vsm::VsmError::WhpTimeout(error)) => tracing::debug!(
+                            vp_index = write.vp_index().index(),
+                            target_vtl = ?write.target_vtl(),
+                            vsm_partition_config = write.value(),
+                            whp_result = "timeout",
+                            local_shadow_committed = false,
+                            error = error as &dyn std::error::Error,
+                            "WHP VSM partition config incomplete"
+                        ),
+                        Err(error) => tracing::error!(
+                            vp_index = write.vp_index().index(),
+                            target_vtl = ?write.target_vtl(),
+                            vsm_partition_config = write.value(),
+                            whp_result = "failure",
+                            local_shadow_committed = false,
+                            error = error as &dyn std::error::Error,
+                            "WHP VSM partition config failed"
+                        ),
+                    }
+                    result.map_err(vsm_register_error_to_hv_error)?;
+                    return Ok(Some(()));
                 }
                 HvX64RegisterName::GuestVsmPartitionConfig => {
+                    let vtl = whp_vsm_pseudo_register_target(&vsm, target)?;
                     let guest_vsm_config = HvRegisterGuestVsmPartitionConfig::from(value.as_u64());
                     vsm.validate_guest_vsm_partition_config(self.vp.index, vtl, guest_vsm_config)
                         .map_err(vsm_access_error_to_hv_error)?;
                 }
                 reg => {
-                    let Ok(name) = regs::hv_register_to_whp(reg) else {
-                        return Ok(None);
-                    };
-
+                    let name = HvRegisterName::from(reg);
+                    let whp_name = regs::hv_register_to_whp(reg)
+                        .unwrap_or(whp::abi::WHV_REGISTER_NAME(name.0));
                     // SAFETY: HvRegisterValue and WHV_REGISTER_VALUE are the same.
                     let whp_value = unsafe {
                         std::mem::transmute::<HvRegisterValue, WHV_REGISTER_VALUE>(*value)
@@ -1879,8 +2113,8 @@ mod x86 {
                     vsm.set_vp_registers(
                         self.vp.index,
                         partition.vtl0.whp.vp(self.vp.index.index()),
-                        Some(vtl),
-                        &[name],
+                        target.explicit(),
+                        &[whp_name],
                         &[whp_value],
                     )
                     .map_err(vsm_register_error_to_hv_error)?;
@@ -1892,13 +2126,14 @@ mod x86 {
 
         pub(super) fn get_vp_register(
             &mut self,
-            vtl: Vtl,
+            target: RegisterTarget,
             name: HvRegisterName,
         ) -> HvResult<HvRegisterValue> {
-            if let Some(value) = self.get_whp_vsm_register(vtl, name)? {
+            if let Some(value) = self.get_whp_vsm_register(target, name)? {
                 return Ok(value);
             }
 
+            let vtl = target.resolve_for_emulation(self.state.active_vtl);
             let value = match name.into() {
                 HvX64RegisterName::VsmCodePageOffsets => {
                     // TODO: active VTL must be 2 and only allow target current VTL.
@@ -2065,14 +2300,15 @@ mod x86 {
 
         pub(super) fn set_vp_register(
             &mut self,
-            vtl: Vtl,
+            target: RegisterTarget,
             name: HvRegisterName,
             value: &HvRegisterValue,
         ) -> HvResult<()> {
-            if self.set_whp_vsm_register(vtl, name, value)?.is_some() {
+            if self.set_whp_vsm_register(target, name, value)?.is_some() {
                 return Ok(());
             }
 
+            let vtl = target.resolve_for_emulation(self.state.active_vtl);
             match name.into() {
                 HvX64RegisterName::VsmPartitionConfig => {
                     // TODO: active VTL must be 2 and only allow target current VTL.
@@ -2168,6 +2404,7 @@ mod x86 {
 
 #[cfg(guest_arch = "aarch64")]
 mod aarch64 {
+    use super::RegisterTarget;
     use super::WhpHypercallExit;
     use crate::WhpProcessor;
     use crate::regs;
@@ -2306,9 +2543,10 @@ mod aarch64 {
 
         pub(super) fn get_vp_register(
             &mut self,
-            _vtl: Vtl,
+            target: RegisterTarget,
             name: HvRegisterName,
         ) -> HvResult<HvRegisterValue> {
+            let _vtl = target.resolve_for_emulation(self.state.active_vtl);
             let v = match name.into() {
                 HvArm64RegisterName::TimeRefCount => {
                     // TODO-aarch64: hypervisor bug. Use the hypervisor reference time once this is fixed on ARM64.
@@ -2351,10 +2589,11 @@ mod aarch64 {
 
         pub(super) fn set_vp_register(
             &mut self,
-            _vtl: Vtl,
+            target: RegisterTarget,
             name: HvRegisterName,
             value: &HvRegisterValue,
         ) -> HvResult<()> {
+            let _vtl = target.resolve_for_emulation(self.state.active_vtl);
             if let Some(reg) = Self::hypervisor_owned_reg(name.into()) {
                 let value = unsafe {
                     std::mem::transmute::<HvRegisterValue, whp::abi::WHV_REGISTER_VALUE>(*value)

@@ -2283,6 +2283,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn modify_vtl_protection_mask_has_vp_aware_abi() {
+        type ModifyVtlProtectionMask = unsafe fn(
+            abi::WHV_PARTITION_HANDLE,
+            u32,
+            abi::WHV_MAP_GPA_RANGE_FLAGS,
+            *const u64,
+            u64,
+            abi::WHV_INPUT_VTL,
+            &mut u64,
+        ) -> windows_sys::core::HRESULT;
+
+        let _: ModifyVtlProtectionMask = api::WHvModifyVtlProtectionMask;
+    }
+
+    #[test]
     fn input_vtl_encoding_is_vtl_generic() {
         assert_eq!(abi::WHV_INPUT_VTL::current().0, 0);
         assert_eq!(abi::WHV_INPUT_VTL::target(1).0, 0x11);

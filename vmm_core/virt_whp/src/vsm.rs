@@ -3,6 +3,7 @@
 
 use hv1_structs::VtlSet;
 use hvdef::HV_PAGE_SIZE;
+use hvdef::HvError;
 use hvdef::HvMapGpaFlags;
 use hvdef::HvRegisterGuestVsmPartitionConfig;
 use hvdef::HvRegisterVsmPartitionConfig;
@@ -21,6 +22,27 @@ pub(crate) struct VsmController {
     #[inspect(flatten)]
     mode: VsmMode,
     state: VtlState,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct VsmPartitionConfigWrite {
+    vp_index: VpIndex,
+    target_vtl: Vtl,
+    value: u64,
+}
+
+impl VsmPartitionConfigWrite {
+    pub(crate) fn vp_index(self) -> VpIndex {
+        self.vp_index
+    }
+
+    pub(crate) fn target_vtl(self) -> Vtl {
+        self.target_vtl
+    }
+
+    pub(crate) fn value(self) -> u64 {
+        self.value
+    }
 }
 
 #[derive(Inspect)]
@@ -120,6 +142,19 @@ impl From<whp::WHvOperationError> for VsmError {
             source,
             processed: completed_pages(processed),
         }
+    }
+}
+
+pub(crate) fn vsm_partition_config_whp_error(error: whp::WHvError) -> VsmError {
+    if error.is_timeout() {
+        VsmError::WhpTimeout(error)
+    } else if error
+        .hv_result()
+        .is_some_and(|result| HvError::from(result) == HvError::UnknownRegisterName)
+    {
+        VsmError::GuestVsmHostSupportRequired(error)
+    } else {
+        VsmError::Whp(error)
     }
 }
 
@@ -288,16 +323,10 @@ impl VsmController {
         self.state.partition_vtls.is_set(vtl)
     }
 
-    pub(crate) fn vp_enabled_vtl_bits(&self, vp_index: VpIndex) -> Result<u16, VsmError> {
-        if !self.is_whp() {
-            return Err(VsmError::VsmDisabled);
-        }
-
-        let Some(vp_vtls) = self.state.vp_vtls.get(vp_index.index() as usize) else {
-            return Err(VsmError::InvalidVpIndex(vp_index.index()));
-        };
-
-        Ok(vtl_set_bits(vp_vtls))
+    #[cfg(test)]
+    fn vp_enabled_vtl_bits(&self, vp_index: VpIndex) -> Result<u16, VsmError> {
+        self.validate_vp_index(vp_index)?;
+        Ok(vtl_set_bits(&self.state.vp_vtls[vp_index.index() as usize]))
     }
 
     pub(crate) fn validate_vp_vtl_enabled(
@@ -309,13 +338,13 @@ impl VsmController {
             return Err(VsmError::VsmDisabled);
         }
 
+        self.validate_vp_index(vp_index)?;
+
         if vtl > self.state.max_vtl || !self.is_partition_vtl_enabled(vtl) {
             return Err(VsmError::VtlNotEnabled { vtl });
         }
 
-        let Some(vp_vtls) = self.state.vp_vtls.get(vp_index.index() as usize) else {
-            return Err(VsmError::InvalidVpIndex(vp_index.index()));
-        };
+        let vp_vtls = &self.state.vp_vtls[vp_index.index() as usize];
 
         if !vp_vtls.is_set(vtl) {
             return Err(VsmError::VpVtlNotEnabled {
@@ -327,13 +356,32 @@ impl VsmController {
         Ok(())
     }
 
-    fn validate_vsm_register_vtl(&self, vp_index: VpIndex, vtl: Vtl) -> Result<(), VsmError> {
-        self.validate_vp_vtl_enabled(vp_index, vtl)?;
-        if vtl == Vtl::Vtl0 {
-            return Err(VsmError::InvalidRegisterVtl { vtl });
+    fn validate_vp_index(&self, vp_index: VpIndex) -> Result<(), VsmError> {
+        if self.state.vp_vtls.get(vp_index.index() as usize).is_none() {
+            return Err(VsmError::InvalidVpIndex(vp_index.index()));
         }
 
         Ok(())
+    }
+
+    fn validate_vsm_register_vtl(&self, vp_index: VpIndex, vtl: Vtl) -> Result<(), VsmError> {
+        self.validate_vp_index(vp_index)?;
+        if vtl == Vtl::Vtl0 {
+            return Err(VsmError::InvalidRegisterVtl { vtl });
+        }
+        if vtl > self.state.max_vtl || !self.is_partition_vtl_enabled(vtl) {
+            return Err(VsmError::VtlNotEnabled { vtl });
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn partition_enabled_vtl_bits(&self) -> Result<u16, VsmError> {
+        if !self.is_whp() {
+            return Err(VsmError::VsmDisabled);
+        }
+
+        Ok(vtl_set_bits(&self.state.partition_vtls))
     }
 
     pub(crate) fn vsm_partition_config(
@@ -347,14 +395,34 @@ impl VsmController {
         ))
     }
 
-    pub(crate) fn set_vsm_partition_config(
-        &mut self,
+    pub(crate) fn prepare_vsm_partition_config_write(
+        &self,
         vp_index: VpIndex,
         vtl: Vtl,
         config: HvRegisterVsmPartitionConfig,
-    ) -> Result<(), VsmError> {
+    ) -> Result<VsmPartitionConfigWrite, VsmError> {
         self.validate_vsm_register_vtl(vp_index, vtl)?;
-        self.state.vsm_partition_configs[vtl as usize] = u64::from(config);
+        if vtl != Vtl::Vtl1 {
+            return Err(VsmError::InvalidRegisterVtl { vtl });
+        }
+        if config.reserved() != 0 {
+            return Err(VsmError::InvalidRegisterValue);
+        }
+
+        Ok(VsmPartitionConfigWrite {
+            vp_index,
+            target_vtl: vtl,
+            value: config.into(),
+        })
+    }
+
+    pub(crate) fn complete_vsm_partition_config_write(
+        &mut self,
+        write: VsmPartitionConfigWrite,
+        whp_result: Result<(), VsmError>,
+    ) -> Result<(), VsmError> {
+        whp_result?;
+        self.state.vsm_partition_configs[write.target_vtl as usize] = write.value;
         Ok(())
     }
 
@@ -462,22 +530,6 @@ impl VsmController {
         match target_vtl {
             Some(target_vtl) => whp::abi::WHV_INPUT_VTL::target(whp_vtl(target_vtl)),
             None => whp::abi::WHV_INPUT_VTL::current(),
-        }
-    }
-
-    fn validate_vp_register_target(
-        &self,
-        vp_index: VpIndex,
-        target_vtl: Option<Vtl>,
-    ) -> Result<(), VsmError> {
-        if let Some(target_vtl) = target_vtl {
-            self.validate_vp_vtl_enabled(vp_index, target_vtl)
-        } else if !self.is_whp() {
-            Err(VsmError::VsmDisabled)
-        } else if self.state.vp_vtls.get(vp_index.index() as usize).is_none() {
-            Err(VsmError::InvalidVpIndex(vp_index.index()))
-        } else {
-            Ok(())
         }
     }
 
@@ -635,7 +687,15 @@ impl VsmController {
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &mut [whp::abi::WHV_REGISTER_VALUE],
     ) -> Result<(), VsmError> {
-        self.validate_vp_register_target(vp_index, target_vtl)?;
+        if !self.is_whp() {
+            return Err(VsmError::VsmDisabled);
+        }
+        self.validate_vp_index(vp_index)?;
+        if let Some(target_vtl) = target_vtl {
+            if target_vtl > self.state.max_vtl || !self.is_partition_vtl_enabled(target_vtl) {
+                return Err(VsmError::VtlNotEnabled { vtl: target_vtl });
+            }
+        }
         vp.get_registers_for_vtl(self.input_vtl(target_vtl), names, values)?;
         Ok(())
     }
@@ -648,7 +708,15 @@ impl VsmController {
         names: &[whp::abi::WHV_REGISTER_NAME],
         values: &[whp::abi::WHV_REGISTER_VALUE],
     ) -> Result<(), VsmError> {
-        self.validate_vp_register_target(vp_index, target_vtl)?;
+        if !self.is_whp() {
+            return Err(VsmError::VsmDisabled);
+        }
+        self.validate_vp_index(vp_index)?;
+        if let Some(target_vtl) = target_vtl {
+            if target_vtl > self.state.max_vtl || !self.is_partition_vtl_enabled(target_vtl) {
+                return Err(VsmError::VtlNotEnabled { vtl: target_vtl });
+            }
+        }
         vp.set_registers_for_vtl(self.input_vtl(target_vtl), names, values)?;
         Ok(())
     }
@@ -657,6 +725,7 @@ impl VsmController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use test_with_tracing::test;
 
     fn whp_vsm_controller(max_vtl: Vtl, vp_count: u32) -> VsmController {
@@ -664,6 +733,10 @@ mod tests {
             mode: VsmMode::Whp,
             state: vtl_state(max_vtl, vp_count),
         }
+    }
+
+    fn enable_partition_vtl(controller: &mut VsmController, vtl: Vtl) {
+        controller.state.partition_vtls.set(vtl);
     }
 
     #[test]
@@ -718,6 +791,119 @@ mod tests {
     }
 
     #[test]
+    fn vsm_partition_config_cache_commits_only_after_success() {
+        let controller = Mutex::new(whp_vsm_controller(Vtl::Vtl1, 1));
+        enable_partition_vtl(&mut controller.lock(), Vtl::Vtl1);
+        let config = HvRegisterVsmPartitionConfig::from(0x7f);
+        let write = controller
+            .lock()
+            .prepare_vsm_partition_config_write(VpIndex::new(0), Vtl::Vtl1, config)
+            .unwrap();
+
+        assert_eq!(
+            u64::from(
+                controller
+                    .lock()
+                    .vsm_partition_config(VpIndex::new(0), Vtl::Vtl1)
+                    .unwrap()
+            ),
+            0
+        );
+
+        controller
+            .lock()
+            .complete_vsm_partition_config_write(write, Ok(()))
+            .unwrap();
+
+        assert_eq!(
+            u64::from(
+                controller
+                    .lock()
+                    .vsm_partition_config(VpIndex::new(0), Vtl::Vtl1)
+                    .unwrap()
+            ),
+            0x7f
+        );
+    }
+
+    #[test]
+    fn vsm_partition_config_timeout_does_not_commit_cache() {
+        let controller = Mutex::new(whp_vsm_controller(Vtl::Vtl1, 1));
+        enable_partition_vtl(&mut controller.lock(), Vtl::Vtl1);
+        let write = controller
+            .lock()
+            .prepare_vsm_partition_config_write(
+                VpIndex::new(0),
+                Vtl::Vtl1,
+                HvRegisterVsmPartitionConfig::from(0x7f),
+            )
+            .unwrap();
+        let timeout = whp::WHvError::from_hresult(0x80350078_u32 as i32).expect("nonzero HRESULT");
+        let error = vsm_partition_config_whp_error(timeout);
+
+        assert!(matches!(error, VsmError::WhpTimeout(_)));
+        assert!(matches!(
+            controller
+                .lock()
+                .complete_vsm_partition_config_write(write, Err(error)),
+            Err(VsmError::WhpTimeout(_))
+        ));
+        assert_eq!(
+            u64::from(
+                controller
+                    .lock()
+                    .vsm_partition_config(VpIndex::new(0), Vtl::Vtl1)
+                    .unwrap()
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn vsm_partition_config_permanent_failure_does_not_commit_cache() {
+        let controller = Mutex::new(whp_vsm_controller(Vtl::Vtl1, 1));
+        enable_partition_vtl(&mut controller.lock(), Vtl::Vtl1);
+        let write = controller
+            .lock()
+            .prepare_vsm_partition_config_write(
+                VpIndex::new(0),
+                Vtl::Vtl1,
+                HvRegisterVsmPartitionConfig::from(0x7f),
+            )
+            .unwrap();
+        let failure = whp::WHvError::from_hresult(0x80004005_u32 as i32).expect("nonzero HRESULT");
+        let error = vsm_partition_config_whp_error(failure);
+
+        assert!(matches!(error, VsmError::Whp(_)));
+        assert!(matches!(
+            controller
+                .lock()
+                .complete_vsm_partition_config_write(write, Err(error)),
+            Err(VsmError::Whp(_))
+        ));
+        assert_eq!(
+            u64::from(
+                controller
+                    .lock()
+                    .vsm_partition_config(VpIndex::new(0), Vtl::Vtl1)
+                    .unwrap()
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_vsm_partition_config_register_requires_updated_host() {
+        let unknown_register =
+            whp::WHvError::from_hresult(0x80350087_u32 as i32).expect("nonzero HRESULT");
+
+        assert!(matches!(
+            vsm_partition_config_whp_error(unknown_register),
+            VsmError::GuestVsmHostSupportRequired(_)
+        ));
+    }
+
+    #[test]
     fn whp_vsm_protection_current_target_uses_whp_current_vtl() {
         let controller = whp_vsm_controller(Vtl::Vtl1, 1);
 
@@ -730,7 +916,7 @@ mod tests {
     #[test]
     fn whp_vsm_protection_explicit_vtl1_does_not_require_software_active_vtl() {
         let mut controller = whp_vsm_controller(Vtl::Vtl1, 1);
-        controller.state.partition_vtls.set(Vtl::Vtl1);
+        enable_partition_vtl(&mut controller, Vtl::Vtl1);
 
         assert_eq!(
             controller.protection_input_vtl(Some(Vtl::Vtl1)).unwrap(),

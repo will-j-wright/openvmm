@@ -1163,6 +1163,22 @@ impl WhpPartitionInner {
                     );
                     hv1_emulator::cpuid::process_hv_cpuid_leaves(&mut cpuid, false, [0; 4]);
                 }
+
+                if vsm.is_whp() {
+                    let features = hvdef::HvFeatures::new()
+                        .with_privileges(hvdef::HvPartitionPrivilege::new().with_access_vsm(true));
+                    let bytes = features.into_bits().to_le_bytes();
+                    let mask = [
+                        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                        u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+                    ];
+                    cpuid.push(
+                        virt::CpuidLeaf::new(hvdef::HV_CPUID_FUNCTION_MS_HV_FEATURES, mask)
+                            .masked(mask),
+                    );
+                }
             }
 
             if nested_virt {
@@ -1648,6 +1664,11 @@ impl VtlPartition {
                             | F::AccessGuestIdleReg
                             | F::AccessFrequencyRegs
                             | F::EnableExtendedGvaRangesForFlushVirtualAddressList;
+                        if vtl == Vtl::Vtl0
+                            && vsm.as_deref().is_some_and(vsm::VsmController::is_whp)
+                        {
+                            features.bank0 |= F::AccessVsm | F::AccessVpRegs;
+                        }
                     }
 
                     #[cfg(guest_arch = "aarch64")]
