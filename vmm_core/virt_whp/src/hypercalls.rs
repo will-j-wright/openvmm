@@ -1000,6 +1000,7 @@ mod x86 {
     use hvdef::HV_PAGE_SIZE;
     use hvdef::HV_PARTITION_ID_SELF;
     use hvdef::HV_VP_INDEX_SELF;
+    use hvdef::HvCacheType;
     use hvdef::HvError;
     use hvdef::HvInterceptAccessType;
     use hvdef::HvInterruptType;
@@ -1021,6 +1022,7 @@ mod x86 {
     use tracing_helpers::ErrorValueExt;
     use virt::VpIndex;
 
+    use virt_support_x86emu::translate::TranslateCachingInfo;
     use virt_support_x86emu::translate::TranslateFlags;
     use virt_support_x86emu::translate::TranslateResult;
     use virt_support_x86emu::translate::translate_gva_to_gpa;
@@ -1183,6 +1185,40 @@ mod x86 {
                     "cannot resolve WHP VSM target-current pseudo-register"
                 );
                 Err(HvError::InvalidParameter)
+            }
+        }
+    }
+
+    fn translated_gpa_cache_type(cache_info: TranslateCachingInfo, pat: u64) -> u8 {
+        match cache_info {
+            TranslateCachingInfo::NoPaging => HvCacheType::HvCacheTypeWriteBack.0 as u8,
+            TranslateCachingInfo::Paging { pat_index } => ((pat >> (pat_index * 8)) & 0xff) as u8,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use test_with_tracing::test;
+
+        #[test]
+        fn successful_translation_uses_pat_cache_type() {
+            assert_eq!(
+                translated_gpa_cache_type(TranslateCachingInfo::NoPaging, 0),
+                HvCacheType::HvCacheTypeWriteBack.0 as u8
+            );
+
+            let pat = u64::from_le_bytes([0, 1, 4, 5, 6, 0, 1, 4]);
+            for (pat_index, expected) in [0, 1, 4, 5, 6, 0, 1, 4].into_iter().enumerate() {
+                assert_eq!(
+                    translated_gpa_cache_type(
+                        TranslateCachingInfo::Paging {
+                            pat_index: pat_index as u64,
+                        },
+                        pat,
+                    ),
+                    expected
+                );
             }
         }
     }
@@ -1789,9 +1825,9 @@ mod x86 {
             control_flags: TranslateGvaControlFlagsX64,
             gva_page: u64,
         ) -> HvResult<hvdef::hypercall::TranslateVirtualAddressExOutputX64> {
-            // TODO: this doesn't fully implement all the functionality of the TranslateVirtualAddressEx hypercall
-            // because the underlying layers currently don't return overlay page, cache type, or event_pending.
-            // Do the best we can to allow Underhill to run.
+            // TODO: this doesn't fully implement all the functionality of the
+            // TranslateVirtualAddressEx hypercall because the underlying layers
+            // currently don't return overlay page or event_pending.
             tracing::trace!(
                 ?partition_id,
                 ?vp_index,
@@ -1820,8 +1856,20 @@ mod x86 {
             );
 
             let result = match result {
-                Ok(TranslateResult { gpa, cache_info: _ }) => {
+                Ok(TranslateResult { gpa, cache_info }) => {
+                    let mut pat = [WHV_REGISTER_VALUE::default()];
+                    self.vp
+                        .get_vtl_registers(Vtl::Vtl0, &[whp::abi::WHvX64RegisterPat], &mut pat)
+                        .map_err(vsm_register_error_to_hv_error)?;
+                    let pat = u128::from(pat[0].0) as u64;
+                    let cache_type = translated_gpa_cache_type(cache_info, pat);
                     hvdef::hypercall::TranslateVirtualAddressExOutputX64 {
+                        translation_result: hvdef::hypercall::TranslateGvaResultExX64 {
+                            result: hvdef::hypercall::TranslateGvaResult::new()
+                                .with_result_code(TranslateGvaResultCode::SUCCESS.0)
+                                .with_cache_type(cache_type),
+                            ..FromZeros::new_zeroed()
+                        },
                         gpa_page: gpa / HV_PAGE_SIZE,
                         ..FromZeros::new_zeroed()
                     }
