@@ -376,13 +376,19 @@ type InitialVpContext = hvdef::hypercall::InitialVpContextX64;
 #[cfg(guest_arch = "aarch64")]
 type InitialVpContext = hvdef::hypercall::InitialVpContextArm64;
 
+#[derive(Debug)]
+enum StartVpRequest {
+    Emulated(Box<InitialVpContext>),
+    WhpVsmBookkeeping { source_vp: VpIndex, target_vtl: Vtl },
+}
+
 #[derive(Debug, Inspect)]
 struct Vplc {
     message_queues: MessageQueues,
     check_queues: AtomicBool,
     extint_pending: AtomicBool,
     #[inspect(with = "|x| x.lock().is_some()")]
-    start_vp_context: Mutex<Option<Box<InitialVpContext>>>,
+    start_vp_request: Mutex<Option<StartVpRequest>>,
     #[inspect(skip)]
     start_vp: AtomicBool,
 }
@@ -394,7 +400,7 @@ impl Vplc {
             check_queues: false.into(),
             extint_pending: false.into(),
             start_vp: false.into(),
-            start_vp_context: Default::default(),
+            start_vp_request: Default::default(),
         }
     }
 
@@ -408,13 +414,13 @@ impl Vplc {
             message_queues,
             check_queues,
             extint_pending,
-            start_vp_context,
+            start_vp_request,
             start_vp,
         } = self;
         message_queues.clear();
         check_queues.store(false, Ordering::Relaxed);
         extint_pending.store(false, Ordering::Relaxed);
-        *start_vp_context.lock() = None;
+        *start_vp_request.lock() = None;
         start_vp.store(false, Ordering::Relaxed);
     }
 }
@@ -1092,8 +1098,11 @@ impl WhpPartitionInner {
                 }
 
                 if vsm.is_whp() {
-                    let features = hvdef::HvFeatures::new()
-                        .with_privileges(hvdef::HvPartitionPrivilege::new().with_access_vsm(true));
+                    let features = hvdef::HvFeatures::new().with_privileges(
+                        hvdef::HvPartitionPrivilege::new()
+                            .with_access_vsm(true)
+                            .with_start_virtual_processor(true),
+                    );
                     let bytes = features.into_bits().to_le_bytes();
                     let mask = [
                         u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
@@ -1573,7 +1582,8 @@ impl VtlPartition {
                         if vtl == Vtl::Vtl0
                             && vsm.as_deref().is_some_and(vsm::VsmController::is_whp)
                         {
-                            features.bank0 |= F::AccessVsm | F::AccessVpRegs;
+                            features.bank0 |=
+                                F::AccessVsm | F::AccessVpRegs | F::StartVirtualProcessor;
                         }
                     }
 
@@ -1812,7 +1822,7 @@ impl<'p> virt::Processor for WhpProcessor<'p> {
         self.state.reset(false, is_bsp);
 
         // For each enabled VTL: apply arch fixups that WHP doesn't handle
-        // and clear any pending `start_vp_context` (via `finish_reset`),
+        // and clear any pending `start_vp_request` (via `finish_reset`),
         // then clear stale pending per-VTL VP signal flags (via
         // `Vplc::reset`).
         // VTL0 is always present.

@@ -153,7 +153,7 @@ pub mod capabilities {
         api::is_supported::WHvStartVirtualProcessor()
     }
 
-    pub fn vsm() -> bool {
+    pub(super) fn vsm_with_start_virtual_processor(start_virtual_processor: bool) -> bool {
         api::is_supported::WHvEnablePartitionVtl()
             && api::is_supported::WHvEnableVpVtl()
             && api::is_supported::WHvDisableVpVtl()
@@ -164,7 +164,11 @@ pub mod capabilities {
             && api::is_supported::WHvModifyVtlProtectionMaskRange()
             && api::is_supported::WHvGetVirtualProcessorRegisters2()
             && api::is_supported::WHvSetVirtualProcessorRegisters2()
-            && start_virtual_processor()
+            && start_virtual_processor
+    }
+
+    pub fn vsm() -> bool {
+        vsm_with_start_virtual_processor(start_virtual_processor())
     }
 }
 
@@ -2269,10 +2273,35 @@ mod tests {
     }
 
     #[test]
+    fn start_virtual_processor_has_expected_abi() {
+        type StartVirtualProcessor = unsafe fn(
+            abi::WHV_PARTITION_HANDLE,
+            u32,
+            abi::WHV_VTL,
+            &abi::WHV_INITIAL_VP_CONTEXT,
+        ) -> windows_sys::core::HRESULT;
+
+        let _: StartVirtualProcessor = api::WHvStartVirtualProcessor;
+    }
+
+    #[test]
+    fn whp_vsm_requires_start_virtual_processor_export() {
+        assert!(!capabilities::vsm_with_start_virtual_processor(false));
+    }
+
+    #[test]
     fn input_vtl_encoding_is_vtl_generic() {
         assert_eq!(abi::WHV_INPUT_VTL::current().0, 0);
         assert_eq!(abi::WHV_INPUT_VTL::target(1).0, 0x11);
         assert_eq!(abi::WHV_INPUT_VTL::target(2).0, 0x12);
         assert_eq!(abi::WHV_INPUT_VTL::all().0, 0x1f);
+    }
+
+    #[test]
+    fn start_virtual_processor_synthetic_feature_is_bit_20() {
+        assert_eq!(
+            abi::WHV_SYNTHETIC_PROCESSOR_FEATURES::StartVirtualProcessor.0,
+            1 << 20
+        );
     }
 }

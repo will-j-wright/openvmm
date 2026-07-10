@@ -78,6 +78,7 @@ fn whp_vsm_error_to_hv_error(err: &vsm::VsmError) -> HvError {
         vsm::VsmError::Vtl0Only
         | vsm::VsmError::IncompatibleWithIsolation
         | vsm::VsmError::HostUnsupported
+        | vsm::VsmError::StartVirtualProcessorHostUnsupported
         | vsm::VsmError::InvalidActiveVtl { .. }
         | vsm::VsmError::ShortOperation { .. }
         | vsm::VsmError::WhpOperation { .. }
@@ -987,6 +988,7 @@ impl hv1_hypercall::VbsVmCallReport for WhpHypercallExit<'_, '_> {
 mod x86 {
     use super::RegisterTarget;
     use super::WhpHypercallExit;
+    use crate::StartVpRequest;
     use crate::WhpProcessor;
     use crate::regs;
     use crate::vsm;
@@ -1196,6 +1198,26 @@ mod x86 {
         }
     }
 
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    enum StartVirtualProcessorPath {
+        WhpVsm,
+        Emulated,
+    }
+
+    fn start_virtual_processor_path(whp_vsm: bool) -> StartVirtualProcessorPath {
+        if whp_vsm {
+            StartVirtualProcessorPath::WhpVsm
+        } else {
+            StartVirtualProcessorPath::Emulated
+        }
+    }
+
+    fn whp_vsm_start_virtual_processor_error_to_hv_error(error: &whp::WHvError) -> HvError {
+        error
+            .hv_result()
+            .map_or(HvError::OperationFailed, HvError::from)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1220,6 +1242,35 @@ mod x86 {
                     expected
                 );
             }
+        }
+
+        #[test]
+        fn whp_vsm_start_virtual_processor_routes_to_whp() {
+            assert_eq!(
+                start_virtual_processor_path(true),
+                StartVirtualProcessorPath::WhpVsm
+            );
+            assert_eq!(
+                start_virtual_processor_path(false),
+                StartVirtualProcessorPath::Emulated
+            );
+        }
+
+        #[test]
+        fn whp_vsm_start_virtual_processor_maps_hv_status() {
+            let invalid_parameter =
+                whp::WHvError::from_hresult(0x80350005_u32 as i32).expect("nonzero HRESULT");
+            assert_eq!(
+                whp_vsm_start_virtual_processor_error_to_hv_error(&invalid_parameter),
+                HvError::InvalidParameter
+            );
+
+            let generic_failure =
+                whp::WHvError::from_hresult(0x80004005_u32 as i32).expect("nonzero HRESULT");
+            assert_eq!(
+                whp_vsm_start_virtual_processor_error_to_hv_error(&generic_failure),
+                HvError::OperationFailed
+            );
         }
     }
 
@@ -1563,12 +1614,74 @@ mod x86 {
                 return Err(HvError::InvalidParameter);
             }
 
+            let partition = self.vp.vp.partition;
+            if start_virtual_processor_path(partition.vsm.lock().is_whp())
+                == StartVirtualProcessorPath::WhpVsm
+            {
+                let initial_context = whp_initial_vp_context(vp_context);
+                tracing::debug!(
+                    source_vp = self.vp.vp.index.index(),
+                    target_vp = vp_index.index(),
+                    ?target_vtl,
+                    rip = initial_context.Rip,
+                    rsp = initial_context.Rsp,
+                    cr3 = initial_context.Cr3,
+                    "WHP VSM StartVP requested"
+                );
+
+                if let Err(error) = partition.vtl0.whp.start_virtual_processor(
+                    vp_index.index(),
+                    u8::from(target_vtl),
+                    &initial_context,
+                ) {
+                    let hv_error = whp_vsm_start_virtual_processor_error_to_hv_error(&error);
+                    tracing::error!(
+                        source_vp = self.vp.vp.index.index(),
+                        target_vp = vp_index.index(),
+                        ?target_vtl,
+                        rip = initial_context.Rip,
+                        rsp = initial_context.Rsp,
+                        cr3 = initial_context.Cr3,
+                        whp_hresult = error.code() as u32,
+                        whp_hv_status = error.hv_result().map(|status| status.get()),
+                        ?hv_error,
+                        error = &error as &dyn std::error::Error,
+                        "WHP VSM StartVP failed"
+                    );
+                    return Err(hv_error);
+                }
+
+                let target_vplc = target_vp.vplc(target_vtl);
+                *target_vplc.start_vp_request.lock() = Some(StartVpRequest::WhpVsmBookkeeping {
+                    source_vp: self.vp.vp.index,
+                    target_vtl,
+                });
+                let bookkeeping_wake_was_pending =
+                    target_vplc.start_vp.swap(true, Ordering::Release);
+                target_vp.wake();
+                tracing::debug!(
+                    source_vp = self.vp.vp.index.index(),
+                    target_vp = vp_index.index(),
+                    ?target_vtl,
+                    rip = initial_context.Rip,
+                    rsp = initial_context.Rsp,
+                    cr3 = initial_context.Cr3,
+                    whp_hresult = 0u32,
+                    whp_hv_status = 0u16,
+                    bookkeeping_wake_queued = true,
+                    bookkeeping_wake_was_pending,
+                    "WHP VSM StartVP completed"
+                );
+                return Ok(());
+            }
+
             if self.vp.state.active_vtl < target_vtl {
                 return Err(HvError::AccessDenied);
             }
 
             let target_vplc = target_vp.vplc(target_vtl);
-            *target_vplc.start_vp_context.lock() = Some(Box::new(*vp_context));
+            *target_vplc.start_vp_request.lock() =
+                Some(StartVpRequest::Emulated(Box::new(*vp_context)));
             target_vplc.start_vp.store(true, Ordering::Release);
             target_vp.wake();
             Ok(())
