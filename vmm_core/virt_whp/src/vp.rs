@@ -479,6 +479,10 @@ impl<'a> WhpProcessor<'a> {
 
     #[cfg(guest_arch = "x86_64")]
     fn handle_triple_fault(&mut self) -> Result<(), VpHaltReason> {
+        let (whp_vsm, native_max_vtl) = {
+            let vsm = self.vp.partition.vsm.lock();
+            (vsm.is_whp(), vsm.max_vtl())
+        };
         let reinject_into_vtl2 = self
             .vp
             .partition
@@ -502,9 +506,12 @@ impl<'a> WhpProcessor<'a> {
             return Ok(());
         }
 
-        Err(VpHaltReason::TripleFault {
-            vtl: self.state.active_vtl,
-        })
+        let vtl = if whp_vsm && native_max_vtl == Vtl::Vtl1 {
+            Vtl::Vtl1
+        } else {
+            self.state.active_vtl
+        };
+        Err(VpHaltReason::TripleFault { vtl })
     }
 
     fn sints_deliverable(&mut self, vtl: Vtl, sints: u16) {
@@ -663,7 +670,8 @@ mod x86 {
                     &mut self.state.exits.interrupt_window
                 }
                 ExitReason::Hypercall(info) => {
-                    crate::hypercalls::WhpHypercallExit::handle(self, info, exit.vp_context);
+                    crate::hypercalls::WhpHypercallExit::handle(self, info, exit.vp_context)
+                        .map_err(|err| dev.fatal_error(err.into()))?;
                     &mut self.state.exits.hypercall
                 }
                 ExitReason::MemoryAccess(access) => {
@@ -1174,14 +1182,18 @@ mod x86 {
         ) {
             let function = info.Rax as u32;
             let index = info.Rcx as u32;
-            let default = [
+            let whp_default = [
                 info.DefaultResultRax as u32,
                 info.DefaultResultRbx as u32,
                 info.DefaultResultRcx as u32,
                 info.DefaultResultRdx as u32,
             ];
 
-            let mut default = self.vp.partition.cpuid.result(function, index, &default);
+            let mut default = self
+                .vp
+                .partition
+                .cpuid
+                .result(function, index, &whp_default);
 
             match CpuidFunction(function) {
                 // The hypervisor does not consistently set this.
@@ -1641,44 +1653,75 @@ mod x86 {
 
             if let Err(MsrError::Unknown) = r {
                 if self.send_unknown_msrs_to_vtl2() {
+                    let (rcx, rax, rdx) = get_active_registers!(
+                        self,
+                        [
+                            whp::Register64::Rcx,
+                            whp::Register64::Rax,
+                            whp::Register64::Rdx
+                        ]
+                    )
+                    .expect("registers should be readable");
                     self.send_msr_to_vtl2(
                         self.new_intercept_header(
                             exit.vp_context.InstructionLength(),
                             HvInterceptAccessType::READ,
                         ),
                         msr,
-                        0,
-                        0,
+                        rdx,
+                        rax,
                     );
+                    let rcx = rcx | 1;
+                    set_active_registers!(self, [(whp::Register64::Rcx, rcx)]).unwrap();
                     return true;
                 }
             }
 
-            let v = match r {
+            let value = match r {
                 Ok(v) => Some(v),
                 Err(err) => {
-                    tracing::warn!(rip = exit.vp_context.Rip, msr, ?err, "invalid msr read");
+                    tracelimit::warn_ratelimited!(
+                        rip = exit.vp_context.Rip,
+                        msr,
+                        ?err,
+                        "invalid msr read"
+                    );
                     None
                 }
             };
 
-            if let Some(v) = v {
-                let rax = v & 0xffffffff;
-                let rdx = v >> 32;
-                let rip = exit.vp_context.Rip.wrapping_add(2);
-
+            let rip = exit.vp_context.Rip.wrapping_add(2);
+            if let Some(value) = value {
+                let rax = value as u32 as u64;
+                let rdx = value >> 32;
                 set_active_registers!(
                     self,
                     [
                         (whp::Register64::Rax, rax),
                         (whp::Register64::Rdx, rdx),
-                        (whp::Register64::Rip, rip),
+                        (whp::Register64::Rip, rip)
+                    ]
+                )
+                .unwrap();
+            } else {
+                // inject a GPF
+                let event = hvdef::HvX64PendingExceptionEvent::new()
+                    .with_event_pending(true)
+                    .with_event_type(hvdef::HV_X64_PENDING_EVENT_EXCEPTION)
+                    .with_deliver_error_code(true)
+                    .with_vector(0xd);
+
+                set_active_registers!(
+                    self,
+                    [
+                        (whp::Register128::PendingEvent, event.into()),
+                        (whp::Register64::Rip, rip)
                     ]
                 )
                 .unwrap();
             }
 
-            v.is_some()
+            true
         }
 
         /// Handles exception exits, which are only used to handle emulating
@@ -1731,7 +1774,6 @@ mod x86 {
                     .with_exception_parameter(info.ExceptionParameter)
                     .with_error_code(info.ErrorCode)
                     .with_vector(info.ExceptionType.0.into())
-                    .with_vector(0xd)
                     .into()
             };
 
