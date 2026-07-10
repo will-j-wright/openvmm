@@ -75,6 +75,8 @@ pub enum VsmError {
     IncompatibleWithIsolation,
     #[error("the host does not support the WHP VSM APIs")]
     HostUnsupported,
+    #[error("updated WHP Guest VSM host support with WHvStartVirtualProcessor is required")]
+    StartVirtualProcessorHostUnsupported,
     #[error("VSM is not enabled")]
     VsmDisabled,
     #[error("VSM target {vtl:?} is not enabled")]
@@ -299,6 +301,10 @@ impl VsmController {
         #[cfg(not(guest_arch = "x86_64"))]
         {
             return Err(VsmError::UnsupportedArchitecture);
+        }
+
+        if !whp::capabilities::start_virtual_processor() {
+            return Err(VsmError::StartVirtualProcessorHostUnsupported);
         }
 
         if !whp::capabilities::vsm() {

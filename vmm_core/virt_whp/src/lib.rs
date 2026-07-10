@@ -421,13 +421,19 @@ struct VpStartRequest {
     context: Box<InitialVpContext>,
 }
 
+#[derive(Debug)]
+enum StartVpRequest {
+    Emulated(VpStartRequest),
+    WhpVsmBookkeeping { source_vp: VpIndex, target_vtl: Vtl },
+}
+
 #[derive(Debug, Inspect)]
 struct Vplc {
     message_queues: MessageQueues,
     check_queues: AtomicBool,
     extint_pending: AtomicBool,
     #[inspect(with = "|x| x.lock().is_some()")]
-    start_vp_request: Mutex<Option<VpStartRequest>>,
+    start_vp_request: Mutex<Option<StartVpRequest>>,
     start_vp: AtomicBool,
     scan_irr: AtomicBool,
 }
@@ -1163,8 +1169,11 @@ impl WhpPartitionInner {
                 }
 
                 if vsm.is_whp() {
-                    let features = hvdef::HvFeatures::new()
-                        .with_privileges(hvdef::HvPartitionPrivilege::new().with_access_vsm(true));
+                    let features = hvdef::HvFeatures::new().with_privileges(
+                        hvdef::HvPartitionPrivilege::new()
+                            .with_access_vsm(true)
+                            .with_start_virtual_processor(true),
+                    );
                     let bytes = features.into_bits().to_le_bytes();
                     let mask = [
                         u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
@@ -1669,7 +1678,8 @@ impl VtlPartition {
                         if vtl == Vtl::Vtl0
                             && vsm.as_deref().is_some_and(vsm::VsmController::is_whp)
                         {
-                            features.bank0 |= F::AccessVsm | F::AccessVpRegs;
+                            features.bank0 |=
+                                F::AccessVsm | F::AccessVpRegs | F::StartVirtualProcessor;
                         }
                     }
 

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use super::StartVpRequest;
 use super::Vplc;
 use super::VtlPartition;
 use super::vtl2::Vtl2InterceptState;
@@ -24,6 +25,7 @@ use thiserror::Error;
 use tracing_helpers::ErrorValueExt;
 use virt::StopVp;
 use virt::VpHaltReason;
+use virt::VpIndex;
 use virt::io::CpuIo;
 use zerocopy::IntoBytes;
 
@@ -48,6 +50,36 @@ pub(crate) struct ExitStats {
     other: Counter,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn whp_vsm_start_vp_bookkeeping_clears_halt_and_startup_suspend() {
+        let mut halted = true;
+        let mut startup_suspend = true;
+
+        assert_eq!(
+            clear_whp_vsm_start_vp_bookkeeping(&mut halted, Some(&mut startup_suspend)),
+            (true, true)
+        );
+        assert!(!halted);
+        assert!(!startup_suspend);
+    }
+
+    #[test]
+    fn whp_vsm_start_vp_bookkeeping_handles_offloaded_apic() {
+        let mut halted = true;
+
+        assert_eq!(
+            clear_whp_vsm_start_vp_bookkeeping(&mut halted, None),
+            (true, false)
+        );
+        assert!(!halted);
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("failed to run")]
 pub struct WhpRunVpError(#[source] whp::WHvError);
@@ -57,6 +89,16 @@ pub struct WhpRunVpError(#[source] whp::WHvError);
 struct UnsupportedWhpExit {
     exit: String,
     active_vtl: Vtl,
+}
+
+fn clear_whp_vsm_start_vp_bookkeeping(
+    halted: &mut bool,
+    startup_suspend: Option<&mut bool>,
+) -> (bool, bool) {
+    let was_halted = std::mem::replace(halted, false);
+    let was_startup_suspended =
+        startup_suspend.is_some_and(|value| std::mem::replace(value, false));
+    (was_halted, was_startup_suspended)
 }
 
 impl<'a> WhpProcessor<'a> {
@@ -167,6 +209,29 @@ impl<'a> WhpProcessor<'a> {
         if vtl == Vtl::Vtl2 {
             self.write_vtl2_entry_reason(reason);
         }
+    }
+
+    fn finish_whp_vsm_start_vp(&mut self, source_vp: VpIndex, target_vtl: Vtl) {
+        let backend_vtl = self.vp.partition.backend_vtl(target_vtl);
+        #[cfg(guest_arch = "x86_64")]
+        let startup_suspend = self
+            .state
+            .vtls
+            .lapic(backend_vtl)
+            .map(|lapic| &mut lapic.startup_suspend);
+        #[cfg(not(guest_arch = "x86_64"))]
+        let startup_suspend: Option<&mut bool> = None;
+        let (was_halted, was_startup_suspended) =
+            clear_whp_vsm_start_vp_bookkeeping(&mut self.state.halted, startup_suspend);
+
+        tracing::debug!(
+            source_vp = source_vp.index(),
+            target_vp = self.vp.index.index(),
+            ?target_vtl,
+            was_halted,
+            was_startup_suspended,
+            "WHP VSM StartVP bookkeeping wake consumed"
+        );
     }
 
     /// Switch to a new VTL for this VP.
@@ -407,7 +472,17 @@ impl<'a> WhpProcessor<'a> {
                         vplc.start_vp.store(false, Ordering::SeqCst);
                         let request = vplc.start_vp_request.lock().take();
                         if let Some(request) = request {
-                            self.start_vp(vtl, request);
+                            match request {
+                                StartVpRequest::Emulated(request) => {
+                                    self.start_vp(vtl, request);
+                                }
+                                StartVpRequest::WhpVsmBookkeeping {
+                                    source_vp,
+                                    target_vtl,
+                                } => {
+                                    self.finish_whp_vsm_start_vp(source_vp, target_vtl);
+                                }
+                            }
                         }
                     }
                 }
@@ -479,7 +554,7 @@ impl<'a> WhpProcessor<'a> {
 
     #[cfg(guest_arch = "x86_64")]
     fn handle_triple_fault(&mut self) -> Result<(), VpHaltReason> {
-        let (whp_vsm, native_max_vtl) = {
+        let (whp_vsm, whp_vsm_max_vtl) = {
             let vsm = self.vp.partition.vsm.lock();
             (vsm.is_whp(), vsm.max_vtl())
         };
@@ -506,7 +581,7 @@ impl<'a> WhpProcessor<'a> {
             return Ok(());
         }
 
-        let vtl = if whp_vsm && native_max_vtl == Vtl::Vtl1 {
+        let vtl = if whp_vsm && whp_vsm_max_vtl == Vtl::Vtl1 {
             Vtl::Vtl1
         } else {
             self.state.active_vtl
@@ -548,6 +623,7 @@ impl<'a> WhpProcessor<'a> {
 
     pub(crate) fn finish_reset(&mut self, vtl: Vtl) {
         self.finish_reset_arch(vtl);
+        *self.vplc(vtl).start_vp_request.lock() = None;
     }
 
     fn request_sint_notifications(&mut self, vtl: Vtl, sints: u16) {
