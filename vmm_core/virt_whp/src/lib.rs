@@ -284,8 +284,7 @@ impl Index<Vtl> for RunStateVtls {
 
     fn index(&self, vtl: Vtl) -> &Self::Output {
         match vtl {
-            Vtl::Vtl0 => &self.vtl0,
-            Vtl::Vtl1 => unreachable!(),
+            Vtl::Vtl0 | Vtl::Vtl1 => &self.vtl0,
             Vtl::Vtl2 => self.vtl2.as_ref().unwrap(),
         }
     }
@@ -294,8 +293,7 @@ impl Index<Vtl> for RunStateVtls {
 impl IndexMut<Vtl> for RunStateVtls {
     fn index_mut(&mut self, vtl: Vtl) -> &mut Self::Output {
         match vtl {
-            Vtl::Vtl0 => &mut self.vtl0,
-            Vtl::Vtl1 => unreachable!(),
+            Vtl::Vtl0 | Vtl::Vtl1 => &mut self.vtl0,
             Vtl::Vtl2 => self.vtl2.as_mut().unwrap(),
         }
     }
@@ -1452,6 +1450,7 @@ impl VtlPartition {
                 .for_op("set apic emulation mode")?;
 
             extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::X64MsrExit;
+            let mut exception_exit_bitmap = 0;
             if user_mode_apic {
                 whp_config
                     .set_property(whp::PartitionProperty::X64MsrExitBitmap(
@@ -1461,10 +1460,13 @@ impl VtlPartition {
                     .for_op("set msr exit bitmap")?;
                 // Enable #GP faults to get synic MSR accesses, for which which the
                 // hypervisor incorrectly fails to exit to the parent.
+                exception_exit_bitmap |= 1 << x86defs::Exception::GENERAL_PROTECTION_FAULT.0;
+            }
+            if exception_exit_bitmap != 0 {
                 extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::ExceptionExit;
                 whp_config
                     .set_property(whp::PartitionProperty::ExceptionExitBitmap(
-                        1 << x86defs::Exception::GENERAL_PROTECTION_FAULT.0,
+                        exception_exit_bitmap,
                     ))
                     .for_op("set exception exit bitmap")?;
             }

@@ -227,9 +227,16 @@ impl WhpHypercallExit<'_, '_> {
             hv1_hypercall::HvGetVpIndexFromApicId,
             hv1_hypercall::HvAcceptGpaPages,
             hv1_hypercall::HvModifySparseGpaPageHostVisibility,
+            hv1_hypercall::HvExtQueryCapabilities,
             hv1_hypercall::HvVbsVmCallReport,
         ]
     );
+}
+
+impl hv1_hypercall::ExtendedQueryCapabilities for WhpHypercallExit<'_, '_> {
+    fn query_extended_capabilities(&mut self) -> hvdef::HvResult<u64> {
+        Err(HvError::InvalidHypercallCode)
+    }
 }
 
 impl hv1_hypercall::PostMessage for WhpHypercallExit<'_, '_> {
@@ -1010,6 +1017,7 @@ mod x86 {
     use hvdef::hypercall::TranslateGvaResultCode;
     use std::mem::offset_of;
     use std::sync::atomic::Ordering;
+    use thiserror::Error;
     use tracing_helpers::ErrorValueExt;
     use virt::VpIndex;
 
@@ -1023,6 +1031,17 @@ mod x86 {
     use zerocopy::FromBytes;
     use zerocopy::FromZeros;
     use zerocopy::IntoBytes;
+
+    #[derive(Debug, Error)]
+    #[error(
+        "WHP VSM VTL switch hypercall exited to OpenVMM: code={code:?}, rip={rip:#x}, active_vtl={active_vtl:?}, fast={fast}"
+    )]
+    pub(crate) struct WhpVsmVtlSwitchExit {
+        code: hvdef::HypercallCode,
+        rip: u64,
+        active_vtl: Vtl,
+        fast: bool,
+    }
 
     fn whp_segment_register(
         reg: hvdef::HvX64SegmentRegister,
@@ -1132,6 +1151,25 @@ mod x86 {
         }
     }
 
+    fn is_64bit_hypercall(
+        vp: &WhpProcessor<'_>,
+        exit_context: &whp::abi::WHV_VP_EXIT_CONTEXT,
+    ) -> bool {
+        match whp::get_registers!(
+            vp.current_whp(),
+            [whp::Register64::Cr0, whp::Register64::Efer]
+        ) {
+            Ok((cr0, efer)) => cr0 & x86defs::X64_CR0_PE != 0 && efer & x86defs::X64_EFER_LMA != 0,
+            Err(err) => {
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to read WHP registers for hypercall mode"
+                );
+                exit_context.ExecutionState.Cr0Pe() && exit_context.ExecutionState.EferLma()
+            }
+        }
+    }
+
     fn whp_vsm_pseudo_register_target(
         vsm: &vsm::VsmController,
         target: RegisterTarget,
@@ -1153,10 +1191,14 @@ mod x86 {
         info: whp::abi::WHV_HYPERCALL_CONTEXT,
         rip: u64,
         rip_dirty: bool,
-        xmm_dirty: bool,
-        gp_dirty: bool,
+        xmm_dirty: u8,
+        gp_dirty: u16,
         invalid_opcode: bool,
         exit_context: &'a whp::abi::WHV_VP_EXIT_CONTEXT,
+    }
+
+    const fn gp_dirty_mask(n: hv1_hypercall::X64HypercallRegister) -> u16 {
+        1 << n as u16
     }
 
     impl hv1_hypercall::X64RegisterState for WhpHypercallExit<'_, '_> {
@@ -1191,7 +1233,7 @@ mod x86 {
                 hv1_hypercall::X64HypercallRegister::Rsi => self.registers.info.Rsi = value,
                 hv1_hypercall::X64HypercallRegister::Rdi => self.registers.info.Rdi = value,
             }
-            self.registers.gp_dirty = true;
+            self.registers.gp_dirty |= gp_dirty_mask(n);
         }
 
         fn xmm(&mut self, n: usize) -> u128 {
@@ -1200,7 +1242,7 @@ mod x86 {
 
         fn set_xmm(&mut self, n: usize, value: u128) {
             self.registers.info.XmmRegisters[n] = value.into();
-            self.registers.xmm_dirty = true;
+            self.registers.xmm_dirty |= 1 << n;
         }
     }
 
@@ -1234,27 +1276,59 @@ mod x86 {
             vp: &'a mut WhpProcessor<'b>,
             info: &whp::abi::WHV_HYPERCALL_CONTEXT,
             exit_context: &'a whp::abi::WHV_VP_EXIT_CONTEXT,
-        ) {
+        ) -> Result<(), WhpVsmVtlSwitchExit> {
             let vpref = vp.vp;
 
-            let is_64bit =
-                exit_context.ExecutionState.Cr0Pe() && exit_context.ExecutionState.EferLma();
+            let is_64bit = is_64bit_hypercall(vp, exit_context);
             let registers = WhpHypercallRegisters {
                 info: *info,
                 rip: exit_context.Rip,
                 rip_dirty: false,
-                xmm_dirty: false,
-                gp_dirty: false,
+                xmm_dirty: 0,
+                gp_dirty: 0,
                 invalid_opcode: false,
                 exit_context,
             };
             let mut this = Self { vp, registers };
+            let control = hvdef::hypercall::Control::from(if is_64bit {
+                info.Rcx
+            } else {
+                (info.Rdx << 32) | (info.Rax & u32::MAX as u64)
+            });
+            let code = hvdef::HypercallCode(control.code());
+
+            let whp_vsm = this.vp.vp.partition.vsm.lock().is_whp();
+            if whp_vsm
+                && matches!(
+                    code,
+                    hvdef::HypercallCode::HvCallVtlCall | hvdef::HypercallCode::HvCallVtlReturn
+                )
+            {
+                tracing::error!(
+                    active_vtl = ?this.vp.state.active_vtl,
+                    vp_index = this.vp.vp.index.index(),
+                    ?code,
+                    fast = control.fast(),
+                    rip = exit_context.Rip,
+                    rax = info.Rax,
+                    rcx = info.Rcx,
+                    rdx = info.Rdx,
+                    "WHP VSM VTL switch hypercall exited to OpenVMM"
+                );
+                return Err(WhpVsmVtlSwitchExit {
+                    code,
+                    rip: exit_context.Rip,
+                    active_vtl: this.vp.state.active_vtl,
+                    fast: control.fast(),
+                });
+            }
 
             WhpHypercallExit::DISPATCHER.dispatch(
                 &vpref.partition.gm,
                 hv1_hypercall::X64RegisterIo::new(&mut this, is_64bit),
             );
-            this.flush()
+            this.flush();
+            Ok(())
         }
 
         fn flush(&mut self) {
@@ -1263,28 +1337,61 @@ mod x86 {
                 ArrayVec::<_, 14>::new(),
                 ArrayVec::<WHV_REGISTER_VALUE, 14>::new(),
             );
-            if registers.gp_dirty {
-                pairs.extend(
-                    [
-                        (whp::Register64::Rax, registers.info.Rax),
-                        (whp::Register64::Rbx, registers.info.Rbx),
-                        (whp::Register64::Rcx, registers.info.Rcx),
-                        (whp::Register64::Rdx, registers.info.Rdx),
-                        (whp::Register64::R8, registers.info.R8),
-                        (whp::Register64::Rsi, registers.info.Rsi),
-                        (whp::Register64::Rdi, registers.info.Rdi),
-                    ]
-                    .into_iter()
-                    .map(|(x, y)| (x.as_abi(), y.as_abi())),
-                );
+            for (reg, value, dirty) in [
+                (
+                    whp::Register64::Rax,
+                    registers.info.Rax,
+                    hv1_hypercall::X64HypercallRegister::Rax,
+                ),
+                (
+                    whp::Register64::Rbx,
+                    registers.info.Rbx,
+                    hv1_hypercall::X64HypercallRegister::Rbx,
+                ),
+                (
+                    whp::Register64::Rcx,
+                    registers.info.Rcx,
+                    hv1_hypercall::X64HypercallRegister::Rcx,
+                ),
+                (
+                    whp::Register64::Rdx,
+                    registers.info.Rdx,
+                    hv1_hypercall::X64HypercallRegister::Rdx,
+                ),
+                (
+                    whp::Register64::R8,
+                    registers.info.R8,
+                    hv1_hypercall::X64HypercallRegister::R8,
+                ),
+                (
+                    whp::Register64::Rsi,
+                    registers.info.Rsi,
+                    hv1_hypercall::X64HypercallRegister::Rsi,
+                ),
+                (
+                    whp::Register64::Rdi,
+                    registers.info.Rdi,
+                    hv1_hypercall::X64HypercallRegister::Rdi,
+                ),
+            ] {
+                if registers.gp_dirty & gp_dirty_mask(dirty) != 0 {
+                    pairs.0.push(reg.as_abi());
+                    pairs.1.push(value.as_abi());
+                }
             }
-            if registers.xmm_dirty {
-                pairs.extend((0..5).map(|i| {
-                    (
-                        whp::abi::WHV_REGISTER_NAME(whp::abi::WHvX64RegisterXmm0.0 + i as u32),
-                        WHV_REGISTER_VALUE(registers.info.XmmRegisters[i]),
-                    )
-                }));
+            if registers.xmm_dirty != 0 {
+                pairs.extend(
+                    (0..6)
+                        .filter(|&i| registers.xmm_dirty & (1 << i) != 0)
+                        .map(|i| {
+                            (
+                                whp::abi::WHV_REGISTER_NAME(
+                                    whp::abi::WHvX64RegisterXmm0.0 + i as u32,
+                                ),
+                                WHV_REGISTER_VALUE(registers.info.XmmRegisters[i]),
+                            )
+                        }),
+                );
             }
             if registers.rip_dirty {
                 pairs.0.push(whp::Register64::Rip.as_abi());
@@ -1293,11 +1400,11 @@ mod x86 {
 
             let (names, values) = &pairs;
             if !names.is_empty() {
-                self.vp.current_whp().set_registers(names, values).unwrap();
+                self.vp.set_active_registers(names, values).unwrap();
 
-                registers.gp_dirty = false;
+                registers.gp_dirty = 0;
                 registers.rip_dirty = false;
-                registers.xmm_dirty = false;
+                registers.xmm_dirty = 0;
             }
 
             if self.registers.invalid_opcode {
@@ -1310,8 +1417,10 @@ mod x86 {
                     .with_vector(x86defs::Exception::INVALID_OPCODE.0.into());
 
                 self.vp
-                    .current_whp()
-                    .set_register(whp::Register128::PendingEvent, exception_event.into())
+                    .set_active_registers(
+                        &[whp::Register128::PendingEvent.as_abi()],
+                        &[WHV_REGISTER_VALUE(u128::from(exception_event).into())],
+                    )
                     .unwrap();
 
                 self.registers.invalid_opcode = false;
@@ -1431,9 +1540,7 @@ mod x86 {
     }
     impl hv1_hypercall::VtlSwitchOps for WhpHypercallExit<'_, '_> {
         fn advance_ip(&mut self) {
-            let exit_context = self.registers.exit_context;
-            let is_64bit =
-                exit_context.ExecutionState.Cr0Pe() && exit_context.ExecutionState.EferLma();
+            let is_64bit = is_64bit_hypercall(self.vp, self.registers.exit_context);
             hv1_hypercall::X64RegisterIo::new(self, is_64bit).advance_ip();
         }
 
@@ -1468,7 +1575,9 @@ mod x86 {
                         Ok([rax, rcx]) => {
                             self.registers.info.Rax = rax;
                             self.registers.info.Rcx = rcx;
-                            self.registers.gp_dirty = true;
+                            self.registers.gp_dirty |=
+                                gp_dirty_mask(hv1_hypercall::X64HypercallRegister::Rax)
+                                    | gp_dirty_mask(hv1_hypercall::X64HypercallRegister::Rcx);
                         }
                         Err(err) => {
                             tracing::error!(
