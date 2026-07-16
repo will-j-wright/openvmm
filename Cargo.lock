@@ -3862,6 +3862,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "underhill_confidentiality",
+ "vm_topology",
+ "vmm_core",
  "x509-cert",
  "x86defs",
  "zerocopy",

@@ -59,6 +59,28 @@ const SNP_ECDSA_CURVE_P384: u32 = 2;
 const SNP_ECC_KEY_SIZE_BYTES: usize = 48;
 const SNP_ECC_COMPONENT_SIZE_BYTES: usize = 72;
 
+/// Identity fields included in an SNP ID block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnpImageIdentity {
+    family_id: [u8; 16],
+    image_id: [u8; 16],
+}
+
+impl SnpImageIdentity {
+    /// The OpenHCL SNP image identity.
+    pub(crate) const OPENHCL: Self = Self::new(SNP_FAMILY_ID, SNP_IMAGE_ID);
+
+    /// The identity used by the direct-Linux SNP test image.
+    pub(crate) const LINUX_DIRECT: Self = Self::new(*b"OpenVMM SNP test", *b"linux-direct\0\0\0\0");
+
+    const fn new(family_id: [u8; 16], image_id: [u8; 16]) -> Self {
+        Self {
+            family_id,
+            image_id,
+        }
+    }
+}
+
 /// Build the SNP ID block signing payload for an IGVM file.
 ///
 /// Called by `manifest` to emit `<base>-snp.idblock`. The returned bytes are
@@ -69,12 +91,22 @@ const SNP_ECC_COMPONENT_SIZE_BYTES: usize = 72;
 /// measurement, `policy` comes from the file's `GuestPolicy`, and `guest_svn`
 /// from the manifest.
 pub fn id_block_signing_payload(ld: &[u8], guest_svn: u32, policy: u64) -> anyhow::Result<Vec<u8>> {
+    id_block_signing_payload_with_identity(ld, guest_svn, policy, SnpImageIdentity::OPENHCL)
+}
+
+/// Build an SNP ID block signing payload with an explicit image identity.
+pub(crate) fn id_block_signing_payload_with_identity(
+    ld: &[u8],
+    guest_svn: u32,
+    policy: u64,
+    identity: SnpImageIdentity,
+) -> anyhow::Result<Vec<u8>> {
     let ld: [u8; SHA_384_OUTPUT_SIZE_BYTES] =
         ld.try_into().context("SNP launch digest is not 48 bytes")?;
     let id_block = SnpPspIdBlock {
         ld,
-        family_id: SNP_FAMILY_ID,
-        image_id: SNP_IMAGE_ID,
+        family_id: identity.family_id,
+        image_id: identity.image_id,
         version: 0x1,
         guest_svn,
         policy,
