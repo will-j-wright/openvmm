@@ -10,6 +10,7 @@ use crate::identity_mapping::VbsMeasurement;
 use crate::signed_measurement::generate_snp_measurement;
 use crate::signed_measurement::generate_tdx_measurement;
 use crate::signed_measurement::generate_vbs_measurement;
+use crate::signed_measurement::snp::SnpImageIdentity;
 use crate::vp_context_builder::VpContextBuilder;
 use crate::vp_context_builder::VpContextPageState;
 use crate::vp_context_builder::VpContextState;
@@ -270,8 +271,13 @@ impl IgvmLoaderRegister for X86Register {
     ) -> anyhow::Result<Option<Measurement>> {
         let measurement = match isolation {
             LoaderIsolationType::Snp { .. } => {
-                let ld = generate_snp_measurement(initialization_headers, directive_headers, svn)
-                    .context("generating snp measurement failed")?;
+                let ld = generate_snp_measurement(
+                    initialization_headers,
+                    directive_headers,
+                    svn,
+                    SnpImageIdentity::UNDERHILL,
+                )
+                .context("generating snp measurement failed")?;
                 Some(Measurement::Snp(SnpMeasurement::new(
                     ld,
                     svn,
