@@ -7665,6 +7665,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "snp_test_igvmfilegen"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crypto",
+ "fs-err",
+ "hex",
+ "igvm",
+ "igvm_defs",
+ "loader",
+ "serde",
+ "serde_json",
+ "test_with_tracing",
+ "vm_topology",
+ "vmm_core",
+ "x86defs",
+ "zerocopy",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
