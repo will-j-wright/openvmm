@@ -1,16 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Generation library for the standalone SNP test IGVM executable.
+//! Generation strategy for a self-contained SNP Linux-direct IGVM.
 
-#![forbid(unsafe_code)]
-
-mod id_block;
-
+use crate::identity_mapping::Measurement;
+use crate::identity_mapping::SnpMeasurement;
+use crate::signed_measurement::snp::SnpImageIdentity;
+use crate::signed_measurement::snp::generate_snp_measurement;
 use anyhow::Context;
 use anyhow::bail;
 use anyhow::ensure;
-use crypto::sha_384::Sha384;
 use igvm::IgvmDirectiveHeader;
 use igvm::IgvmFile;
 use igvm::IgvmInitializationHeader;
@@ -23,6 +22,10 @@ use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
 use igvm_defs::IgvmPageDataFlags;
 use igvm_defs::IgvmPageDataType;
 use igvm_defs::IgvmPlatformType;
+use igvm_defs::SnpPolicy;
+use igvmfilegen_config::LinuxImage;
+use igvmfilegen_config::ResourceType;
+use igvmfilegen_config::Resources;
 use loader::importer::BootPageAcceptance;
 use loader::importer::IgvmParameterType;
 use loader::importer::ImageLoad;
@@ -35,66 +38,39 @@ use loader::importer::TableRegister;
 use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
-use serde::Deserialize;
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::ffi::CString;
 use std::fmt::Write as _;
 use std::io::Seek;
-use std::io::Write;
 use std::mem::discriminant;
-use std::path::Path;
-use std::path::PathBuf;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::processor::TopologyBuilder;
 use zerocopy::FromZeros;
-use zerocopy::IntoBytes;
 
 const COMPATIBILITY_MASK: u32 = 1;
 const PAGE_SIZE: u64 = igvm_defs::PAGE_SIZE_4K;
-const RAM_MIB: u64 = 160;
-const RAM_SIZE: u64 = RAM_MIB * 1024 * 1024;
-const RAM_PAGE_COUNT: u64 = RAM_SIZE / PAGE_SIZE;
 const PROCESSOR_COUNT: u32 = 1;
-const GUEST_SVN: u32 = 1;
-/// Test-only host assumption. Real SNP software must read this from CPUID
-/// 0x8000_001f rather than assuming that the encryption bit is always 51.
-const SNP_C_BIT_POSITION: u8 = 51;
-const SNP_C_BIT_MASK: u64 = 1 << SNP_C_BIT_POSITION;
 /// KVM hardcodes the initial VMSA at this GPA and measures it during launch
 /// finish, after all userspace-provided launch-update pages.
 const KVM_VMSA_GPA: u64 = 0xffff_ffff_f000;
-const SNP_POLICY: u64 = (1 << 19) | (1 << 17) | (1 << 16);
-const KERNEL_COMMAND_LINE: &str = "console=ttyS0 earlyprintk=serial earlycon panic=-1";
 const PM_BASE: u16 = 0x400;
 const ACPI_IRQ: u32 = 9;
 const COM1_BASE: u16 = 0x3f8;
 const COM1_IRQ: u32 = 4;
-const MEASUREMENT_CLASS_ID: &str = "7fb00ee4-a7ff-11ed-9e2f-00155d09de56";
 
-/// Inputs accepted by the fixed-shape generator.
-#[derive(Debug, Clone)]
-pub struct GenerateOptions {
-    /// Linux kernel image.
-    pub kernel: PathBuf,
-    /// Optional initrd image.
-    pub initrd: Option<PathBuf>,
-    /// Output IGVM path.
-    pub output: PathBuf,
+pub struct BuildParams<'a> {
+    pub linux: &'a LinuxImage,
+    pub memory_page_count: u64,
+    pub c_bit_position: u8,
+    pub guest_svn: u32,
+    pub policy: SnpPolicy,
+    pub resources: &'a Resources,
 }
 
-/// Paths written by [`generate`].
-#[derive(Debug, Clone)]
-pub struct GeneratedArtifacts {
-    /// Serialized IGVM.
-    pub igvm: PathBuf,
-    /// Human-readable GPA map.
-    pub map: PathBuf,
-    /// SNP launch measurement document.
-    pub measurement: PathBuf,
-    /// Expected OpenVMM launch configuration.
-    pub openvmm_contract: PathBuf,
+pub struct BuildOutput {
+    pub guest: IgvmFile,
+    pub map: String,
+    pub measurement: Measurement,
 }
 
 #[derive(Debug, Clone)]
@@ -108,28 +84,36 @@ struct ImportedPage {
 struct TestIgvmImporter {
     pages: BTreeMap<u64, ImportedPage>,
     registers: Vec<X86Register>,
+    ram_page_count: u64,
+    c_bit_mask: u64,
 }
 
 impl TestIgvmImporter {
-    fn new() -> Self {
+    fn new(ram_page_count: u64, c_bit_position: u8) -> Self {
         Self {
             pages: BTreeMap::new(),
             registers: Vec::new(),
+            ram_page_count,
+            c_bit_mask: 1u64 << c_bit_position,
         }
     }
 
     fn finish(self) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, SevVmsa, String)> {
-        let vmsa = build_vmsa(&self.registers)?;
+        let vmsa = build_vmsa(&self.registers, self.c_bit_mask)?;
         let (mut directives, map) =
-            build_complete_ram_directives(&self.pages, &vmsa, RAM_PAGE_COUNT)?;
+            build_complete_ram_directives(&self.pages, &vmsa, self.ram_page_count)?;
+        let ram_size = self
+            .ram_page_count
+            .checked_mul(PAGE_SIZE)
+            .context("RAM size overflow")?;
         directives.insert(
             0,
             IgvmDirectiveHeader::RequiredMemory {
                 gpa: 0,
                 compatibility_mask: COMPATIBILITY_MASK,
-                number_of_bytes: RAM_SIZE
+                number_of_bytes: ram_size
                     .try_into()
-                    .expect("fixed RAM size fits in an IGVM required-memory directive"),
+                    .context("RAM size does not fit in an IGVM required-memory directive")?,
                 vtl2_protectable: false,
             },
         );
@@ -194,13 +178,13 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
             .checked_add(page_count)
             .context("imported page range overflow")?;
         ensure!(
-            page_end <= RAM_PAGE_COUNT,
-            "{debug_tag} lies outside the fixed {RAM_MIB} MiB RAM layout"
+            page_end <= self.ram_page_count,
+            "{debug_tag} lies outside the configured RAM layout"
         );
 
         let mut data = data.to_vec();
         if debug_tag == "linux-pagetables" {
-            patch_confidential_page_tables(&mut data)?;
+            patch_confidential_page_tables(&mut data, self.c_bit_mask)?;
         }
 
         for page_offset in 0..page_count {
@@ -253,8 +237,8 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
             .checked_add(page_count)
             .context("required memory range overflow")?;
         ensure!(
-            page_end <= RAM_PAGE_COUNT,
-            "required memory lies outside the fixed RAM layout"
+            page_end <= self.ram_page_count,
+            "required memory lies outside the configured RAM layout"
         );
         Ok(())
     }
@@ -290,10 +274,20 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
     fn set_imported_regions_config_page(&mut self, _page_base: u64) {}
 }
 
-/// Generate the fixed SNP test IGVM and companion artifacts.
-pub fn generate(options: GenerateOptions) -> anyhow::Result<GeneratedArtifacts> {
+pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
+    let BuildParams {
+        linux,
+        memory_page_count,
+        c_bit_position,
+        guest_svn,
+        policy,
+        resources,
+    } = params;
+    let memory_size = memory_page_count
+        .checked_mul(PAGE_SIZE)
+        .context("RAM size overflow")?;
     let memory_layout =
-        MemoryLayout::new(RAM_SIZE, &[], &[], &[], None).context("building memory layout")?;
+        MemoryLayout::new(memory_size, &[], &[], &[], None).context("building memory layout")?;
     let processor_topology = TopologyBuilder::new_x86()
         .build(PROCESSOR_COUNT)
         .context("building processor topology")?;
@@ -316,14 +310,21 @@ pub fn generate(options: GenerateOptions) -> anyhow::Result<GeneratedArtifacts> 
         },
     };
 
-    let mut kernel = fs_err::File::open(&options.kernel)
-        .with_context(|| format!("opening kernel {}", options.kernel.display()))?;
-    let mut initrd = match &options.initrd {
-        Some(path) => Some(
-            fs_err::File::open(path)
-                .with_context(|| format!("opening initrd {}", path.display()))?,
-        ),
-        None => None,
+    let kernel_path = resources
+        .get(ResourceType::LinuxKernel)
+        .context("Linux kernel resource is missing")?;
+    let mut kernel = fs_err::File::open(kernel_path)
+        .with_context(|| format!("opening kernel {}", kernel_path.display()))?;
+    let mut initrd = if linux.use_initrd {
+        let initrd_path = resources
+            .get(ResourceType::LinuxInitrd)
+            .context("Linux initrd resource is missing")?;
+        Some(
+            fs_err::File::open(initrd_path)
+                .with_context(|| format!("opening initrd {}", initrd_path.display()))?,
+        )
+    } else {
+        None
     };
     let initrd_config = if let Some(initrd) = &mut initrd {
         let size = initrd
@@ -339,14 +340,12 @@ pub fn generate(options: GenerateOptions) -> anyhow::Result<GeneratedArtifacts> 
         None
     };
 
-    let command_line =
-        CString::new(KERNEL_COMMAND_LINE).expect("fixed kernel command line has no NUL");
-    let mut importer = TestIgvmImporter::new();
+    let mut importer = TestIgvmImporter::new(memory_page_count, c_bit_position);
     loader::linux::load_x86(
         &mut importer,
         &mut kernel,
         initrd_config,
-        &command_line,
+        &linux.command_line,
         &memory_layout,
         |gpa| {
             let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
@@ -365,6 +364,7 @@ pub fn generate(options: GenerateOptions) -> anyhow::Result<GeneratedArtifacts> 
     .context("loading direct-Linux image")?;
 
     let (mut directives, _vmsa, map) = importer.finish()?;
+    let policy: u64 = policy.into();
     let platform_headers = vec![IgvmPlatformHeader::SupportedPlatform(
         IGVM_VHS_SUPPORTED_PLATFORM {
             compatibility_mask: COMPATIBILITY_MASK,
@@ -375,17 +375,17 @@ pub fn generate(options: GenerateOptions) -> anyhow::Result<GeneratedArtifacts> 
         },
     )];
     let initialization_headers = vec![IgvmInitializationHeader::GuestPolicy {
-        policy: SNP_POLICY,
+        policy,
         compatibility_mask: COMPATIBILITY_MASK,
     }];
 
-    let launch_digest = generate_snp_measurement(&initialization_headers, &directives)
-        .context("computing SNP launch digest")?;
-    directives.push(id_block::signed_id_block(
-        launch_digest,
-        GUEST_SVN,
-        SNP_POLICY,
-    )?);
+    let launch_digest = generate_snp_measurement(
+        &initialization_headers,
+        &mut directives,
+        guest_svn,
+        SnpImageIdentity::LINUX_DIRECT,
+    )
+    .context("computing SNP launch digest")?;
 
     let igvm = IgvmFile::new(
         IgvmRevision::V1,
@@ -398,14 +398,33 @@ pub fn generate(options: GenerateOptions) -> anyhow::Result<GeneratedArtifacts> 
     igvm.serialize(&mut binary).context("serializing IGVM")?;
     let reparsed = IgvmFile::new_from_binary(&binary, Some(igvm::IsolationType::Snp))
         .context("validating serialized SNP IGVM")?;
-    validate_generated_igvm(&reparsed, launch_digest)?;
+    validate_generated_igvm(
+        &reparsed,
+        launch_digest,
+        policy,
+        guest_svn,
+        memory_page_count,
+        1u64 << c_bit_position,
+    )?;
 
-    write_artifacts(&options, &binary, &map, launch_digest)
+    Ok(BuildOutput {
+        guest: igvm,
+        map,
+        measurement: Measurement::Snp(SnpMeasurement::new(
+            launch_digest,
+            guest_svn,
+            SnpPolicy::from(policy).debug() == 1,
+        )),
+    })
 }
 
 fn validate_generated_igvm(
     igvm: &IgvmFile,
     expected_launch_digest: [u8; 48],
+    expected_policy: u64,
+    expected_guest_svn: u32,
+    ram_page_count: u64,
+    c_bit_mask: u64,
 ) -> anyhow::Result<()> {
     ensure!(igvm.platforms().len() == 1, "expected one platform header");
     let IgvmPlatformHeader::SupportedPlatform(platform) = &igvm.platforms()[0];
@@ -421,7 +440,7 @@ fn validate_generated_igvm(
             IgvmInitializationHeader::GuestPolicy {
                 policy,
                 compatibility_mask: COMPATIBILITY_MASK,
-            } if *policy == SNP_POLICY
+            } if *policy == expected_policy
         )),
         "serialized file lost its SNP guest policy"
     );
@@ -446,7 +465,7 @@ fn validate_generated_igvm(
                 ensure!(!saw_vmsa, "PageData appears after the VMSA directive");
                 ensure!(gpa.is_multiple_of(PAGE_SIZE), "unaligned PageData GPA");
                 let page = gpa / PAGE_SIZE;
-                ensure!(page < RAM_PAGE_COUNT, "PageData lies outside RAM");
+                ensure!(page < ram_page_count, "PageData lies outside RAM");
                 ensure!(
                     covered_pages.insert(page),
                     "duplicate page directive at GPA {gpa:#x}"
@@ -477,8 +496,8 @@ fn validate_generated_igvm(
                 ensure!(!vmsa.sev_features.vtom(), "VMSA unexpectedly enables vTOM");
                 ensure!(vmsa.virtual_tom == 0, "VMSA virtual TOM is not zero");
                 ensure!(
-                    vmsa.cr3 & SNP_C_BIT_MASK != 0,
-                    "VMSA CR3 does not contain C-bit 51"
+                    vmsa.cr3 & c_bit_mask != 0,
+                    "VMSA CR3 does not contain the configured C-bit"
                 );
                 ensure!(
                     vmsa.cr0 & x86defs::X64_CR0_ET != 0,
@@ -511,14 +530,16 @@ fn validate_generated_igvm(
                 ..
             } => {
                 ensure!(
-                    *gpa == 0 && u64::from(*number_of_bytes) == RAM_SIZE && !vtl2_protectable,
+                    *gpa == 0
+                        && u64::from(*number_of_bytes) == ram_page_count * PAGE_SIZE
+                        && !vtl2_protectable,
                     "unexpected RequiredMemory directive"
                 );
                 required_memory_count += 1;
             }
             IgvmDirectiveHeader::SnpIdBlock { ld, guest_svn, .. } => {
                 ensure!(
-                    *ld == expected_launch_digest && *guest_svn == GUEST_SVN,
+                    *ld == expected_launch_digest && *guest_svn == expected_guest_svn,
                     "SNP ID block does not match the generated launch digest"
                 );
                 id_block_count += 1;
@@ -528,9 +549,9 @@ fn validate_generated_igvm(
     }
 
     ensure!(
-        covered_pages.len() == RAM_PAGE_COUNT as usize
+        covered_pages.len() == ram_page_count as usize
             && covered_pages.first() == Some(&0)
-            && covered_pages.last() == Some(&(RAM_PAGE_COUNT - 1)),
+            && covered_pages.last() == Some(&(ram_page_count - 1)),
         "IGVM does not cover every page of the fixed RAM layout"
     );
     ensure!(required_memory_count == 1, "expected one RequiredMemory");
@@ -539,8 +560,19 @@ fn validate_generated_igvm(
     ensure!(secrets_count == 1, "expected one SNP secrets page");
     ensure!(cpuid_count == 1, "expected one SNP CPUID page");
 
-    let measured_digest = generate_snp_measurement(igvm.initializations(), igvm.directives())
-        .context("remeasuring serialized SNP IGVM")?;
+    let mut measured_directives = igvm
+        .directives()
+        .iter()
+        .filter(|directive| !matches!(directive, IgvmDirectiveHeader::SnpIdBlock { .. }))
+        .cloned()
+        .collect();
+    let measured_digest = generate_snp_measurement(
+        igvm.initializations(),
+        &mut measured_directives,
+        expected_guest_svn,
+        SnpImageIdentity::LINUX_DIRECT,
+    )
+    .context("remeasuring serialized SNP IGVM")?;
     ensure!(
         measured_digest == expected_launch_digest,
         "serialized IGVM launch digest changed"
@@ -548,98 +580,7 @@ fn validate_generated_igvm(
     Ok(())
 }
 
-fn generate_snp_measurement(
-    initialization_headers: &[IgvmInitializationHeader],
-    directives: &[IgvmDirectiveHeader],
-) -> anyhow::Result<[u8; 48]> {
-    ensure!(
-        initialization_headers.iter().any(|header| matches!(
-            header,
-            IgvmInitializationHeader::GuestPolicy {
-                compatibility_mask,
-                ..
-            } if compatibility_mask & COMPATIBILITY_MASK == COMPATIBILITY_MASK
-        )),
-        "SNP guest policy is missing"
-    );
-
-    let zero_page = [0; PAGE_SIZE as usize];
-    let zero_digest = crypto::sha_384::sha_384(&zero_page);
-    let mut launch_digest = [0; 48];
-    let mut padded_page = vec![0; PAGE_SIZE as usize];
-
-    let mut measure_page = |page_type: x86defs::snp::SnpPageType,
-                            gpa: u64,
-                            page_data: Option<&[u8]>|
-     -> anyhow::Result<()> {
-        let contents = match page_data {
-            Some([]) => zero_digest,
-            Some(data) if data.len() < PAGE_SIZE as usize => {
-                padded_page.fill(0);
-                padded_page[..data.len()].copy_from_slice(data);
-                crypto::sha_384::sha_384(&padded_page)
-            }
-            Some(data) if data.len() == PAGE_SIZE as usize => crypto::sha_384::sha_384(data),
-            Some(data) => bail!("cannot measure {}-byte page data", data.len()),
-            None => [0; 48],
-        };
-        let page_info = x86defs::snp::SnpPageInfo {
-            digest_current: launch_digest,
-            contents,
-            length: size_of::<x86defs::snp::SnpPageInfo>() as u16,
-            page_type,
-            imi_page_bit: 0,
-            lower_vmpl_permissions: 0,
-            gpa,
-        };
-        let mut hash = Sha384::new();
-        hash.update(page_info.as_bytes());
-        launch_digest = hash.finish();
-        Ok(())
-    };
-
-    for directive in directives {
-        if directive
-            .compatibility_mask()
-            .map(|mask| mask & COMPATIBILITY_MASK != COMPATIBILITY_MASK)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        match directive {
-            IgvmDirectiveHeader::PageData {
-                gpa,
-                flags,
-                data_type,
-                data,
-                ..
-            } if !flags.shared() => {
-                let (page_type, data) = if *data_type == IgvmPageDataType::SECRETS {
-                    (x86defs::snp::SnpPageType::SECRETS, None)
-                } else if *data_type == IgvmPageDataType::CPUID_DATA
-                    || *data_type == IgvmPageDataType::CPUID_XF
-                {
-                    (x86defs::snp::SnpPageType::CPUID, None)
-                } else if flags.unmeasured() {
-                    (x86defs::snp::SnpPageType::UNMEASURED, None)
-                } else {
-                    (x86defs::snp::SnpPageType::NORMAL, Some(data.as_slice()))
-                };
-                measure_page(page_type, *gpa, data)?;
-            }
-            IgvmDirectiveHeader::SnpVpContext { gpa, vmsa, .. } => {
-                measure_page(x86defs::snp::SnpPageType::VMSA, *gpa, Some(vmsa.as_bytes()))?;
-            }
-            IgvmDirectiveHeader::PageData { .. }
-            | IgvmDirectiveHeader::RequiredMemory { .. }
-            | IgvmDirectiveHeader::SnpIdBlock { .. } => {}
-            unexpected => bail!("cannot measure unexpected directive {unexpected:?}"),
-        }
-    }
-    Ok(launch_digest)
-}
-
-fn patch_confidential_page_tables(data: &mut [u8]) -> anyhow::Result<()> {
+fn patch_confidential_page_tables(data: &mut [u8], c_bit_mask: u64) -> anyhow::Result<()> {
     ensure!(
         data.len().is_multiple_of(size_of::<u64>()),
         "Linux page-table data is not a whole number of entries"
@@ -651,14 +592,18 @@ fn patch_confidential_page_tables(data: &mut [u8]) -> anyhow::Result<()> {
                 .expect("an exact eight-byte chunk converts to an array"),
         );
         if value & 1 != 0 {
-            value |= SNP_C_BIT_MASK;
+            ensure!(
+                value & c_bit_mask == 0,
+                "Linux page-table entry already uses the configured C-bit"
+            );
+            value |= c_bit_mask;
             entry.copy_from_slice(&value.to_le_bytes());
         }
     }
     Ok(())
 }
 
-fn build_vmsa(registers: &[X86Register]) -> anyhow::Result<SevVmsa> {
+fn build_vmsa(registers: &[X86Register], c_bit_mask: u64) -> anyhow::Result<SevVmsa> {
     let mut vmsa = SevVmsa::new_zeroed();
     vmsa.efer = x86defs::X64_EFER_SVME;
     vmsa.sev_features = SevFeatures::new().with_snp(true);
@@ -698,7 +643,7 @@ fn build_vmsa(registers: &[X86Register]) -> anyhow::Result<SevVmsa> {
             X86Register::Cs(value) => vmsa.cs = segment_selector(value),
             X86Register::Tr(value) => vmsa.tr = segment_selector(value),
             X86Register::Cr0(value) => vmsa.cr0 = value | x86defs::X64_CR0_ET,
-            X86Register::Cr3(value) => vmsa.cr3 = value | SNP_C_BIT_MASK,
+            X86Register::Cr3(value) => vmsa.cr3 = value | c_bit_mask,
             X86Register::Cr4(value) => vmsa.cr4 = value | x86defs::X64_CR4_MCE,
             X86Register::Efer(value) => vmsa.efer = value | x86defs::X64_EFER_SVME,
             X86Register::Pat(value) => vmsa.pat = value,
@@ -734,7 +679,7 @@ fn build_vmsa(registers: &[X86Register]) -> anyhow::Result<SevVmsa> {
 
     ensure!(vmsa.rip != 0, "Linux loader did not provide an entry point");
     ensure!(
-        vmsa.cr3 & SNP_C_BIT_MASK != 0,
+        vmsa.cr3 & c_bit_mask != 0,
         "initial CR3 does not contain the fixed SNP C-bit"
     );
     ensure!(
@@ -813,7 +758,7 @@ fn build_complete_ram_directives(
         imported.keys().all(|page| *page < ram_page_count),
         "an imported page lies outside RAM"
     );
-    Ok((directives, format_map(&map_entries)))
+    Ok((directives, format_map(&map_entries, ram_page_count)))
 }
 
 fn page_data_shape(
@@ -854,11 +799,12 @@ fn page_data_shape(
     })
 }
 
-fn format_map(entries: &[(u64, String, &'static str)]) -> String {
-    let mut output = String::from(
-        "IGVM file isolation: SNP (C-bit model, fixed bit 51)\n\
-         Required memory: 0000000000000000 - 000000000a000000 (0xa000000 bytes)\n\
-         IGVM file layout:\n",
+fn format_map(entries: &[(u64, String, &'static str)], ram_page_count: u64) -> String {
+    let ram_size = ram_page_count * PAGE_SIZE;
+    let mut output = format!(
+        "IGVM file isolation: SNP (C-bit model)\n\
+         Required memory: 0000000000000000 - {ram_size:016x} ({ram_size:#x} bytes)\n\
+         IGVM file layout:\n"
     );
     let mut index = 0;
     while index < entries.len() {
@@ -882,180 +828,25 @@ fn format_map(entries: &[(u64, String, &'static str)]) -> String {
     output
 }
 
-#[derive(Debug, Serialize)]
-struct MeasurementDocument {
-    environment: MeasurementEnvironment,
-    series: Vec<MeasurementInstance>,
-}
-
-#[derive(Debug, Serialize)]
-struct MeasurementEnvironment {
-    class_id: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct MeasurementInstance {
-    reference: MeasurementReference,
-    endorsement: MeasurementEndorsement,
-}
-
-#[derive(Debug, Serialize)]
-struct MeasurementReference {
-    snp_ld: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MeasurementEndorsement {
-    snp_isvsvn: u32,
-    build_info: MeasurementBuildInfo,
-}
-
-#[derive(Debug, Serialize)]
-struct MeasurementBuildInfo {
-    debug_build: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct OpenvmmLaunchContract {
-    schema_version: u32,
-    hypervisor: &'static str,
-    isolation: &'static str,
-    memory_mib: u64,
-    processor_count: u32,
-    serial_console: &'static str,
-    vmbus: bool,
-    pcie: bool,
-    disks: bool,
-    expected_snp_c_bit_position: u8,
-    kvm_vmsa_gpa: &'static str,
-    all_ram_pages_are_measured_normal: bool,
-    kvm_zero_page_optimization_allowed: bool,
-    kernel_command_line: &'static str,
-    suggested_arguments: Vec<String>,
-}
-
-fn write_artifacts(
-    options: &GenerateOptions,
-    binary: &[u8],
-    map: &str,
-    launch_digest: [u8; 48],
-) -> anyhow::Result<GeneratedArtifacts> {
-    if let Some(parent) = options.output.parent() {
-        fs_err::create_dir_all(parent)
-            .with_context(|| format!("creating output directory {}", parent.display()))?;
-    }
-    fs_err::write(&options.output, binary)
-        .with_context(|| format!("writing IGVM {}", options.output.display()))?;
-
-    let map_path = append_to_file_name(&options.output, ".map")?;
-    fs_err::write(&map_path, map).with_context(|| format!("writing map {}", map_path.display()))?;
-
-    let measurement_path = replace_file_name(&options.output, "-snp.json")?;
-    let measurement = MeasurementDocument {
-        environment: MeasurementEnvironment {
-            class_id: MEASUREMENT_CLASS_ID,
-        },
-        series: vec![MeasurementInstance {
-            reference: MeasurementReference {
-                snp_ld: hex::encode_upper(launch_digest),
-            },
-            endorsement: MeasurementEndorsement {
-                snp_isvsvn: GUEST_SVN,
-                build_info: MeasurementBuildInfo { debug_build: true },
-            },
-        }],
-    };
-    write_json(&measurement_path, &measurement)?;
-
-    let openvmm_contract_path = replace_file_name(&options.output, ".openvmm.json")?;
-    let contract = openvmm_launch_contract(&options.output);
-    write_json(&openvmm_contract_path, &contract)?;
-
-    Ok(GeneratedArtifacts {
-        igvm: options.output.clone(),
-        map: map_path,
-        measurement: measurement_path,
-        openvmm_contract: openvmm_contract_path,
-    })
-}
-
-fn openvmm_launch_contract(output: &Path) -> OpenvmmLaunchContract {
-    OpenvmmLaunchContract {
-        schema_version: 1,
-        hypervisor: "kvm",
-        isolation: "snp",
-        memory_mib: RAM_MIB,
-        processor_count: PROCESSOR_COUNT,
-        serial_console: "com1",
-        vmbus: false,
-        pcie: false,
-        disks: false,
-        expected_snp_c_bit_position: SNP_C_BIT_POSITION,
-        kvm_vmsa_gpa: "0xFFFFFFFFF000",
-        all_ram_pages_are_measured_normal: true,
-        kvm_zero_page_optimization_allowed: false,
-        kernel_command_line: KERNEL_COMMAND_LINE,
-        suggested_arguments: vec![
-            "--hypervisor".into(),
-            "kvm".into(),
-            "--isolation".into(),
-            "snp".into(),
-            "--igvm".into(),
-            output.display().to_string(),
-            "--com1".into(),
-            "console".into(),
-            "--no-vmbus".into(),
-            "-m".into(),
-            "160MB".into(),
-            "-p".into(),
-            "1".into(),
-        ],
-    }
-}
-
-fn write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
-    let mut file =
-        fs_err::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    serde_json::to_writer_pretty(&mut file, value)
-        .with_context(|| format!("serializing {}", path.display()))?;
-    writeln!(file).with_context(|| format!("finishing {}", path.display()))?;
-    Ok(())
-}
-
-fn append_to_file_name(path: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
-    let mut file_name = path
-        .file_name()
-        .context("output path must have a file name")?
-        .to_os_string();
-    file_name.push(suffix);
-    Ok(path.with_file_name(file_name))
-}
-
-fn replace_file_name(path: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
-    let mut file_name = path
-        .file_stem()
-        .context("output path must have a file stem")?
-        .to_os_string();
-    file_name.push(suffix);
-    Ok(path.with_file_name(file_name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_with_tracing::test;
+    use zerocopy::IntoBytes;
+
+    const TEST_C_BIT_MASK: u64 = 1 << 51;
 
     #[test]
     fn page_table_patch_sets_only_present_entries() {
         let entries = [0u64, 0x2003, 0x4002];
         let mut data = entries.as_bytes().to_vec();
-        patch_confidential_page_tables(&mut data).unwrap();
+        patch_confidential_page_tables(&mut data, TEST_C_BIT_MASK).unwrap();
         let patched: Vec<_> = data
             .chunks_exact(8)
             .map(|entry| u64::from_le_bytes(entry.try_into().unwrap()))
             .collect();
         assert_eq!(patched[0], 0);
-        assert_eq!(patched[1], 0x2003 | SNP_C_BIT_MASK);
+        assert_eq!(patched[1], 0x2003 | TEST_C_BIT_MASK);
         assert_eq!(patched[2], 0x4002);
     }
 
@@ -1063,14 +854,14 @@ mod tests {
     fn vmsa_uses_c_bit_model() {
         let registers = [
             X86Register::Rip(0x100000),
-            X86Register::Cr3(0x4000 | SNP_C_BIT_MASK),
+            X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
             X86Register::Cr0(x86defs::X64_CR0_PE | x86defs::X64_CR0_PG),
             X86Register::Cr4(x86defs::X64_CR4_PAE),
             X86Register::Efer(x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA),
         ];
-        let vmsa = build_vmsa(&registers).unwrap();
+        let vmsa = build_vmsa(&registers, TEST_C_BIT_MASK).unwrap();
         assert_eq!(vmsa.rip, 0x100000);
-        assert_ne!(vmsa.cr3 & SNP_C_BIT_MASK, 0);
+        assert_ne!(vmsa.cr3 & TEST_C_BIT_MASK, 0);
         assert_ne!(vmsa.cr0 & x86defs::X64_CR0_ET, 0);
         assert_ne!(vmsa.cr4 & x86defs::X64_CR4_MCE, 0);
         assert!(vmsa.sev_features.snp());
@@ -1100,10 +891,13 @@ mod tests {
                 tag: "secret",
             },
         );
-        let vmsa = build_vmsa(&[
-            X86Register::Rip(0x100000),
-            X86Register::Cr3(0x4000 | SNP_C_BIT_MASK),
-        ])
+        let vmsa = build_vmsa(
+            &[
+                X86Register::Rip(0x100000),
+                X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
+            ],
+            TEST_C_BIT_MASK,
+        )
         .unwrap();
         let (directives, _) = build_complete_ram_directives(&imported, &vmsa, 4).unwrap();
         assert_eq!(directives.len(), 5);
@@ -1136,23 +930,5 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn launch_contract_matches_fixed_image() {
-        let contract = openvmm_launch_contract(Path::new("/tmp/test.igvm"));
-        assert_eq!(contract.memory_mib, 160);
-        assert_eq!(contract.processor_count, 1);
-        assert_eq!(contract.expected_snp_c_bit_position, 51);
-        assert_eq!(contract.kvm_vmsa_gpa, "0xFFFFFFFFF000");
-        assert!(contract.all_ram_pages_are_measured_normal);
-        assert!(!contract.kvm_zero_page_optimization_allowed);
-        assert!(!contract.vmbus);
-        assert!(
-            contract
-                .suggested_arguments
-                .windows(2)
-                .any(|args| args == ["--igvm", "/tmp/test.igvm"])
-        );
     }
 }

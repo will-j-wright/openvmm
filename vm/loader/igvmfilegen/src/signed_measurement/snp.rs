@@ -23,6 +23,8 @@ use zerocopy::IntoBytes;
 pub enum Error {
     #[error("invalid parameter area index")]
     InvalidParameterAreaIndex,
+    #[error("missing or invalid SNP guest policy")]
+    InvalidGuestPolicy,
     #[error("failed to sign temporary SNP ID block: {0}")]
     TempSigning(String),
 }
@@ -32,6 +34,35 @@ const SNP_ECDSA_CURVE_P384: u32 = 2;
 const SNP_ECC_KEY_SIZE_BYTES: usize = 48;
 const SNP_ECC_COMPONENT_SIZE_BYTES: usize = 72;
 
+/// Identity fields included in an SNP ID block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnpImageIdentity {
+    family_id: [u8; 16],
+    image_id: [u8; 16],
+}
+
+impl SnpImageIdentity {
+    /// The Underhill SNP image identity.
+    pub(crate) const UNDERHILL: Self = Self::new(
+        [
+            0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ],
+        *b"underhill\0\0\0\0\0\0\0",
+    );
+
+    /// The identity used by the direct-Linux SNP test image.
+    pub(crate) const LINUX_DIRECT: Self = Self::new(*b"OpenVMM SNP test", *b"linux-direct\0\0\0\0");
+
+    /// Creates an SNP image identity from PSP family and image IDs.
+    pub(crate) const fn new(family_id: [u8; 16], image_id: [u8; 16]) -> Self {
+        Self {
+            family_id,
+            image_id,
+        }
+    }
+}
+
 /// Iterate through all headers, creating a launch digest which is then signed,
 /// returning the launch digest. Also emits a temporarily-signed
 /// [`IgvmDirectiveHeader::SnpIdBlock`] directive (the presence of this directive
@@ -40,6 +71,7 @@ pub fn generate_snp_measurement(
     initialization_headers: &[IgvmInitializationHeader],
     directive_headers: &mut Vec<IgvmDirectiveHeader>,
     svn: u32,
+    identity: SnpImageIdentity,
 ) -> Result<[u8; SHA_384_OUTPUT_SIZE_BYTES], Error> {
     let mut parameter_area_table = HashMap::new();
     const PAGE_SIZE_4K_USIZE: usize = PAGE_SIZE_4K as usize;
@@ -100,7 +132,7 @@ pub fn generate_snp_measurement(
         launch_digest = hash.finish();
     };
 
-    let mut policy: u64 = 0;
+    let mut policy = None;
 
     for header in initialization_headers {
         if let IgvmInitializationHeader::GuestPolicy {
@@ -108,14 +140,14 @@ pub fn generate_snp_measurement(
             compatibility_mask,
         } = header
         {
-            assert_eq!(
-                compatibility_mask & snp_compatibility_mask,
-                snp_compatibility_mask
-            );
-            policy = *snp_policy;
+            if compatibility_mask & snp_compatibility_mask == snp_compatibility_mask {
+                policy = Some(*snp_policy);
+            }
         }
     }
-    assert_ne!(policy, 0);
+    let policy = policy
+        .filter(|policy| *policy != 0)
+        .ok_or(Error::InvalidGuestPolicy)?;
 
     // Loop over all the page data to build the digest
     for header in directive_headers.iter() {
@@ -208,22 +240,14 @@ pub fn generate_snp_measurement(
         }
     }
 
-    // Underhill family ID for the SNP ID block.
-    const UNDERHILL_FAMILY_ID: [u8; 16] = [
-        0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00,
-    ];
-    let family_id = UNDERHILL_FAMILY_ID;
-    let image_id = *b"underhill\0\0\0\0\0\0\0";
-
     // Generate the PSP ID block format, hash with SHA-384.
     let psp_id_block = SnpPspIdBlock {
         ld: launch_digest,
         version: 0x1,
         guest_svn: svn,
         policy,
-        family_id,
-        image_id,
+        family_id: identity.family_id,
+        image_id: identity.image_id,
     };
 
     // Print the ID block for reference.
@@ -340,4 +364,127 @@ fn sign_id_block_with_temp_key(
     };
 
     Ok((id_key_signature, id_public_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use igvm_defs::IgvmPageDataFlags;
+    use igvm_defs::SnpPolicy;
+
+    fn initialization_headers() -> Vec<IgvmInitializationHeader> {
+        let policy = SnpPolicy::from((0x1 << 17) | (0x1 << 16) | 0x1f);
+        vec![IgvmInitializationHeader::GuestPolicy {
+            policy: policy.into(),
+            compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+        }]
+    }
+
+    fn page_data(page_number: u64, flags: IgvmPageDataFlags, data: Vec<u8>) -> IgvmDirectiveHeader {
+        IgvmDirectiveHeader::PageData {
+            gpa: page_number * PAGE_SIZE_4K,
+            compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+            flags,
+            data_type: IgvmPageDataType::NORMAL,
+            data,
+        }
+    }
+
+    fn existing_measurement_fixture() -> Vec<IgvmDirectiveHeader> {
+        let mut directives = Vec::new();
+
+        for page_number in 0..5 {
+            directives.push(page_data(
+                page_number,
+                IgvmPageDataFlags::new(),
+                if page_number == 0 {
+                    vec![0, 5]
+                } else {
+                    Vec::new()
+                },
+            ));
+        }
+
+        for page_number in 5..10 {
+            directives.push(page_data(
+                page_number,
+                IgvmPageDataFlags::new().with_unmeasured(true),
+                if page_number == 5 {
+                    vec![0, 5]
+                } else {
+                    Vec::new()
+                },
+            ));
+        }
+
+        directives.push(page_data(10, IgvmPageDataFlags::new(), vec![0, 5]));
+        directives.push(page_data(
+            20,
+            IgvmPageDataFlags::new().with_shared(true),
+            vec![0, 5],
+        ));
+        directives
+    }
+
+    #[test]
+    fn image_identity_constants_match_existing_values() {
+        assert_eq!(
+            SnpImageIdentity::UNDERHILL,
+            SnpImageIdentity::new(
+                [
+                    0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+                *b"underhill\0\0\0\0\0\0\0",
+            )
+        );
+        assert_eq!(
+            SnpImageIdentity::LINUX_DIRECT,
+            SnpImageIdentity::new(*b"OpenVMM SNP test", *b"linux-direct\0\0\0\0")
+        );
+    }
+
+    #[test]
+    fn selected_identity_is_emitted_in_id_block() {
+        let identity = SnpImageIdentity::LINUX_DIRECT;
+        let mut directives = Vec::new();
+
+        let digest =
+            generate_snp_measurement(&initialization_headers(), &mut directives, 7, identity)
+                .expect("measurement generation should succeed");
+
+        assert_eq!(digest, [0; SHA_384_OUTPUT_SIZE_BYTES]);
+        let Some(IgvmDirectiveHeader::SnpIdBlock {
+            family_id,
+            image_id,
+            guest_svn,
+            ..
+        }) = directives.last()
+        else {
+            panic!("measurement should append an SNP ID block");
+        };
+        assert_eq!(*family_id, identity.family_id);
+        assert_eq!(*image_id, identity.image_id);
+        assert_eq!(*guest_svn, 7);
+    }
+
+    #[test]
+    fn existing_measurement_fixture_digest_is_unchanged() {
+        let expected_digest = [
+            136, 154, 25, 56, 108, 130, 226, 33, 155, 222, 211, 233, 42, 118, 78, 140, 0, 194, 155,
+            150, 109, 4, 166, 98, 188, 166, 207, 223, 236, 100, 123, 144, 81, 153, 86, 83, 57, 7,
+            131, 132, 101, 87, 145, 50, 99, 215, 28, 79,
+        ];
+        let mut directives = existing_measurement_fixture();
+
+        let digest = generate_snp_measurement(
+            &initialization_headers(),
+            &mut directives,
+            1,
+            SnpImageIdentity::UNDERHILL,
+        )
+        .expect("measurement generation should succeed");
+
+        assert_eq!(digest, expected_digest);
+    }
 }

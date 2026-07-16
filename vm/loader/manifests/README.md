@@ -1,9 +1,44 @@
-This folder contains different manifest recipes to build various IGVM files.
-These contain the functional configuration for a given igvm recipe.
+This folder contains manifest recipes for building IGVM files. The build system
+normally creates the resource file that supplies each recipe's binary inputs.
 
-The build system will automatically create the required resource file used by
-this tool.
+## SNP Linux-direct profile
 
-If you want to run this tool manually and specify a custom resource file, see
-igvmfilegen_config's `Resources` type and usage on how to manually create a
-resource file for a given recipe.
+`snp-linux-direct.json` is a bring-up profile with these assumptions:
+
+- x64, one virtual processor, and one VTL0 SEV-SNP guest that boots Linux
+  directly
+- 160 MiB of contiguous RAM (40,960 4-KiB pages)
+- COM1-only serial ACPI, with no VMBus, PCIe, disks, IOMMU, or PSP
+- no shared GPA boundary, normal interrupt injection, and secure AVIC disabled
+- base SNP policy `0x30000`; `enable_debug` adds the debug bit to produce the
+  current debug-capable policy `0xb0000`
+- an initrd and the kernel command line
+  `console=ttyS0 earlyprintk=serial earlycon panic=-1`
+- SNP C-bit position 51, which is a test-host assumption rather than a portable
+  SNP property
+
+To build it manually, create a resources file containing absolute paths:
+
+```json
+{
+    "resources": {
+        "linux_kernel": "/absolute/path/to/vmlinux-or-bzImage",
+        "linux_initrd": "/absolute/path/to/initrd"
+    }
+}
+```
+
+Then run:
+
+```bash
+cargo run -p igvmfilegen -- manifest \
+  --manifest /absolute/path/to/openvmm/vm/loader/manifests/snp-linux-direct.json \
+  --resources /absolute/path/to/snp-linux-direct-resources.json \
+  --output /absolute/path/to/snp-linux-direct.bin
+```
+
+The standard outputs are:
+
+- `snp-linux-direct.bin`
+- `snp-linux-direct.bin.map`
+- `snp-linux-direct-snp.json`

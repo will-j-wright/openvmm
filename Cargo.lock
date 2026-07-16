@@ -3751,11 +3751,14 @@ dependencies = [
  "range_map_vec",
  "serde",
  "serde_json",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
  "underhill_confidentiality",
  "vbs_defs",
+ "vm_topology",
+ "vmm_core",
  "x86defs",
  "zerocopy",
 ]
@@ -7662,27 +7665,6 @@ dependencies = [
  "defmt 0.3.100",
  "heapless",
  "managed",
-]
-
-[[package]]
-name = "snp_test_igvmfilegen"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "crypto",
- "fs-err",
- "hex",
- "igvm",
- "igvm_defs",
- "loader",
- "serde",
- "serde_json",
- "test_with_tracing",
- "vm_topology",
- "vmm_core",
- "x86defs",
- "zerocopy",
 ]
 
 [[package]]
