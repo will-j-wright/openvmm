@@ -15,6 +15,7 @@ mod identity_mapping;
 mod measurement_diag;
 mod platform_mask;
 mod snp_id_block;
+mod snp_linux_direct;
 mod vp_context_builder;
 
 use crate::corim_signature::detach_payload;
@@ -432,6 +433,21 @@ struct PlatformMeta {
     platform: IgvmPlatformType,
     svn: u32,
     debug_enabled: bool,
+    snp_identity: Option<snp_id_block::SnpImageIdentity>,
+}
+
+struct BuiltGuest {
+    guest: IgvmFile,
+    map: String,
+}
+
+impl From<file_loader::IgvmOutput> for BuiltGuest {
+    fn from(output: file_loader::IgvmOutput) -> Self {
+        Self {
+            guest: output.guest,
+            map: output.map.to_string(),
+        }
+    }
 }
 
 /// Build a sibling path of `output` named `<base>-<isolation><ext>`,
@@ -533,15 +549,27 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
     let mut map_files = Vec::new();
     let mut platform_metas: Vec<PlatformMeta> = Vec::new();
     let base_path = output.file_stem().unwrap();
+    let has_snp_linux_direct = igvm_config
+        .guest_configs
+        .iter()
+        .any(|config| matches!(config.image, Image::SnpLinuxDirect { .. }));
+    if has_snp_linux_direct && igvm_config.guest_configs.len() != 1 {
+        bail!("snp_linux_direct must be the only guest config in an IGVM file");
+    }
+
     for config in igvm_config.guest_configs {
         // Max VTL must be 2 or 0.
         if config.max_vtl != 2 && config.max_vtl != 0 {
             bail!("max_vtl must be 2 or 0");
         }
 
-        let loader_isolation_type = match config.isolation_type {
+        config.image.validate().context("invalid image config")?;
+
+        let loader_isolation_type = match &config.isolation_type {
             ConfigIsolationType::None => LoaderIsolationType::None,
-            ConfigIsolationType::Vbs { enable_debug } => LoaderIsolationType::Vbs { enable_debug },
+            ConfigIsolationType::Vbs { enable_debug } => LoaderIsolationType::Vbs {
+                enable_debug: *enable_debug,
+            },
             ConfigIsolationType::Snp {
                 shared_gpa_boundary_bits,
                 policy,
@@ -549,8 +577,8 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 injection_type,
                 secure_avic,
             } => LoaderIsolationType::Snp {
-                shared_gpa_boundary_bits,
-                policy: SnpPolicy::from(policy).with_debug(enable_debug as u8),
+                shared_gpa_boundary_bits: *shared_gpa_boundary_bits,
+                policy: SnpPolicy::from(*policy).with_debug(*enable_debug as u8),
                 injection_type: match injection_type {
                     SnpInjectionType::Normal => vp_context_builder::snp::InjectionType::Normal,
                     SnpInjectionType::Restricted => {
@@ -567,8 +595,8 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 sept_ve_disable,
             } => LoaderIsolationType::Tdx {
                 policy: TdxPolicy::new()
-                    .with_debug_allowed(enable_debug as u8)
-                    .with_sept_ve_disable(sept_ve_disable as u8),
+                    .with_debug_allowed(*enable_debug as u8)
+                    .with_sept_ve_disable(*sept_ve_disable as u8),
             },
         };
 
@@ -604,6 +632,11 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                     platform: IgvmPlatformType::SEV_SNP,
                     svn: config.guest_svn,
                     debug_enabled: policy.debug() == 1,
+                    snp_identity: Some(if matches!(config.image, Image::SnpLinuxDirect { .. }) {
+                        snp_id_block::SnpImageIdentity::LINUX_DIRECT
+                    } else {
+                        snp_id_block::SnpImageIdentity::OPENHCL
+                    }),
                 });
             }
             LoaderIsolationType::Tdx { policy } => {
@@ -611,6 +644,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                     platform: IgvmPlatformType::TDX,
                     svn: config.guest_svn,
                     debug_enabled: policy.debug_allowed() == 1,
+                    snp_identity: None,
                 });
             }
             LoaderIsolationType::Vbs { enable_debug } => {
@@ -618,19 +652,59 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                     platform: IgvmPlatformType::VSM_ISOLATION,
                     svn: config.guest_svn,
                     debug_enabled: *enable_debug,
+                    snp_identity: None,
                 });
             }
             LoaderIsolationType::None => {}
         }
 
-        // Max VTL of 2 implies paravisor.
-        let with_paravisor = config.max_vtl == 2;
+        let igvm_output: BuiltGuest = match &config.image {
+            Image::SnpLinuxDirect {
+                linux,
+                processor_count,
+                memory_page_count,
+                c_bit_position,
+            } => {
+                if config.max_vtl != 0 {
+                    bail!("snp_linux_direct requires max_vtl 0");
+                }
+                let ConfigIsolationType::Snp {
+                    shared_gpa_boundary_bits,
+                    policy,
+                    enable_debug,
+                    injection_type,
+                    secure_avic,
+                } = &config.isolation_type
+                else {
+                    bail!("snp_linux_direct requires SNP isolation");
+                };
+                if shared_gpa_boundary_bits.is_some() {
+                    bail!("snp_linux_direct does not support a shared GPA boundary");
+                }
+                if !matches!(injection_type, SnpInjectionType::Normal) {
+                    bail!("snp_linux_direct requires normal interrupt injection");
+                }
+                if !matches!(secure_avic, SecureAvicType::Disabled) {
+                    bail!("snp_linux_direct requires secure AVIC to be disabled");
+                }
 
-        let mut loader = IgvmLoader::<R>::new(with_paravisor, loader_isolation_type);
-
-        load_image(&mut loader.loader(), &config.image, &resources)?;
-
-        let igvm_output = loader.finalize().context("finalizing loader")?;
+                R::build_snp_linux_direct(snp_linux_direct::BuildParams {
+                    linux,
+                    processor_count: *processor_count,
+                    memory_page_count: *memory_page_count,
+                    c_bit_position: *c_bit_position,
+                    policy: SnpPolicy::from(*policy).with_debug(*enable_debug as u8),
+                    resources: &resources,
+                })?
+            }
+            _ => {
+                // Max VTL of 2 implies paravisor.
+                let with_paravisor = config.max_vtl == 2;
+                let mut loader = IgvmLoader::<R>::new(with_paravisor, loader_isolation_type);
+                load_image(&mut loader.loader(), &config.image, &resources)?;
+                loader.finalize().context("finalizing loader")?.into()
+            }
+        };
 
         // Merge the loaded guest into the overall IGVM file.
         match &mut igvm_file {
@@ -704,8 +778,16 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
         if meta.platform == IgvmPlatformType::SEV_SNP {
             let policy = snp_id_block::guest_policy(serializer.file(), compatibility_mask)
                 .context("SNP GuestPolicy missing; cannot emit SNP ID block signing payload")?;
-            let signing_payload =
-                snp_id_block::id_block_signing_payload(&digest, meta.svn, policy)?;
+            let identity = meta
+                .snp_identity
+                .expect("SNP platform metadata includes an image identity");
+            let signing_payload = if identity == snp_id_block::SnpImageIdentity::OPENHCL {
+                snp_id_block::id_block_signing_payload(&digest, meta.svn, policy)?
+            } else {
+                snp_id_block::id_block_signing_payload_with_identity(
+                    &digest, meta.svn, policy, identity,
+                )?
+            };
             write_platform_sibling(base_path, &output, meta, ".idblock", &signing_payload)?;
         }
     }
@@ -1181,6 +1263,10 @@ fn debug_validate_igvm_file(binary_file: &[u8]) {
 /// register types for different architectures. Different methods may need to be
 /// called depending on the register type that represents the given architecture.
 trait IgvmfilegenRegister: IgvmLoaderRegister + 'static {
+    fn build_snp_linux_direct(
+        params: snp_linux_direct::BuildParams<'_>,
+    ) -> anyhow::Result<BuiltGuest>;
+
     fn load_uefi(
         importer: &mut dyn ImageLoad<Self>,
         image: &[u8],
@@ -1215,6 +1301,16 @@ trait IgvmfilegenRegister: IgvmLoaderRegister + 'static {
 }
 
 impl IgvmfilegenRegister for X86Register {
+    fn build_snp_linux_direct(
+        params: snp_linux_direct::BuildParams<'_>,
+    ) -> anyhow::Result<BuiltGuest> {
+        let output = snp_linux_direct::build(params)?;
+        Ok(BuiltGuest {
+            guest: output.guest,
+            map: output.map,
+        })
+    }
+
     fn load_uefi(
         importer: &mut dyn ImageLoad<Self>,
         image: &[u8],
@@ -1272,6 +1368,12 @@ impl IgvmfilegenRegister for X86Register {
 }
 
 impl IgvmfilegenRegister for Aarch64Register {
+    fn build_snp_linux_direct(
+        _params: snp_linux_direct::BuildParams<'_>,
+    ) -> anyhow::Result<BuiltGuest> {
+        bail!("snp_linux_direct is only supported for x64")
+    }
+
     fn load_uefi(
         importer: &mut dyn ImageLoad<Self>,
         image: &[u8],
@@ -1345,6 +1447,9 @@ fn load_image<'a, R: IgvmfilegenRegister + GuestArch + 'static>(
         }
         Image::Linux(ref linux) => {
             load_linux(loader, linux, resources)?;
+        }
+        Image::SnpLinuxDirect { .. } => {
+            unreachable!("snp_linux_direct is built by its dedicated strategy")
         }
         Image::Openhcl {
             ref command_line,
