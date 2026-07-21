@@ -5,8 +5,8 @@ normally creates the resource file that supplies each recipe's binary inputs.
 
 `snp-linux-direct.json` is a bring-up profile with these assumptions:
 
-- x64, one virtual processor, and one VTL0 SEV-SNP guest that boots Linux
-  directly
+- x64 and one VTL0 SEV-SNP guest that boots Linux directly
+- one virtual processor; `snp-linux-direct-multi-vp.json` uses two
 - 160 MiB of contiguous RAM (40,960 4-KiB pages)
 - COM1-only serial ACPI, with no VMBus, PCIe, disks, IOMMU, or PSP
 - no shared GPA boundary, normal interrupt injection, and secure AVIC disabled

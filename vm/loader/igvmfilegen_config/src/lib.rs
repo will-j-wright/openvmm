@@ -128,6 +128,9 @@ pub enum Image {
     SnpLinuxDirect {
         /// The Linux image to load.
         linux: LinuxImage,
+        /// The number of virtual processors in the guest.
+        #[serde(default = "default_processor_count")]
+        processor_count: u32,
         /// The number of pages in the guest.
         memory_page_count: u64,
         /// The page-table address bit used as the SNP encryption bit.
@@ -170,11 +173,15 @@ impl Image {
     /// Validate constraints intrinsic to this image configuration.
     pub fn validate(&self) -> Result<(), ImageValidationError> {
         if let Image::SnpLinuxDirect {
+            processor_count,
             memory_page_count,
             c_bit_position,
             ..
         } = *self
         {
+            if processor_count == 0 {
+                return Err(ImageValidationError::ZeroProcessorCount);
+            }
             if memory_page_count == 0 {
                 return Err(ImageValidationError::ZeroMemoryPageCount);
             }
@@ -198,6 +205,8 @@ impl Image {
 /// Error returned when an image configuration contains invalid intrinsic fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageValidationError {
+    /// The image requests no virtual processors.
+    ZeroProcessorCount,
     /// The image requests no guest memory.
     ZeroMemoryPageCount,
     /// The requested memory byte count cannot be represented by an IGVM
@@ -216,6 +225,7 @@ pub enum ImageValidationError {
 impl std::fmt::Display for ImageValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
+            Self::ZeroProcessorCount => write!(f, "processor_count must be nonzero"),
             Self::ZeroMemoryPageCount => write!(f, "memory_page_count must be nonzero"),
             Self::MemoryByteCountTooLarge { memory_page_count } => write!(
                 f,
@@ -230,6 +240,10 @@ impl std::fmt::Display for ImageValidationError {
 }
 
 impl std::error::Error for ImageValidationError {}
+
+const fn default_processor_count() -> u32 {
+    1
+}
 
 impl LinuxImage {
     fn required_resources(&self) -> Vec<ResourceType> {
@@ -412,6 +426,7 @@ mod test {
 
     fn snp_linux_direct_image(
         use_initrd: bool,
+        processor_count: u32,
         memory_page_count: u64,
         c_bit_position: u8,
     ) -> Image {
@@ -420,6 +435,7 @@ mod test {
                 use_initrd,
                 command_line: CString::new("console=ttyS0").unwrap(),
             },
+            processor_count,
             memory_page_count,
             c_bit_position,
         }
@@ -450,11 +466,13 @@ mod test {
                 assert!(matches!(injection_type, SnpInjectionType::Normal));
                 assert!(matches!(secure_avic, SecureAvicType::Disabled));
             }
+
             isolation_type => panic!("unexpected isolation type: {isolation_type:?}"),
         }
         match &guest.image {
             Image::SnpLinuxDirect {
                 linux,
+                processor_count,
                 memory_page_count,
                 c_bit_position,
             } => {
@@ -463,6 +481,7 @@ mod test {
                     linux.command_line.as_bytes(),
                     b"console=ttyS0 earlyprintk=serial earlycon panic=-1"
                 );
+                assert_eq!(*processor_count, 1);
                 assert_eq!(*memory_page_count, 40960);
                 assert_eq!(*c_bit_position, 51);
                 guest.image.validate().unwrap();
@@ -472,8 +491,27 @@ mod test {
     }
 
     #[test]
+    fn parse_multi_vp_snp_linux_direct_manifest() {
+        let config: Config = serde_json::from_str(include_str!(
+            "../../manifests/snp-linux-direct-multi-vp.json"
+        ))
+        .unwrap();
+        let [guest] = config.guest_configs.as_slice() else {
+            panic!("expected one guest config");
+        };
+        let Image::SnpLinuxDirect {
+            processor_count, ..
+        } = &guest.image
+        else {
+            panic!("expected SNP Linux-direct image");
+        };
+        assert_eq!(*processor_count, 2);
+        guest.image.validate().unwrap();
+    }
+
+    #[test]
     fn snp_linux_direct_required_resources_with_initrd() {
-        let image = snp_linux_direct_image(true, 40960, 51);
+        let image = snp_linux_direct_image(true, 1, 40960, 51);
 
         assert_eq!(
             image.required_resources(),
@@ -483,14 +521,14 @@ mod test {
 
     #[test]
     fn snp_linux_direct_required_resources_without_initrd() {
-        let image = snp_linux_direct_image(false, 40960, 51);
+        let image = snp_linux_direct_image(false, 1, 40960, 51);
 
         assert_eq!(image.required_resources(), vec![ResourceType::LinuxKernel]);
     }
 
     #[test]
     fn snp_linux_direct_rejects_zero_memory() {
-        let image = snp_linux_direct_image(false, 0, 51);
+        let image = snp_linux_direct_image(false, 1, 0, 51);
 
         assert_eq!(
             image.validate(),
@@ -501,7 +539,7 @@ mod test {
     #[test]
     fn snp_linux_direct_rejects_oversized_memory() {
         let memory_page_count = u64::from(u32::MAX) / IGVM_PAGE_SIZE_BYTES + 1;
-        let image = snp_linux_direct_image(false, memory_page_count, 51);
+        let image = snp_linux_direct_image(false, 1, memory_page_count, 51);
 
         assert_eq!(
             image.validate(),
@@ -512,13 +550,23 @@ mod test {
     #[test]
     fn snp_linux_direct_rejects_invalid_c_bit_positions() {
         for c_bit_position in [31, 52] {
-            let image = snp_linux_direct_image(false, 40960, c_bit_position);
+            let image = snp_linux_direct_image(false, 1, 40960, c_bit_position);
 
             assert_eq!(
                 image.validate(),
                 Err(ImageValidationError::InvalidCBitPosition { c_bit_position })
             );
         }
+    }
+
+    #[test]
+    fn snp_linux_direct_rejects_zero_processors() {
+        let image = snp_linux_direct_image(false, 0, 40960, 51);
+
+        assert_eq!(
+            image.validate(),
+            Err(ImageValidationError::ZeroProcessorCount)
+        );
     }
 
     #[test]

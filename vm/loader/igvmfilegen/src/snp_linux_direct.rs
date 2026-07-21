@@ -49,7 +49,6 @@ use zerocopy::FromZeros;
 
 const COMPATIBILITY_MASK: u32 = 1;
 const PAGE_SIZE: u64 = igvm_defs::PAGE_SIZE_4K;
-const PROCESSOR_COUNT: u32 = 1;
 /// KVM hardcodes the initial VMSA at this GPA and measures it during launch
 /// finish, after all userspace-provided launch-update pages.
 const KVM_VMSA_GPA: u64 = 0xffff_ffff_f000;
@@ -60,6 +59,7 @@ const COM1_IRQ: u32 = 4;
 
 pub struct BuildParams<'a> {
     pub linux: &'a LinuxImage,
+    pub processor_count: u32,
     pub memory_page_count: u64,
     pub c_bit_position: u8,
     pub guest_svn: u32,
@@ -98,10 +98,17 @@ impl TestIgvmImporter {
         }
     }
 
-    fn finish(self) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, SevVmsa, String)> {
+    fn finish(
+        self,
+        processor_count: u32,
+    ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, SevVmsa, String)> {
         let vmsa = build_vmsa(&self.registers, self.c_bit_mask)?;
-        let (mut directives, map) =
-            build_complete_ram_directives(&self.pages, &vmsa, self.ram_page_count)?;
+        let (mut directives, map) = build_complete_ram_directives(
+            &self.pages,
+            &vmsa,
+            processor_count,
+            self.ram_page_count,
+        )?;
         let ram_size = self
             .ram_page_count
             .checked_mul(PAGE_SIZE)
@@ -181,11 +188,6 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
             page_end <= self.ram_page_count,
             "{debug_tag} lies outside the configured RAM layout"
         );
-
-        let mut data = data.to_vec();
-        if debug_tag == "linux-pagetables" {
-            patch_confidential_page_tables(&mut data, self.c_bit_mask)?;
-        }
 
         for page_offset in 0..page_count {
             let data_start = (page_offset * PAGE_SIZE) as usize;
@@ -277,6 +279,7 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
 pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
     let BuildParams {
         linux,
+        processor_count,
         memory_page_count,
         c_bit_position,
         guest_svn,
@@ -289,7 +292,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
     let memory_layout =
         MemoryLayout::new(memory_size, &[], &[], &[], None).context("building memory layout")?;
     let processor_topology = TopologyBuilder::new_x86()
-        .build(PROCESSOR_COUNT)
+        .build(processor_count)
         .context("building processor topology")?;
     let pcie_host_bridges = Vec::new();
     let acpi_builder = vmm_core::acpi_builder::AcpiTablesBuilder {
@@ -359,11 +362,14 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
             }
         },
         None,
-        Some(loader::linux::SnpBootConfig),
+        Some(loader::linux::SnpBootConfig {
+            c_bit: c_bit_position,
+            aci_hyperv: None,
+        }),
     )
     .context("loading direct-Linux image")?;
 
-    let (mut directives, _vmsa, map) = importer.finish()?;
+    let (mut directives, _vmsa, map) = importer.finish(processor_count)?;
     let policy: u64 = policy.into();
     let platform_headers = vec![IgvmPlatformHeader::SupportedPlatform(
         IGVM_VHS_SUPPORTED_PLATFORM {
@@ -403,6 +409,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         launch_digest,
         policy,
         guest_svn,
+        processor_count,
         memory_page_count,
         1u64 << c_bit_position,
     )?;
@@ -423,6 +430,7 @@ fn validate_generated_igvm(
     expected_launch_digest: [u8; 48],
     expected_policy: u64,
     expected_guest_svn: u32,
+    processor_count: u32,
     ram_page_count: u64,
     c_bit_mask: u64,
 ) -> anyhow::Result<()> {
@@ -447,7 +455,7 @@ fn validate_generated_igvm(
 
     let mut covered_pages = BTreeSet::new();
     let mut required_memory_count = 0;
-    let mut vmsa_count = 0;
+    let mut next_vmsa_index = 0;
     let mut id_block_count = 0;
     let mut secrets_count = 0;
     let mut cpuid_count = 0;
@@ -489,9 +497,17 @@ fn validate_generated_igvm(
                     );
                 }
             }
-            IgvmDirectiveHeader::SnpVpContext { gpa, vmsa, .. } => {
-                ensure!(!saw_vmsa, "multiple or reordered VMSA directives");
+            IgvmDirectiveHeader::SnpVpContext {
+                gpa,
+                vp_index,
+                vmsa,
+                ..
+            } => {
                 ensure!(*gpa == KVM_VMSA_GPA, "VMSA is not at KVM's fixed GPA");
+                ensure!(
+                    u32::from(*vp_index) == next_vmsa_index,
+                    "VMSA VP contexts are not ordered by VP index"
+                );
                 ensure!(vmsa.sev_features.snp(), "VMSA does not enable SNP");
                 ensure!(!vmsa.sev_features.vtom(), "VMSA unexpectedly enables vTOM");
                 ensure!(vmsa.virtual_tom == 0, "VMSA virtual TOM is not zero");
@@ -520,7 +536,7 @@ fn validate_generated_igvm(
                         && vmsa.mxcsr == x86defs::xsave::DEFAULT_MXCSR,
                     "VMSA FPU control state does not match KVM reset state"
                 );
-                vmsa_count += 1;
+                next_vmsa_index += 1;
                 saw_vmsa = true;
             }
             IgvmDirectiveHeader::RequiredMemory {
@@ -555,7 +571,10 @@ fn validate_generated_igvm(
         "IGVM does not cover every page of the fixed RAM layout"
     );
     ensure!(required_memory_count == 1, "expected one RequiredMemory");
-    ensure!(vmsa_count == 1, "expected one SNP VMSA");
+    ensure!(
+        next_vmsa_index == processor_count,
+        "expected one SNP VMSA per processor"
+    );
     ensure!(id_block_count == 1, "expected one SNP ID block");
     ensure!(secrets_count == 1, "expected one SNP secrets page");
     ensure!(cpuid_count == 1, "expected one SNP CPUID page");
@@ -577,29 +596,6 @@ fn validate_generated_igvm(
         measured_digest == expected_launch_digest,
         "serialized IGVM launch digest changed"
     );
-    Ok(())
-}
-
-fn patch_confidential_page_tables(data: &mut [u8], c_bit_mask: u64) -> anyhow::Result<()> {
-    ensure!(
-        data.len().is_multiple_of(size_of::<u64>()),
-        "Linux page-table data is not a whole number of entries"
-    );
-    for entry in data.chunks_exact_mut(size_of::<u64>()) {
-        let mut value = u64::from_le_bytes(
-            entry
-                .try_into()
-                .expect("an exact eight-byte chunk converts to an array"),
-        );
-        if value & 1 != 0 {
-            ensure!(
-                value & c_bit_mask == 0,
-                "Linux page-table entry already uses the configured C-bit"
-            );
-            value |= c_bit_mask;
-            entry.copy_from_slice(&value.to_le_bytes());
-        }
-    }
     Ok(())
 }
 
@@ -710,9 +706,10 @@ fn segment_selector(value: SegmentRegister) -> SevSelector {
 fn build_complete_ram_directives(
     imported: &BTreeMap<u64, ImportedPage>,
     vmsa: &SevVmsa,
+    processor_count: u32,
     ram_page_count: u64,
 ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, String)> {
-    let mut directives = Vec::with_capacity(ram_page_count as usize + 1);
+    let mut directives = Vec::with_capacity(ram_page_count as usize + processor_count as usize);
     let mut map_entries = Vec::new();
 
     for page in 0..ram_page_count {
@@ -746,13 +743,21 @@ fn build_complete_ram_directives(
         directives.push(directive);
         map_entries.push((page, tag, kind));
     }
-    directives.push(IgvmDirectiveHeader::SnpVpContext {
-        gpa: KVM_VMSA_GPA,
-        compatibility_mask: COMPATIBILITY_MASK,
-        vp_index: 0,
-        vmsa: Box::new(*vmsa),
-    });
-    map_entries.push((KVM_VMSA_GPA / PAGE_SIZE, "snp-vmsa".to_owned(), "VMSA"));
+    for vp_index in 0..processor_count {
+        directives.push(IgvmDirectiveHeader::SnpVpContext {
+            gpa: KVM_VMSA_GPA,
+            compatibility_mask: COMPATIBILITY_MASK,
+            vp_index: vp_index
+                .try_into()
+                .context("VP index does not fit in IGVM")?,
+            vmsa: Box::new(*vmsa),
+        });
+        map_entries.push((
+            KVM_VMSA_GPA / PAGE_SIZE,
+            format!("snp-vmsa-vp{vp_index}"),
+            "VMSA",
+        ));
+    }
 
     ensure!(
         imported.keys().all(|page| *page < ram_page_count),
@@ -832,23 +837,8 @@ fn format_map(entries: &[(u64, String, &'static str)], ram_page_count: u64) -> S
 mod tests {
     use super::*;
     use test_with_tracing::test;
-    use zerocopy::IntoBytes;
 
     const TEST_C_BIT_MASK: u64 = 1 << 51;
-
-    #[test]
-    fn page_table_patch_sets_only_present_entries() {
-        let entries = [0u64, 0x2003, 0x4002];
-        let mut data = entries.as_bytes().to_vec();
-        patch_confidential_page_tables(&mut data, TEST_C_BIT_MASK).unwrap();
-        let patched: Vec<_> = data
-            .chunks_exact(8)
-            .map(|entry| u64::from_le_bytes(entry.try_into().unwrap()))
-            .collect();
-        assert_eq!(patched[0], 0);
-        assert_eq!(patched[1], 0x2003 | TEST_C_BIT_MASK);
-        assert_eq!(patched[2], 0x4002);
-    }
 
     #[test]
     fn vmsa_uses_c_bit_model() {
@@ -899,7 +889,7 @@ mod tests {
             TEST_C_BIT_MASK,
         )
         .unwrap();
-        let (directives, _) = build_complete_ram_directives(&imported, &vmsa, 4).unwrap();
+        let (directives, _) = build_complete_ram_directives(&imported, &vmsa, 1, 4).unwrap();
         assert_eq!(directives.len(), 5);
         assert!(matches!(
             directives[0],
@@ -930,5 +920,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn complete_ram_emits_one_vmsa_per_processor() {
+        let vmsa = build_vmsa(
+            &[
+                X86Register::Rip(0x100000),
+                X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
+            ],
+            TEST_C_BIT_MASK,
+        )
+        .unwrap();
+        let (directives, _) = build_complete_ram_directives(&BTreeMap::new(), &vmsa, 4, 1).unwrap();
+        let vp_indexes = directives
+            .iter()
+            .filter_map(|directive| match directive {
+                IgvmDirectiveHeader::SnpVpContext { vp_index, .. } => Some(*vp_index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vp_indexes, [0, 1, 2, 3]);
     }
 }

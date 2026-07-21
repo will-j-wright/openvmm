@@ -248,6 +248,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
         let igvm_output = match &config.image {
             Image::SnpLinuxDirect {
                 linux,
+                processor_count,
                 memory_page_count,
                 c_bit_position,
             } => {
@@ -276,6 +277,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
 
                 R::build_snp_linux_direct(snp_linux_direct::BuildParams {
                     linux,
+                    processor_count: *processor_count,
                     memory_page_count: *memory_page_count,
                     c_bit_position: *c_bit_position,
                     guest_svn: config.guest_svn,

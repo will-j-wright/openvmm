@@ -15,7 +15,7 @@
             },
             "image": {
                 "snp_linux_direct": {
-                    "processor_count": 1,
+                    "processor_count": 2,
                     "linux": {
                         "use_initrd": true,
                         "command_line": "console=ttyS0 earlyprintk=serial earlycon panic=-1"
