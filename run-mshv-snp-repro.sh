@@ -6,10 +6,12 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 HOST="${MSHV_SNP_HOST:-wedson-mshv}"
+MODE="${MSHV_SNP_MODE:-direct}"
 ACI_ROOT="${MSHV_SNP_ACI_ROOT:-$HOME/ai/leafeon/aci-6.6}"
 OPENVMM_BIN="${MSHV_SNP_OPENVMM:-$REPO_ROOT/target/x86_64-unknown-linux-musl/debug/openvmm}"
 KERNEL="${MSHV_SNP_KERNEL:-$ACI_ROOT/out/snp-nord/arch/x86/boot/bzImage}"
 INITRD="${MSHV_SNP_INITRD:-$REPO_ROOT/.packages/underhill-deps-private/x64/initrd}"
+IGVM="${MSHV_SNP_IGVM:-}"
 MEMORY="${MSHV_SNP_MEMORY:-160MB}"
 PROCESSORS="${MSHV_SNP_PROCESSORS:-1}"
 TIMEOUT_SECONDS="${MSHV_SNP_TIMEOUT_SECONDS:-90}"
@@ -52,10 +54,12 @@ Build, deploy, and run the MSHV SNP direct-boot repro on
 wedson-mshv. Configuration is provided through environment variables:
 
   MSHV_SNP_HOST              SSH host (default: wedson-mshv)
+  MSHV_SNP_MODE              boot mode: direct | igvm (default: direct)
   MSHV_SNP_ACI_ROOT          ACI Linux checkout
   MSHV_SNP_OPENVMM           static-musl OpenVMM binary
   MSHV_SNP_KERNEL            ACI bzImage
   MSHV_SNP_INITRD            direct-boot initrd
+  MSHV_SNP_IGVM              ACI SNP IGVM file (required in igvm mode)
   MSHV_SNP_BUILD_OPENVMM     build OpenVMM first (default: 1)
   MSHV_SNP_BUILD_KERNEL      incrementally build the ACI kernel (default: 0)
   MSHV_SNP_MEMORY            guest memory (default: 160MB)
@@ -88,6 +92,10 @@ if [[ ! "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]]; then
     echo "ERROR: MSHV_SNP_TIMEOUT_SECONDS must be an integer from 1 through 99999" >&2
     exit 2
 fi
+if [[ ! "$MODE" =~ ^(direct|igvm)$ ]]; then
+    echo "ERROR: MSHV_SNP_MODE must be direct or igvm" >&2
+    exit 2
+fi
 if [[ ! "$DEVICE_TEST" =~ ^(none|blk|net|both)$ ]]; then
     echo "ERROR: MSHV_SNP_DEVICE_TEST must be none, blk, net, or both" >&2
     exit 2
@@ -99,6 +107,24 @@ for value in "$BUILD_OPENVMM" "$BUILD_KERNEL" "$KEEP_REMOTE" "$RESTRICTED_INJECT
         exit 2
     fi
 done
+if [[ "$MODE" == igvm ]]; then
+    if [[ -z "$IGVM" ]]; then
+        echo "ERROR: MSHV_SNP_IGVM is required in igvm mode" >&2
+        exit 2
+    fi
+    if [[ "$RESTRICTED_INJECTION" == 1 ]]; then
+        echo "ERROR: restricted injection must be encoded in the IGVM VMSA" >&2
+        exit 2
+    fi
+    if [[ "$BUILD_KERNEL" == 1 ]]; then
+        echo "ERROR: MSHV_SNP_BUILD_KERNEL is not used in igvm mode" >&2
+        exit 2
+    fi
+    if [[ "$CONSOLE" != serial || "$DEVICE_TEST" != none ]]; then
+        echo "ERROR: igvm mode currently validates the serial shell without device tests" >&2
+        exit 2
+    fi
+fi
 
 for command in cargo python3 scp sha256sum ssh; do
     if ! command -v "$command" >/dev/null; then
@@ -254,10 +280,14 @@ check_artifact() {
 }
 
 check_artifact "OpenVMM binary" "$OPENVMM_BIN" 1
-check_artifact "ACI kernel" "$KERNEL"
-check_artifact "initrd" "$INITRD"
+if [[ "$MODE" == direct ]]; then
+    check_artifact "ACI kernel" "$KERNEL"
+    check_artifact "initrd" "$INITRD"
+else
+    check_artifact "ACI IGVM" "$IGVM"
+fi
 
-if [[ "$CONSOLE" == virtio ]]; then
+if [[ "$MODE" == direct && "$CONSOLE" == virtio ]]; then
     generated_initrd_dir="$(mktemp -d)"
     mkdir "$generated_initrd_dir/root"
     (
@@ -276,13 +306,21 @@ if [[ "$CONSOLE" == virtio ]]; then
 fi
 
 openvmm_hash="$(sha256sum "$OPENVMM_BIN" | awk '{print $1}')"
-kernel_hash="$(sha256sum "$KERNEL" | awk '{print $1}')"
-initrd_hash="$(sha256sum "$INITRD" | awk '{print $1}')"
-artifact_bytes="$(
-    stat -c %s "$OPENVMM_BIN"
-    stat -c %s "$KERNEL"
-    stat -c %s "$INITRD"
-)"
+if [[ "$MODE" == direct ]]; then
+    kernel_hash="$(sha256sum "$KERNEL" | awk '{print $1}')"
+    initrd_hash="$(sha256sum "$INITRD" | awk '{print $1}')"
+    artifact_bytes="$(
+        stat -c %s "$OPENVMM_BIN"
+        stat -c %s "$KERNEL"
+        stat -c %s "$INITRD"
+    )"
+else
+    igvm_hash="$(sha256sum "$IGVM" | awk '{print $1}')"
+    artifact_bytes="$(
+        stat -c %s "$OPENVMM_BIN"
+        stat -c %s "$IGVM"
+    )"
+fi
 required_kib=0
 while IFS= read -r bytes; do
     required_kib=$((required_kib + (bytes + 1023) / 1024))
@@ -308,10 +346,15 @@ remote_kernel="$(
     printf 'run_id=%s\n' "$run_id"
     printf 'change_id=%s\n' "$change_id"
     printf 'host=%s\n' "$HOST"
+    printf 'mode=%s\n' "$MODE"
     printf 'remote_dir=%s\n' "$remote_dir"
     printf 'openvmm=%s\nopenvmm_sha256=%s\n' "$OPENVMM_BIN" "$openvmm_hash"
-    printf 'kernel=%s\nkernel_sha256=%s\n' "$KERNEL" "$kernel_hash"
-    printf 'initrd=%s\ninitrd_sha256=%s\n' "$INITRD" "$initrd_hash"
+    if [[ "$MODE" == direct ]]; then
+        printf 'kernel=%s\nkernel_sha256=%s\n' "$KERNEL" "$kernel_hash"
+        printf 'initrd=%s\ninitrd_sha256=%s\n' "$INITRD" "$initrd_hash"
+    else
+        printf 'igvm=%s\nigvm_sha256=%s\n' "$IGVM" "$igvm_hash"
+    fi
     printf 'memory=%s\nprocessors=%s\ntimeout_seconds=%s\n' "$MEMORY" "$PROCESSORS" "$TIMEOUT_SECONDS"
     printf 'restricted_injection=%s\n' "$RESTRICTED_INJECTION"
     printf 'disable_cpuid_offload=%s\n' "$DISABLE_CPUID_OFFLOAD"
@@ -328,33 +371,58 @@ ssh "${SSH_OPTS[@]}" "$HOST" \
 remote_staged=1
 
 scp -q "${SSH_OPTS[@]}" "$OPENVMM_BIN" "$HOST:$remote_dir/openvmm.new"
-scp -q "${SSH_OPTS[@]}" "$KERNEL" "$HOST:$remote_dir/bzImage.new"
-scp -q "${SSH_OPTS[@]}" "$INITRD" "$HOST:$remote_dir/initrd.new"
-
-verify_command="cd $quoted_remote_dir &&
-    test \"\$(sha256sum openvmm.new | awk '{print \$1}')\" = $(printf '%q' "$openvmm_hash") &&
-    test \"\$(sha256sum bzImage.new | awk '{print \$1}')\" = $(printf '%q' "$kernel_hash") &&
-    test \"\$(sha256sum initrd.new | awk '{print \$1}')\" = $(printf '%q' "$initrd_hash") &&
-    mv openvmm.new openvmm &&
-    mv bzImage.new bzImage &&
-    mv initrd.new initrd &&
-    chmod 755 openvmm"
+if [[ "$MODE" == direct ]]; then
+    scp -q "${SSH_OPTS[@]}" "$KERNEL" "$HOST:$remote_dir/bzImage.new"
+    scp -q "${SSH_OPTS[@]}" "$INITRD" "$HOST:$remote_dir/initrd.new"
+    verify_command="cd $quoted_remote_dir &&
+        test \"\$(sha256sum openvmm.new | awk '{print \$1}')\" = $(printf '%q' "$openvmm_hash") &&
+        test \"\$(sha256sum bzImage.new | awk '{print \$1}')\" = $(printf '%q' "$kernel_hash") &&
+        test \"\$(sha256sum initrd.new | awk '{print \$1}')\" = $(printf '%q' "$initrd_hash") &&
+        mv openvmm.new openvmm &&
+        mv bzImage.new bzImage &&
+        mv initrd.new initrd &&
+        chmod 755 openvmm"
+else
+    scp -q "${SSH_OPTS[@]}" "$IGVM" "$HOST:$remote_dir/guest.igvm.new"
+    verify_command="cd $quoted_remote_dir &&
+        test \"\$(sha256sum openvmm.new | awk '{print \$1}')\" = $(printf '%q' "$openvmm_hash") &&
+        test \"\$(sha256sum guest.igvm.new | awk '{print \$1}')\" = $(printf '%q' "$igvm_hash") &&
+        mv openvmm.new openvmm &&
+        mv guest.igvm.new guest.igvm &&
+        chmod 755 openvmm"
+fi
 ssh "${SSH_OPTS[@]}" "$HOST" "$verify_command" 2>&1 | tee -a "$deploy_log"
 
-openvmm_command=(
-    env "OPENVMM_LOG=$OPENVMM_LOG"
-    timeout --foreground "$TIMEOUT_SECONDS"
-    ./openvmm
-    --hypervisor mshv
-    --isolation snp
-    --hv
-    --no-vmbus
-    --kernel ./bzImage
-    --initrd ./initrd
-    -m "$MEMORY"
-    -p "$PROCESSORS"
-    -c "$KERNEL_CMDLINE"
-)
+if [[ "$MODE" == direct ]]; then
+    openvmm_command=(
+        env "OPENVMM_LOG=$OPENVMM_LOG"
+        timeout --foreground "$TIMEOUT_SECONDS"
+        ./openvmm
+        --hypervisor mshv
+        --isolation snp
+        --hv
+        --no-vmbus
+        --kernel ./bzImage
+        --initrd ./initrd
+        -m "$MEMORY"
+        -p "$PROCESSORS"
+        -c "$KERNEL_CMDLINE"
+    )
+else
+    openvmm_command=(
+        env "OPENVMM_LOG=$OPENVMM_LOG"
+        timeout --foreground "$TIMEOUT_SECONDS"
+        ./openvmm
+        --hypervisor mshv
+        --isolation snp
+        --hv
+        --no-vmbus
+        --igvm ./guest.igvm
+        --igvm-personality linux-direct
+        -m "$MEMORY"
+        -p "$PROCESSORS"
+    )
+fi
 case "$CONSOLE" in
     serial)
         openvmm_command+=(--com1 console)

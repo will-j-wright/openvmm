@@ -34,6 +34,8 @@
 # Ignore developer scripts in the root directory
 /*.sh
 !/copy-snp-artifacts.sh
+!/run-snp-igvm-openvmm.sh
+!/run-snp-igvm-openvmm-repro.sh
 !/run-snp-openvmm.sh
 !/run-snp-openvmm-repro.sh
 /*.cmd

@@ -40,3 +40,20 @@ MSHV_SNP_RESTRICTED_INJECTION=1 \
 ```
 
 Set `MSHV_SNP_BUILD_OPENVMM=0` to reuse an existing musl OpenVMM build.
+
+To run an ACI IGVM, generate it from
+`vm/loader/manifests/snp-linux-direct-aci.json`, then pass it to the same
+harness:
+
+```bash
+MSHV_SNP_MODE=igvm \
+MSHV_SNP_IGVM=path/to/snp-linux-direct-aci.bin \
+MSHV_SNP_PROCESSORS=1 \
+    ./run-mshv-snp-repro.sh
+```
+
+The ACI manifest measures restricted injection into the IGVM VMSA. Do not set
+`MSHV_SNP_RESTRICTED_INJECTION` in IGVM mode. The checked-in ACI profile uses
+one VP. Multi-VP files encode and enforce their measured APIC-ID mapping, but
+the current ACI kernel/host combination fails secondary-CPU startup identically
+in direct and IGVM modes.

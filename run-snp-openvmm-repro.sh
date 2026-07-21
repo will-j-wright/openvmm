@@ -1,16 +1,45 @@
 #!/bin/bash
-# Run the SNP OpenVMM repro over SSH and automatically quit OpenVMM when a
-# known failure pattern or timeout is observed.
+# Run the SNP OpenVMM e2e matrix over SSH and automatically quit OpenVMM when
+# each configuration passes, fails, or times out.
 
 set -euo pipefail
 
 HOST="${SNP_REPRO_HOST:-cho-snp-ubuntu}"
-REMOTE_SCRIPT="${SNP_REPRO_REMOTE_SCRIPT:-~/snp-openvmm/run-snp-openvmm.sh}"
 TIMEOUT_SECONDS="${SNP_REPRO_TIMEOUT_SECONDS:-180}"
 ERROR_PATTERN="${SNP_REPRO_ERROR_PATTERN:-fatal error|failed to run VP|Bad address|guest halted|triple fault|panicked at|assertion failed|abnormal exit|SIGABRT|core dumped|node failure|Connection reset by peer}"
 SHELL_PATTERN="${SNP_REPRO_SHELL_PATTERN:-~ #}"
 
-python3 - "$HOST" "$REMOTE_SCRIPT" "$TIMEOUT_SECONDS" "$ERROR_PATTERN" "$SHELL_PATTERN" <<'PY'
+if [[ -z "${SNP_REPRO_CONFIG:-}" && -z "${SNP_REPRO_REMOTE_SCRIPT:-}" ]]; then
+    for config in linux-direct igvm-multi-vp; do
+        echo "SNP e2e config: $config"
+        SNP_REPRO_CONFIG="$config" "$0"
+    done
+    exit 0
+fi
+
+case "${SNP_REPRO_CONFIG:-custom}" in
+    linux-direct)
+        REMOTE_SCRIPT="${SNP_REPRO_LINUX_DIRECT_REMOTE_SCRIPT:-~/snp-openvmm/run-snp-openvmm.sh}"
+        EXPECTED_PROCESSORS="${SNP_REPRO_LINUX_DIRECT_EXPECTED_PROCESSORS:-2}"
+        DEVICE_SMOKE=1
+        ;;
+    igvm-multi-vp)
+        REMOTE_SCRIPT="${SNP_REPRO_MULTI_VP_IGVM_REMOTE_SCRIPT:-cd ~/snp-openvmm && env SNP_USE_SUDO=0 SNP_IGVM=./snp-linux-direct-multi-vp.bin SNP_PROCESSORS=2 ./run-snp-igvm-openvmm.sh}"
+        EXPECTED_PROCESSORS=2
+        DEVICE_SMOKE=0
+        ;;
+    custom)
+        REMOTE_SCRIPT="${SNP_REPRO_REMOTE_SCRIPT:?SNP_REPRO_REMOTE_SCRIPT must be set for a custom config}"
+        EXPECTED_PROCESSORS="${SNP_REPRO_EXPECTED_PROCESSORS:-2}"
+        DEVICE_SMOKE="${SNP_REPRO_DEVICE_SMOKE:-1}"
+        ;;
+    *)
+        echo "ERROR: unknown SNP e2e config: $SNP_REPRO_CONFIG" >&2
+        exit 2
+        ;;
+esac
+
+python3 - "$HOST" "$REMOTE_SCRIPT" "$TIMEOUT_SECONDS" "$ERROR_PATTERN" "$SHELL_PATTERN" "$EXPECTED_PROCESSORS" "$DEVICE_SMOKE" <<'PY'
 import os
 import pty
 import re
@@ -20,15 +49,21 @@ import subprocess
 import sys
 import time
 
-host, remote_script, timeout_seconds, error_pattern, shell_pattern = sys.argv[1:]
+host, remote_script, timeout_seconds, error_pattern, shell_pattern, expected_processors, device_smoke = sys.argv[1:]
 timeout_seconds = int(timeout_seconds)
+device_smoke = bool(int(device_smoke))
 pattern = re.compile(error_pattern)
 shell_ready = re.compile(shell_pattern)
 smoke_success = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_ALL_PASS(?:[\r\n]|$)")
 smoke_failure = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_[A-Z_]+_FAIL(?:[\r\n]|$)")
-smoke_command = (
-    "ok=1; echo OVMM_SMOKE_BEGIN; "
-    "d=; for p in /sys/class/block/vd*; do [ -e \"$p\" ] || continue; "
+processor_smoke = (
+    "echo OVMM_SMOKE_BEGIN; "
+    "cpus=$(grep -c '^processor' /proc/cpuinfo); "
+    f"if [ \"$cpus\" = {expected_processors} ]; then echo OVMM_SMOKE_CPU_PASS; "
+    "else echo OVMM_SMOKE_CPU_FAIL; fi"
+)
+device_smoke_command = (
+    "ok=1; d=; for p in /sys/class/block/vd*; do [ -e \"$p\" ] || continue; "
     "[ \"$(cat \"$p/size\")\" = 131072 ] && d=${p##*/} && break; done; "
     "m=OPENVMM-VIRTIO-BLK-SMOKE; "
     "if [ -n \"$d\" ] && printf %s \"$m\" | dd of=/dev/$d bs=1 count=${#m} conv=fsync 2>/dev/null "
@@ -44,6 +79,11 @@ smoke_command = (
     "then echo OVMM_SMOKE_NET_PING_PASS; else echo OVMM_SMOKE_NET_PING_FAIL; ok=0; fi; "
     "if [ \"$ok\" = 1 ]; then echo OVMM_SMOKE_ALL_PASS; else echo OVMM_SMOKE_ALL_FAIL; fi"
 )
+smoke_commands = [processor_smoke]
+if device_smoke:
+    smoke_commands.append(device_smoke_command)
+else:
+    smoke_commands.append("echo OVMM_SMOKE_ALL_PASS")
 
 argv = ["ssh", "-t", host, remote_script]
 pid, fd = pty.fork()
@@ -64,11 +104,14 @@ def send_quit():
     os.write(fd, b"\x11q\r")
 
 def send_smoke_test():
-    print("\nSNP repro: running virtio block/network smoke tests", file=sys.stderr, flush=True)
-    payload = f"{smoke_command}\r".encode()
-    for offset in range(0, len(payload), 32):
-        os.write(fd, payload[offset : offset + 32])
-        time.sleep(0.01)
+    smoke_description = "processor and virtio block/network" if device_smoke else "processor"
+    print(f"\nSNP repro: running {smoke_description} smoke tests", file=sys.stderr, flush=True)
+    for command in smoke_commands:
+        payload = f"{command}\r".encode()
+        for offset in range(0, len(payload), 32):
+            os.write(fd, payload[offset : offset + 32])
+            time.sleep(0.01)
+        time.sleep(0.1)
 
 try:
     while True:
