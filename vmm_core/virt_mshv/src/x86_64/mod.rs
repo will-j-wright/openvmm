@@ -740,6 +740,16 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         self.max_physical_address_size()
     }
 
+    fn configure_isolation(
+        &mut self,
+        config: Option<&virt::IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error> {
+        if config.is_some() {
+            return Err(ErrorInner::IsolationNotSupported.into());
+        }
+        Ok(())
+    }
+
     fn build(
         self,
         config: PartitionConfig<'_>,

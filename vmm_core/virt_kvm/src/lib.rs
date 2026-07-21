@@ -100,6 +100,28 @@ pub enum KvmError {
     SnpLaunchInProgress,
     #[error("SNP launch previously failed")]
     SnpLaunchFailed,
+    #[error("partition isolation configuration was already supplied")]
+    IsolationConfigurationAlreadySet,
+    #[error("partition isolation configuration was not supplied before build")]
+    IsolationConfigurationMissing,
+    #[error("SNP IGVM VP contexts do not match the configured virtual processors")]
+    InvalidSnpIgvmTopology,
+    #[error("SNP IGVM VMSA import markers do not match the supplied VP contexts")]
+    InvalidSnpIgvmVmsaImports,
+    #[error("KVM requires SNP IGVM VMSA directives after all measured page directives")]
+    UnsupportedSnpIgvmVmsaOrder,
+    #[error("SNP IGVM VMSA GPA {0:#x} is not supported by KVM")]
+    InvalidSnpVmsaGpa(u64),
+    #[error("invalid SNP VMSA: {0}")]
+    InvalidSnpIgvmVmsa(&'static str),
+    #[error("KVM does not support SNP VMSA feature bits {0:#x}")]
+    UnsupportedSnpVmsaFeatures(u64),
+    #[error("SNP IGVM requests unsupported highest VTL {0}")]
+    UnsupportedSnpVtl(u8),
+    #[error("SNP IGVM requests unsupported shared GPA boundary {0:#x}")]
+    UnsupportedSnpSharedGpaBoundary(u64),
+    #[error("KVM does not support SNP IGVM relocation")]
+    SnpIgvmRelocationUnsupported,
     #[error("missing KVM CCA capability: {0}")]
     MissingCcaCapability(&'static str),
     #[error("CCA realm VMs require GICv3")]
@@ -155,6 +177,9 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     sev: Option<std::fs::File>,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    snp_config: Option<Arc<snp::KvmSnpConfig>>,
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     snp_launch_state: Mutex<SnpLaunchState>,
