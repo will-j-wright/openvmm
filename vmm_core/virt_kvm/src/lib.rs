@@ -69,6 +69,10 @@ pub enum KvmError {
     InvalidState(&'static str),
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
+    #[error("partition isolation configuration was already supplied")]
+    IsolationConfigurationAlreadySet,
+    #[error("partition isolation configuration was not supplied before build")]
+    IsolationConfigurationMissing,
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -104,6 +108,9 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     sev: Option<std::fs::File>,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    snp_config: Option<Arc<snp::KvmSnpConfig>>,
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     snp_launch_state: Mutex<SnpLaunchState>,

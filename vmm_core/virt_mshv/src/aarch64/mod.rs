@@ -161,6 +161,16 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             .expect("failed to get physical address width") as u8
     }
 
+    fn configure_isolation(
+        &mut self,
+        config: Option<&virt::IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error> {
+        if config.is_some() {
+            return Err(ErrorInner::IsolationNotSupported.into());
+        }
+        Ok(())
+    }
+
     fn build(
         self,
         config: PartitionConfig<'_>,

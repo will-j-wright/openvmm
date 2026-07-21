@@ -144,6 +144,18 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
     type ProcessorBinder = HvfProcessorBinder;
     type Error = Error;
 
+    fn configure_isolation(
+        &mut self,
+        config: Option<&virt::IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error> {
+        if config.is_some() {
+            return Err(
+                anyhow::anyhow!("HVF does not support IGVM isolation configuration").into(),
+            );
+        }
+        Ok(())
+    }
+
     fn build(
         self,
         config: virt::PartitionConfig<'_>,
