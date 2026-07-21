@@ -819,6 +819,8 @@ pub enum Error {
     NestedVirtIncompatibleWithVtl2,
     #[error("nested_virt is incompatible with isolation")]
     NestedVirtIncompatibleWithIsolation,
+    #[error("WHP does not support IGVM isolation configuration")]
+    IgvmIsolationNotSupported,
 }
 
 trait WhpResultExt<T> {
@@ -957,6 +959,16 @@ impl ProtoPartition for WhpProtoPartition<'_> {
             .unwrap()
             .try_into()
             .unwrap()
+    }
+
+    fn configure_isolation(
+        &mut self,
+        config: Option<&virt::IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error> {
+        if config.is_some() {
+            return Err(Error::IgvmIsolationNotSupported);
+        }
+        Ok(())
     }
 
     fn build(

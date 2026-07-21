@@ -831,6 +831,18 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         self.ipa_size
     }
 
+    fn configure_isolation(
+        &mut self,
+        config: Option<&virt::IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error> {
+        if config.is_some() {
+            return Err(KvmError::UnsupportedIsolationConfiguration(
+                "IGVM isolation configuration is not supported on aarch64",
+            ));
+        }
+        Ok(())
+    }
+
     fn build(
         mut self,
         config: virt::PartitionConfig<'_>,

@@ -172,6 +172,10 @@ impl virt::Hypervisor for Kvm {
         // Query which MCE capability bits this host allows us to set so that
         // bind() can advertise CMCI to the guest where supported (Intel).
         let supported_mce_cap = self.kvm.supported_mce_cap()?;
+        let supported_vmsa_features = match config.isolation {
+            virt::IsolationType::Snp => Some(self.kvm.supported_sev_vmsa_features()),
+            _ => None,
+        };
 
         // Determine the CPU vendor from CPUID leaf 0.
         let vendor = supported_cpuid
@@ -396,9 +400,6 @@ impl virt::Hypervisor for Kvm {
                 unreachable!()
             }
         };
-        if let Some(sev) = &sev {
-            vm.sev_snp_init(sev.as_fd())?;
-        }
         vm.enable_split_irqchip(virt::irqcon::IRQ_LINES as u32)?;
         vm.enable_x2apic_api()?;
         vm.enable_unknown_msr_exits()?;
@@ -406,6 +407,9 @@ impl virt::Hypervisor for Kvm {
         Ok(KvmProtoPartition {
             vm,
             sev,
+            snp_config: None,
+            isolation_configured: false,
+            supported_vmsa_features,
             config,
             cpuid: cpuid_entries,
             nested_virt,
@@ -418,6 +422,9 @@ impl virt::Hypervisor for Kvm {
 pub struct KvmProtoPartition<'a> {
     vm: kvm::Partition,
     sev: Option<std::fs::File>,
+    snp_config: Option<Arc<crate::snp::KvmSnpConfig>>,
+    isolation_configured: bool,
+    supported_vmsa_features: Option<Result<u64, kvm::Error>>,
     config: ProtoPartitionConfig<'a>,
     cpuid: CpuidLeafSet,
     nested_virt: bool,
@@ -435,10 +442,64 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         max_physical_address_size_from_cpuid(&|eax, ecx| self.cpuid.result(eax, ecx, &[0; 4]))
     }
 
+    fn configure_isolation(
+        &mut self,
+        config: Option<&virt::IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error> {
+        if self.isolation_configured {
+            return Err(KvmError::IsolationConfigurationAlreadySet);
+        }
+
+        let snp_config = match (self.config.isolation, config) {
+            (virt::IsolationType::None, None) => None,
+            (virt::IsolationType::None, Some(_)) => {
+                return Err(KvmError::UnsupportedIsolationConfiguration(
+                    "IGVM isolation configuration requires an isolated partition",
+                ));
+            }
+            (virt::IsolationType::Snp, None) => None,
+            (virt::IsolationType::Snp, Some(virt::IgvmIsolationConfig::Snp(config))) => {
+                let config = crate::snp::prepare_snp_config(
+                    config.clone(),
+                    self.supported_vmsa_features
+                        .take()
+                        .ok_or(KvmError::IsolationConfigurationMissing)??,
+                )?;
+                if config.vp.context.vp_index != VpIndex::BSP
+                    || self.config.processor_topology.vp_count() != 1
+                    || self.config.processor_topology.vp_arch(VpIndex::BSP).apic_id != 0
+                {
+                    return Err(KvmError::InvalidSnpIgvmTopology);
+                }
+                if config.vp.context.gpa != crate::snp::KVM_SNP_VMSA_GPA {
+                    return Err(KvmError::InvalidSnpVmsaGpa(config.vp.context.gpa));
+                }
+                Some(config)
+            }
+            (virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca, _) => {
+                return Err(KvmError::IsolationNotSupported);
+            }
+        };
+
+        if let Some(sev) = &self.sev {
+            self.vm.sev_snp_init(
+                sev.as_fd(),
+                snp_config.as_ref().map_or(0, |config| config.vmsa_features),
+            )?;
+        }
+        self.snp_config = snp_config;
+        self.isolation_configured = true;
+        Ok(())
+    }
+
     fn build(
         mut self,
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
+        if !self.isolation_configured {
+            return Err(KvmError::IsolationConfigurationMissing);
+        }
+
         // Build topology leaves using the base cpuid before consuming it.
         let mut topology_leaves = Vec::new();
         virt::x86::topology::topology_cpuid(
@@ -528,6 +589,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             sev: self.sev,
+            snp_config: self.snp_config,
             snp_launch_state: Mutex::new(SnpLaunchState::NotStarted),
             memory: Default::default(),
             memory_backing_mode,

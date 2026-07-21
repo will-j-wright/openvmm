@@ -8,6 +8,7 @@ use guestmem::GuestMemory;
 use hvdef::HV_PAGE_SIZE;
 use igvm::IgvmDirectiveHeader;
 use igvm::IgvmFile;
+use igvm::IgvmInitializationHeader;
 use igvm::IgvmPlatformHeader;
 use igvm::IgvmRelocatableRegion;
 use igvm::page_table::CpuPagingState;
@@ -33,6 +34,7 @@ use range_map_vec::RangeMap;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Seek;
+use std::sync::Arc;
 use thiserror::Error;
 use vm_loader::InitialLoad;
 use vm_loader::Loader;
@@ -88,6 +90,10 @@ pub enum Error {
     UnsupportedGuestArch,
     #[error("igvm file does not support vbs")]
     NoVbsSupport,
+    #[error("igvm file does not support SNP")]
+    NoSnpSupport,
+    #[error("SNP IGVM file does not contain a guest policy")]
+    MissingSnpGuestPolicy,
     #[error("vp context for lower VTL not supported")]
     LowerVtlContext,
     #[error("missing required memory range {0}")]
@@ -121,17 +127,29 @@ fn from_igvm_vtl(vtl: igvm::hv_defs::Vtl) -> hvdef::Vtl {
     }
 }
 
-/// Read and parse an IgvmFile from a File. This assumes the file is a VBS IGVM
-/// file.
-pub fn read_igvm_file(mut file: &std::fs::File) -> Result<IgvmFile, Error> {
+/// Read and parse an IGVM file for a specific isolation type.
+pub fn read_igvm_file(
+    mut file: &std::fs::File,
+    igvm_isolation_type: igvm::IsolationType,
+) -> Result<IgvmFile, Error> {
     let mut file_contents = Vec::new();
     file.rewind().map_err(Error::Igvm)?;
     file.read_to_end(&mut file_contents).map_err(Error::Igvm)?;
 
-    let igvm_file = IgvmFile::new_from_binary(&file_contents, Some(igvm::IsolationType::Vbs))
+    let igvm_file = IgvmFile::new_from_binary(&file_contents, Some(igvm_isolation_type))
         .map_err(Error::InvalidIgvmFile)?;
 
     Ok(igvm_file)
+}
+
+/// Maps the partition isolation type to the IGVM isolation type.
+pub fn igvm_isolation_type(isolation: virt::IsolationType) -> igvm::IsolationType {
+    match isolation {
+        virt::IsolationType::None | virt::IsolationType::Vbs => igvm::IsolationType::Vbs,
+        virt::IsolationType::Snp => igvm::IsolationType::Snp,
+        virt::IsolationType::Tdx => igvm::IsolationType::Tdx,
+        virt::IsolationType::Cca => igvm::IsolationType::Cca,
+    }
 }
 
 /// Extract the vbs supported platform header from an igvm file.
@@ -144,6 +162,133 @@ fn vbs_platform_header(igvm_file: &IgvmFile) -> Result<&IgvmPlatformHeader, Erro
             info.platform_type == IgvmPlatformType::VSM_ISOLATION
         })
         .ok_or(Error::NoVbsSupport)
+}
+
+fn snp_platform_header(igvm_file: &IgvmFile) -> Result<&IgvmPlatformHeader, Error> {
+    igvm_file
+        .platforms()
+        .iter()
+        .find(|header| {
+            let IgvmPlatformHeader::SupportedPlatform(info) = header;
+            info.platform_type == IgvmPlatformType::SEV_SNP
+        })
+        .ok_or(Error::NoSnpSupport)
+}
+
+fn selected_platform_header(
+    igvm_file: &IgvmFile,
+    igvm_isolation_type: igvm::IsolationType,
+) -> Result<&IgvmPlatformHeader, Error> {
+    match igvm_isolation_type {
+        igvm::IsolationType::Vbs => vbs_platform_header(igvm_file),
+        igvm::IsolationType::Snp => snp_platform_header(igvm_file),
+        _ => Err(Error::UnsupportedGuestArch),
+    }
+}
+
+/// Extract backend-owned isolation configuration from an IGVM file.
+pub fn isolation_config(
+    igvm_file: &IgvmFile,
+    igvm_isolation_type: igvm::IsolationType,
+) -> Result<Option<virt::IgvmIsolationConfig>, Error> {
+    if igvm_isolation_type != igvm::IsolationType::Snp {
+        return Ok(None);
+    }
+
+    let IgvmPlatformHeader::SupportedPlatform(platform) = snp_platform_header(igvm_file)?;
+    let policy = igvm_file
+        .initializations()
+        .iter()
+        .find_map(|header| match header {
+            IgvmInitializationHeader::GuestPolicy { policy, .. } => Some(*policy),
+            _ => None,
+        })
+        .ok_or(Error::MissingSnpGuestPolicy)?;
+
+    let has_relocation = igvm_file.initializations().iter().any(|header| {
+        matches!(
+            header,
+            IgvmInitializationHeader::RelocatableRegion { .. }
+                | IgvmInitializationHeader::PageTableRelocationRegion { .. }
+        )
+    });
+
+    let mut vp_contexts = Vec::new();
+    let mut identity = None;
+    for directive in igvm_file.directives() {
+        match directive {
+            IgvmDirectiveHeader::SnpVpContext {
+                gpa,
+                vp_index,
+                vmsa,
+                ..
+            } => {
+                let page = <&[u8; 4096]>::try_from(vmsa.as_bytes())
+                    .expect("the parsed SNP VMSA is a 4-KiB page");
+                vp_contexts.push(Arc::new(virt::SnpVpContext {
+                    gpa: *gpa,
+                    vp_index: virt::VpIndex::new(u32::from(*vp_index)),
+                    page: Arc::new(*page),
+                }));
+            }
+            IgvmDirectiveHeader::SnpIdBlock {
+                author_key_enabled,
+                ld,
+                family_id,
+                image_id,
+                version,
+                guest_svn,
+                id_key_algorithm,
+                author_key_algorithm,
+                id_key_signature,
+                id_public_key,
+                author_key_signature,
+                author_public_key,
+                ..
+            } => {
+                identity = Some(virt::SnpIdentity {
+                    author_key_enabled: *author_key_enabled,
+                    launch_digest: *ld,
+                    family_id: *family_id,
+                    image_id: *image_id,
+                    version: *version,
+                    guest_svn: *guest_svn,
+                    id_key_algorithm: *id_key_algorithm,
+                    author_key_algorithm: *author_key_algorithm,
+                    id_key_signature: virt::SnpIdBlockSignature {
+                        r: id_key_signature.r_comp,
+                        s: id_key_signature.s_comp,
+                    },
+                    id_public_key: virt::SnpIdBlockPublicKey {
+                        curve: id_public_key.curve,
+                        qx: id_public_key.qx,
+                        qy: id_public_key.qy,
+                    },
+                    author_key_signature: virt::SnpIdBlockSignature {
+                        r: author_key_signature.r_comp,
+                        s: author_key_signature.s_comp,
+                    },
+                    author_public_key: virt::SnpIdBlockPublicKey {
+                        curve: author_public_key.curve,
+                        qx: author_public_key.qx,
+                        qy: author_public_key.qy,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Some(virt::IgvmIsolationConfig::Snp(Arc::new(
+        virt::SnpConfig {
+            policy,
+            highest_vtl: platform.highest_vtl,
+            shared_gpa_boundary: platform.shared_gpa_boundary,
+            has_relocation,
+            vp_contexts,
+            identity,
+        },
+    ))))
 }
 
 /// Determine if the given `igvm_file` supports relocations or not.
@@ -504,6 +649,8 @@ pub struct AcpiTables<'a> {
 pub struct LoadIgvmParams<'a, T: ArchTopology> {
     /// The IGVM file to load.
     pub igvm_file: &'a IgvmFile,
+    /// The isolation type used to parse the IGVM file.
+    pub igvm_isolation_type: igvm::IsolationType,
     /// The guest memory instance to access guest memory with.
     pub gm: &'a GuestMemory,
     /// The processor topology of the guest.
@@ -553,6 +700,7 @@ fn load_igvm_x86(
 ) -> Result<InitialLoad<X86Register>, Error> {
     let LoadIgvmParams {
         igvm_file,
+        igvm_isolation_type,
         gm,
         processor_topology,
         mem_layout,
@@ -595,11 +743,8 @@ fn load_igvm_x86(
         return Err(Error::CommandLineContainsNul(pos));
     }
 
-    let (mask, max_vtl) = match vbs_platform_header(igvm_file)? {
-        IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
-            (info.compatibility_mask, info.highest_vtl)
-        }
+    let (mask, max_vtl) = match selected_platform_header(igvm_file, igvm_isolation_type)? {
+        IgvmPlatformHeader::SupportedPlatform(info) => (info.compatibility_mask, info.highest_vtl),
     };
 
     let (relocation_regions, mut page_table_fixup) = igvm_file.relocations(mask);
@@ -861,6 +1006,9 @@ fn load_igvm_x86(
     let mut page_data = PageDataBuffer::new();
     for header in directives {
         debug_assert!(header.compatibility_mask().unwrap_or(mask) & mask == mask);
+        if !matches!(*header, IgvmDirectiveHeader::PageData { .. }) {
+            page_data.flush(&mut loader)?;
+        }
 
         match *header {
             IgvmDirectiveHeader::PageData {
@@ -897,7 +1045,9 @@ fn load_igvm_x86(
                             BootPageAcceptance::Exclusive
                         }
                     }
-                    // TODO: other data types SNP / TDX only, unsupported
+                    IgvmPageDataType::SECRETS => BootPageAcceptance::SecretsPage,
+                    IgvmPageDataType::CPUID_DATA => BootPageAcceptance::CpuidPage,
+                    IgvmPageDataType::CPUID_XF => BootPageAcceptance::CpuidExtendedStatePage,
                     _ => todo!("unsupported IgvmPageDataType"),
                 };
 
@@ -1017,8 +1167,15 @@ fn load_igvm_x86(
                     igvm_defs::IgvmEnvironmentInfo::new().with_memory_is_shared(false);
                 import_parameter(&mut parameter_areas, info, environment_info.as_bytes())?;
             }
-            IgvmDirectiveHeader::SnpVpContext { .. } => todo!("snp not supported"),
-            IgvmDirectiveHeader::SnpIdBlock { .. } => todo!("snp not supported"),
+            IgvmDirectiveHeader::SnpVpContext { .. } => {
+                // KVM needs the raw IGVM VMSA before KVM_SEV_INIT2, and later
+                // synthesizes its own measured VMSA from per-vCPU register
+                // state at launch finish. The bytes therefore travel through
+                // the pre-build isolation config and this directive has no
+                // guest-memory import to perform.
+            }
+            // This metadata was passed to the backend before partition build.
+            IgvmDirectiveHeader::SnpIdBlock { .. } => {}
             IgvmDirectiveHeader::VbsMeasurement { .. } => todo!("vbs not supported"),
             IgvmDirectiveHeader::X64VbsVpContext {
                 vtl,
@@ -1183,9 +1340,17 @@ fn load_igvm_x86(
                     ParameterAreaState::Inserted => panic!("igvmfile is invalid, multiple insert"),
                 }
             }
-            IgvmDirectiveHeader::ErrorRange { .. } => {
-                todo!("Error Range not supported")
-            }
+            IgvmDirectiveHeader::ErrorRange {
+                gpa, size_bytes, ..
+            } => loader
+                .import_pages(
+                    gpa / HV_PAGE_SIZE,
+                    size_bytes as u64 / HV_PAGE_SIZE,
+                    "igvm-error-range",
+                    BootPageAcceptance::Shared,
+                    &[],
+                )
+                .map_err(Error::Loader)?,
             IgvmDirectiveHeader::X64NativeVpContext { .. } => {
                 todo!("native vp context not supported")
             }
@@ -1226,7 +1391,7 @@ fn load_igvm_x86(
             .map_err(Error::Loader)?;
     }
 
-    Ok(loader.initial_regs_and_page_imports())
+    Ok(loader.initial_regs_and_ordered_page_imports())
 }
 
 /// Build the IGVM memory map reported to the guest, with the specified memory
