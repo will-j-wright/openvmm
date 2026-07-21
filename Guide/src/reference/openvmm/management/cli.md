@@ -86,8 +86,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
   bring-up. It supports either loader-based kernel/initrd boot or an SNP IGVM
   selected with `--igvm-personality linux-direct`. MSHV SNP can expose Hyper-V
   enlightenments with `--hv --no-vmbus`; VMBus devices remain unsupported.
-  MSHV SNP IGVM boot is limited to one VP; the IGVM must use VTL0, no shared
-  GPA boundary, and no relocation metadata.
+  The IGVM must use VTL0, no shared GPA boundary, and no relocation metadata.
+  The portable KVM/MSHV IGVM profile uses an external high-GPA VMSA and is
+  limited to one VP on MSHV. The MSHV-specific ACI profile uses an in-RAM BSP
+  VMSA and runtime VP-count and memory-map parameters, allowing the guest to
+  start APs through Hyper-V.
 
   SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
   the minimal emulated chipset and serial console, optional devices are
@@ -97,10 +100,13 @@ as well as the generated CLI help (via `cargo run -- --help`).
 
   ```bash
   openvmm --hypervisor mshv --isolation snp \
-    --igvm path/to/snp-linux-direct.bin \
+    --igvm path/to/snp-linux-direct-aci.bin \
     --igvm-personality linux-direct --com1 console \
-    --no-vmbus -m 160MB -p 1
+    --hv --no-vmbus -m 160MB -p 1
   ```
+
+  Restricted injection for IGVM boot is measured into the file-provided VMSA.
+  Do not pass `--snp-restricted-injection` with `--igvm`.
 * `--snp-restricted-injection`: Enable restricted interrupt injection in the
   loader-generated SNP VMSA. This bring-up option has no default and requires
   `--hypervisor mshv --isolation snp` with Linux direct boot. Do not enable it

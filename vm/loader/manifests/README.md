@@ -6,6 +6,7 @@ normally creates the resource file that supplies each recipe's binary inputs.
 `snp-linux-direct.json` is a bring-up profile with these assumptions:
 
 - x64 and one VTL0 SEV-SNP guest that boots Linux directly
+- the default `standard` boot layout, shared by KVM and MSHV
 - a serializable processor-topology plan; the default profile uses one virtual
   processor and `snp-linux-direct-multi-vp.json` uses two
 - 160 MiB of contiguous RAM (40,960 4-KiB pages)
@@ -25,17 +26,38 @@ to boot on KVM and MSHV. Its `SnpVpContext` uses the SNP initial-VMSA GPA
 maps and imports the file-provided VMSA there. Both backends submit the policy
 and SNP ID block encoded in the file.
 
-MSHV currently supports only the one-processor profile. The multi-processor
-profile remains available for KVM. The
-`snp-linux-direct-restricted.json` profile uses the same IGVM encoding with
+MSHV's standard high-GPA VMSA path supports only the one-processor profile.
+The standard multi-processor profile remains available for KVM. The
+`snp-linux-direct-restricted.json` profile uses the same standard encoding with
 restricted interrupt injection and is intended only for MSHV bring-up.
 
-The image contains a small measured bootshim. Only pages containing the kernel,
-initrd, boot metadata, SNP special pages, bootshim, or bootshim parameters are
-included as IGVM `PageData`. After SNP launch, the bootshim accepts the
-remaining private RAM with `PVALIDATE` and then enters Linux. This avoids
-loading and measuring every configured RAM page, but still accepts all RAM
-before Linux starts.
+The standard image contains a small measured bootshim. Only pages containing
+the kernel, initrd, boot metadata, SNP special pages, bootshim, or bootshim
+parameters are included as IGVM `PageData`. After SNP launch, the bootshim
+accepts the remaining private RAM with `PVALIDATE` and then enters Linux. This
+avoids loading and measuring every configured RAM page, but still accepts all
+RAM before Linux starts.
+
+`snp-linux-direct-aci.json` instead selects the `aci_hyperv` boot layout. It is
+MSHV-specific and reproduces the ACI physical-Hyper-V SNP boot ABI:
+
+- the ACI bzImage loads at its preferred address;
+- ACPI and SNP metadata occupy the fixed ACI GPAs;
+- the BSP VMSA is measured at GPA `0x201000`;
+- restricted injection is encoded in that VMSA by the manifest's
+  `injection_type`; do not pass OpenVMM's `--snp-restricted-injection` flag;
+- the unmeasured parameter page at GPA `0x802000` receives the runtime VP count
+  and IGVM-format memory map through standard IGVM parameter directives;
+- only the ACI initial image is launch-imported. There is no bootshim, so the
+  guest validates the remaining RAM itself.
+
+The checked-in ACI manifest describes one VP, matching the passing hardware
+repro. The format preserves multi-VP support: only the BSP VMSA is present in
+the IGVM, the measured topology contract records every expected APIC ID, and
+the guest starts APs using the Hyper-V `StartVirtualProcessor` contract. The
+current ACI kernel/host combination's two-VP direct and IGVM boots fail at the
+same secondary-CPU startup point, so SMP remains covered structurally and by
+unit tests rather than enabled in the shipped profile.
 
 Petri uses the same schema to generate a test-local IGVM after all OpenVMM
 backend modifiers have been applied. The final OpenVMM CPU, RAM, chipset, and
@@ -93,6 +115,15 @@ cargo xflowey build-igvm x64-test-linux-direct \
 Build the MSHV restricted-injection variant by substituting
 `vm/loader/manifests/snp-linux-direct-restricted.json` and a distinct build
 label.
+
+Build the ACI Hyper-V variant with its bzImage as the VTL0 kernel:
+
+```bash
+cargo xflowey build-igvm x64-test-linux-direct \
+  --override-manifest vm/loader/manifests/snp-linux-direct-aci.json \
+  --custom-vtl0-kernel path/to/bzImage \
+  --build-label snp-linux-direct-aci
+```
 
 The standard outputs are:
 
