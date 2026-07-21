@@ -465,14 +465,21 @@ impl ProtoPartition for KvmProtoPartition<'_> {
                         .take()
                         .ok_or(KvmError::IsolationConfigurationMissing)??,
                 )?;
-                if config.vp.context.vp_index != VpIndex::BSP
-                    || self.config.processor_topology.vp_count() != 1
-                    || self.config.processor_topology.vp_arch(VpIndex::BSP).apic_id != 0
+                if config.vps.len() != self.config.processor_topology.vp_count() as usize
+                    || self
+                        .config
+                        .processor_topology
+                        .vps()
+                        .any(|vp| config.vp(vp.vp_index).is_none())
                 {
                     return Err(KvmError::InvalidSnpIgvmTopology);
                 }
-                if config.vp.context.gpa != crate::snp::KVM_SNP_VMSA_GPA {
-                    return Err(KvmError::InvalidSnpVmsaGpa(config.vp.context.gpa));
+                if let Some(vp) = config
+                    .vps
+                    .iter()
+                    .find(|vp| vp.context.gpa != crate::snp::KVM_SNP_VMSA_GPA)
+                {
+                    return Err(KvmError::InvalidSnpVmsaGpa(vp.context.gpa));
                 }
                 Some(config)
             }

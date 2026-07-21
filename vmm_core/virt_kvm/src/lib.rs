@@ -104,7 +104,7 @@ pub enum KvmError {
     IsolationConfigurationAlreadySet,
     #[error("partition isolation configuration was not supplied before build")]
     IsolationConfigurationMissing,
-    #[error("SNP IGVM requires exactly BSP VP index 0 and one virtual processor")]
+    #[error("SNP IGVM VP contexts do not match the configured virtual processors")]
     InvalidSnpIgvmTopology,
     #[error("SNP IGVM VMSA GPA {0:#x} is not supported by KVM")]
     InvalidSnpVmsaGpa(u64),

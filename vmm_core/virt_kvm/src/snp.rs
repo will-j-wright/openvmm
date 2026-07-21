@@ -44,8 +44,17 @@ pub(crate) struct KvmSnpVpConfig {
 #[derive(Debug)]
 pub(crate) struct KvmSnpConfig {
     pub(crate) generic: Arc<virt::SnpConfig>,
-    pub(crate) vp: KvmSnpVpConfig,
+    pub(crate) vps: Vec<KvmSnpVpConfig>,
     pub(crate) vmsa_features: u64,
+}
+
+impl KvmSnpConfig {
+    pub(crate) fn vp(&self, vp_index: virt::VpIndex) -> Option<&KvmSnpVpConfig> {
+        self.vps
+            .binary_search_by_key(&vp_index, |vp| vp.context.vp_index)
+            .ok()
+            .map(|index| &self.vps[index])
+    }
 }
 
 fn parse_vmsa_page(context: Arc<virt::SnpVpContext>) -> Result<KvmSnpVpConfig, KvmError> {
@@ -69,18 +78,35 @@ pub(crate) fn prepare_snp_config(
     if config.has_relocation {
         return Err(KvmError::SnpIgvmRelocationUnsupported);
     }
-    let [context] = config.vp_contexts.as_slice() else {
+    if config.vp_contexts.is_empty() {
         return Err(KvmError::InvalidSnpIgvmTopology);
-    };
-    // KVM_SEV_INIT2 needs the VM-wide VMSA feature bits before any vCPUs
-    // exist. KVM does not import this raw page directly: before launch finish
-    // we install its state into the vCPU, then KVM synthesizes and measures its
-    // own VMSA at the reserved initial-VMSA GPA.
-    let vp = parse_vmsa_page(context.clone())?;
-    if vp.vmsa.sev_features.vtom() || vp.vmsa.virtual_tom != 0 {
-        return Err(KvmError::InvalidSnpVmsa("vTOM is not supported"));
     }
-    let vmsa_features = u64::from(vp.vmsa.sev_features) & !1;
+
+    // KVM_SEV_INIT2 needs the VM-wide VMSA feature bits before any vCPUs
+    // exist. KVM does not import these raw pages directly: before launch finish
+    // we install each page's state into its vCPU, then KVM synthesizes and
+    // measures its own VMSAs at the reserved initial-VMSA GPA.
+    let mut vps = Vec::with_capacity(config.vp_contexts.len());
+    let mut vmsa_features = None;
+    for context in &config.vp_contexts {
+        let vp = parse_vmsa_page(context.clone())?;
+        if vp.vmsa.sev_features.vtom() || vp.vmsa.virtual_tom != 0 {
+            return Err(KvmError::InvalidSnpVmsa("vTOM is not supported"));
+        }
+        let features = u64::from(vp.vmsa.sev_features) & !1;
+        match vmsa_features {
+            Some(previous) if previous != features => {
+                return Err(KvmError::InvalidSnpVmsa(
+                    "VP contexts have inconsistent VMSA features",
+                ));
+            }
+            None => vmsa_features = Some(features),
+            _ => {}
+        }
+        vps.push(vp);
+    }
+    vps.sort_by_key(|vp| vp.context.vp_index);
+    let vmsa_features = vmsa_features.unwrap_or(0);
     let unsupported_features = vmsa_features & !supported_vmsa_features;
     if unsupported_features != 0 {
         return Err(KvmError::UnsupportedSnpVmsaFeatures(unsupported_features));
@@ -88,7 +114,7 @@ pub(crate) fn prepare_snp_config(
 
     Ok(Arc::new(KvmSnpConfig {
         generic: config,
-        vp,
+        vps,
         vmsa_features,
     }))
 }
@@ -155,7 +181,6 @@ impl KvmPartitionInner {
                 self.set_initial_shared_memory(page.range)?;
                 continue;
             }
-
             let kvm_page_type = crate::arch::snp::snp_launch_page_type(page.import_type)?;
 
             let private_range = {
@@ -173,7 +198,8 @@ impl KvmPartitionInner {
                 let (xcr0, xss) = self
                     .snp_config
                     .as_ref()
-                    .map_or((1, 0), |config| (config.vp.vmsa.xcr0, config.vp.vmsa.xss));
+                    .and_then(|config| config.vp(virt::VpIndex::BSP))
+                    .map_or((1, 0), |vp| (vp.vmsa.xcr0, vp.vmsa.xss));
                 write_snp_cpuid_page(
                     private_range.hva,
                     page.range.len(),
@@ -308,7 +334,10 @@ impl KvmPartitionInner {
             let vp_info = vp.vp_info();
             let kvm_vp = self.kvm.vp(vp_info.apic_id);
             if let Some(config) = &self.snp_config {
-                set_snp_igvm_vmsa_state(&kvm_vp, &config.vp.vmsa)?;
+                let vp = config
+                    .vp(vp_info.base.vp_index)
+                    .ok_or(KvmError::InvalidSnpIgvmTopology)?;
+                set_snp_igvm_vmsa_state(&kvm_vp, &vp.vmsa)?;
             }
             let sregs = kvm_vp.get_sregs()?;
 
@@ -610,7 +639,7 @@ mod tests {
     use test_with_tracing::test;
     use zerocopy::FromZeros;
 
-    fn valid_vmsa_page(features: x86defs::snp::SevFeatures) -> Arc<[u8; 4096]> {
+    fn valid_vmsa_page_at_rip(features: x86defs::snp::SevFeatures, rip: u64) -> Arc<[u8; 4096]> {
         let mut vmsa = x86defs::snp::SevVmsa::new_zeroed();
         vmsa.efer = x86defs::X64_EFER_SVME
             | x86defs::X64_EFER_LME
@@ -622,7 +651,7 @@ mod tests {
         vmsa.dr7 = 0x400;
         vmsa.dr6 = 0xffff_0ff0;
         vmsa.rflags = 2;
-        vmsa.rip = 0x100000;
+        vmsa.rip = rip;
         vmsa.sev_features = features;
         vmsa.xcr0 = 1;
         vmsa.x87_fcw = x86defs::xsave::INIT_FCW;
@@ -633,19 +662,31 @@ mod tests {
         Arc::new(page)
     }
 
-    fn snp_config(page: Arc<[u8; 4096]>) -> Arc<virt::SnpConfig> {
+    fn valid_vmsa_page(features: x86defs::snp::SevFeatures) -> Arc<[u8; 4096]> {
+        valid_vmsa_page_at_rip(features, 0x100000)
+    }
+
+    fn vp_context(vp_index: u32, page: Arc<[u8; 4096]>) -> Arc<virt::SnpVpContext> {
+        Arc::new(virt::SnpVpContext {
+            gpa: KVM_SNP_VMSA_GPA,
+            vp_index: virt::VpIndex::new(vp_index),
+            page,
+        })
+    }
+
+    fn snp_config_with_contexts(vp_contexts: Vec<Arc<virt::SnpVpContext>>) -> Arc<virt::SnpConfig> {
         Arc::new(virt::SnpConfig {
             policy: 0x30000,
             highest_vtl: 0,
             shared_gpa_boundary: 0,
             has_relocation: false,
-            vp_contexts: vec![Arc::new(virt::SnpVpContext {
-                gpa: KVM_SNP_VMSA_GPA,
-                vp_index: virt::VpIndex::BSP,
-                page,
-            })],
+            vp_contexts,
             identity: None,
         })
+    }
+
+    fn snp_config(page: Arc<[u8; 4096]>) -> Arc<virt::SnpConfig> {
+        snp_config_with_contexts(vec![vp_context(0, page)])
     }
 
     fn test_identity() -> virt::SnpIdentity {
@@ -695,6 +736,44 @@ mod tests {
                 0,
             ),
             Err(KvmError::UnsupportedSnpVmsaFeatures(bits)) if bits == supported
+        ));
+    }
+
+    #[test]
+    fn maps_multiple_vp_contexts_by_vp_index() {
+        let features = x86defs::snp::SevFeatures::new().with_snp(true);
+        let prepared = prepare_snp_config(
+            snp_config_with_contexts(vec![
+                vp_context(1, valid_vmsa_page_at_rip(features, 0x200000)),
+                vp_context(0, valid_vmsa_page_at_rip(features, 0x100000)),
+            ]),
+            u64::MAX,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.vps.len(), 2);
+        assert_eq!(prepared.vp(virt::VpIndex::BSP).unwrap().vmsa.rip, 0x100000);
+        assert_eq!(
+            prepared.vp(virt::VpIndex::new(1)).unwrap().vmsa.rip,
+            0x200000
+        );
+    }
+
+    #[test]
+    fn rejects_inconsistent_multi_vp_vmsa_features() {
+        let bsp_features = x86defs::snp::SevFeatures::new().with_snp(true);
+        let ap_features = bsp_features.with_restrict_injection(true);
+        assert!(matches!(
+            prepare_snp_config(
+                snp_config_with_contexts(vec![
+                    vp_context(0, valid_vmsa_page(bsp_features)),
+                    vp_context(1, valid_vmsa_page(ap_features)),
+                ]),
+                u64::MAX,
+            ),
+            Err(KvmError::InvalidSnpVmsa(
+                "VP contexts have inconsistent VMSA features"
+            ))
         ));
     }
 
