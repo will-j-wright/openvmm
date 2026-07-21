@@ -306,6 +306,19 @@ impl KvmPartitionInner {
     /// the old state is discarded so stale data cannot be reused if the page
     /// later transitions back.
     #[cfg(guest_arch = "x86_64")]
+    pub(crate) fn set_initial_shared_memory(&self, range: MemoryRange) -> Result<(), KvmError> {
+        let state = self.memory.lock();
+        let segments =
+            guest_memfd_range_segments(range, &state.ranges).map_err(|err| match err {
+                KvmError::InvalidMapGpaRange => KvmError::InvalidSnpLaunchRange,
+                err => err,
+            })?;
+        self.kvm
+            .set_memory_attributes(range.start(), range.len(), 0)?;
+        self.discard_stale_private_memory_backing(&segments, false, "SNP")
+    }
+
+    #[cfg(guest_arch = "x86_64")]
     pub(crate) fn set_map_gpa_range_attributes(
         &self,
         gpa: u64,

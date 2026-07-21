@@ -217,6 +217,90 @@ pub struct InitialPageImport {
     pub tag: &'static str,
 }
 
+/// An opaque SNP virtual processor context.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct SnpVpContext {
+    /// The guest physical address associated with the context.
+    pub gpa: u64,
+    /// The virtual processor described by the context.
+    pub vp_index: VpIndex,
+    /// The complete 4-KiB VMSA page.
+    pub page: Arc<[u8; 4096]>,
+}
+
+/// An SNP ID-block signature.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct SnpIdBlockSignature {
+    /// The ECDSA R component.
+    pub r: [u8; 72],
+    /// The ECDSA S component.
+    pub s: [u8; 72],
+}
+
+/// An SNP ID-block public key.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct SnpIdBlockPublicKey {
+    /// The elliptic curve identifier.
+    pub curve: u32,
+    /// The public key X coordinate.
+    pub qx: [u8; 72],
+    /// The public key Y coordinate.
+    pub qy: [u8; 72],
+}
+
+/// SNP launch identity as supplied by an IGVM file.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct SnpIdentity {
+    /// Whether the author key is enabled.
+    pub author_key_enabled: u8,
+    /// The launch digest supplied by the IGVM file.
+    pub launch_digest: [u8; 48],
+    /// The guest family identifier.
+    pub family_id: [u8; 16],
+    /// The guest image identifier.
+    pub image_id: [u8; 16],
+    /// The ID-block format version.
+    pub version: u32,
+    /// The guest security version number.
+    pub guest_svn: u32,
+    /// The ID-key algorithm.
+    pub id_key_algorithm: u32,
+    /// The author-key algorithm.
+    pub author_key_algorithm: u32,
+    /// The ID-block signature.
+    pub id_key_signature: SnpIdBlockSignature,
+    /// The ID public key.
+    pub id_public_key: SnpIdBlockPublicKey,
+    /// The author-key signature.
+    pub author_key_signature: SnpIdBlockSignature,
+    /// The author public key.
+    pub author_public_key: SnpIdBlockPublicKey,
+}
+
+/// Backend-neutral SNP launch configuration extracted from an IGVM file.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct SnpConfig {
+    /// The SNP guest policy.
+    pub policy: u64,
+    /// The highest VTL requested by the selected IGVM platform.
+    pub highest_vtl: u8,
+    /// The shared GPA boundary requested by the selected IGVM platform.
+    pub shared_gpa_boundary: u64,
+    /// Whether the IGVM contains relocation metadata.
+    pub has_relocation: bool,
+    /// Opaque virtual processor contexts in file order.
+    pub vp_contexts: Vec<Arc<SnpVpContext>>,
+    /// Optional launch identity and authentication data.
+    pub identity: Option<SnpIdentity>,
+}
+
+/// Isolation configuration extracted from a filtered IGVM file.
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub enum IgvmIsolationConfig {
+    /// AMD SEV-SNP launch configuration.
+    Snp(Arc<SnpConfig>),
+}
+
 /// Prototype partition creation configuration.
 pub struct ProtoPartitionConfig<'a> {
     /// The set of VPs to create.
@@ -316,6 +400,16 @@ pub trait ProtoPartition {
     fn supports_memory_fault_resolution(&self) -> bool {
         false
     }
+
+    /// Configures isolation after the prototype VM exists and before any guest
+    /// memory regions or virtual processors are created.
+    ///
+    /// The VM orchestrator calls this exactly once for every partition,
+    /// including partitions that are not loaded from IGVM.
+    fn configure_isolation(
+        &mut self,
+        config: Option<&IgvmIsolationConfig>,
+    ) -> Result<(), Self::Error>;
 
     /// Constructs the full partition.
     fn build(
