@@ -661,8 +661,8 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
         let igvm_output: BuiltGuest = match &config.image {
             Image::SnpLinuxDirect {
                 linux,
-                processor_count,
-                memory_page_count,
+                processor_topology,
+                vm_layout,
                 c_bit_position,
             } => {
                 if config.max_vtl != 0 {
@@ -690,8 +690,8 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
 
                 R::build_snp_linux_direct(snp_linux_direct::BuildParams {
                     linux,
-                    processor_count: *processor_count,
-                    memory_page_count: *memory_page_count,
+                    processor_topology,
+                    vm_layout,
                     c_bit_position: *c_bit_position,
                     policy: SnpPolicy::from(*policy).with_debug(*enable_debug as u8),
                     resources: &resources,

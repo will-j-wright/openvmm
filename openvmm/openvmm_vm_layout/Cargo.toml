@@ -1,0 +1,24 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "openvmm_vm_layout"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvmm_defs.workspace = true
+
+memory_range.workspace = true
+vm_topology.workspace = true
+vmm_core_defs.workspace = true
+
+anyhow.workspace = true
+cxl_spec.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[build-dependencies]
+build_rs_guest_arch.workspace = true
+
+[lints]
+workspace = true

@@ -3853,12 +3853,15 @@ dependencies = [
  "loader_defs",
  "memory_range",
  "object 0.37.3",
+ "openvmm_vm_layout",
  "product_policy",
  "range_map_vec",
+ "safe_intrinsics",
  "serde",
  "serde_json",
  "signature",
  "test_with_tracing",
+ "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
  "underhill_confidentiality",
@@ -3873,6 +3876,7 @@ dependencies = [
 name = "igvmfilegen_config"
 version = "0.0.0"
 dependencies = [
+ "openvmm_vm_layout",
  "product_policy",
  "serde",
  "serde_json",
@@ -5748,6 +5752,7 @@ dependencies = [
  "missing_dev",
  "openvmm_defs",
  "openvmm_pcat_locator",
+ "openvmm_vm_layout",
  "pal",
  "pal_async",
  "parking_lot",
@@ -6104,6 +6109,20 @@ dependencies = [
  "virtio_resources",
  "vm_resource",
  "vmcore",
+]
+
+[[package]]
+name = "openvmm_vm_layout"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "build_rs_guest_arch",
+ "cxl_spec",
+ "memory_range",
+ "openvmm_defs",
+ "serde",
+ "vm_topology",
+ "vmm_core_defs",
 ]
 
 [[package]]
@@ -6470,6 +6489,7 @@ dependencies = [
  "hvdef",
  "hyperv_ic_resources",
  "ide_resources",
+ "igvmfilegen_config",
  "image",
  "initrd_cpio",
  "inspect",
@@ -6487,6 +6507,7 @@ dependencies = [
  "openvmm_helpers",
  "openvmm_hypervisors",
  "openvmm_pcat_locator",
+ "openvmm_vm_layout",
  "pal",
  "pal_async",
  "parking_lot",
@@ -7811,6 +7832,16 @@ dependencies = [
  "defmt 0.3.100",
  "heapless",
  "managed",
+]
+
+[[package]]
+name = "snp_bootshim"
+version = "0.0.0"
+dependencies = [
+ "loader_defs",
+ "minimal_rt",
+ "minimal_rt_build",
+ "x86defs",
 ]
 
 [[package]]
@@ -10693,6 +10724,9 @@ dependencies = [
  "guid",
  "hvs_file",
  "hyperv_ic_resources",
+ "igvm",
+ "igvm_defs",
+ "igvmfilegen_config",
  "initrd_cpio",
  "inspect",
  "jiff",
@@ -10707,6 +10741,7 @@ dependencies = [
  "openvmm_defs",
  "openvmm_helpers",
  "openvmm_ttrpc_vmservice",
+ "openvmm_vm_layout",
  "pal",
  "pal_async",
  "petri",

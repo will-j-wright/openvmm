@@ -4,8 +4,10 @@
 //! Contains [`PetriVmConfigOpenVmm::new`], which builds a [`PetriVmConfigOpenVmm`] with all
 //! default settings for a given [`Firmware`] and [`MachineArch`].
 
+use super::PendingSnpIgvm;
 use super::PetriVmConfigOpenVmm;
 use super::PetriVmResourcesOpenVmm;
+use super::modify::pcie_root_topology;
 use crate::Drive;
 use crate::EfiDiagnosticsLogLevel;
 use crate::Firmware;
@@ -164,6 +166,9 @@ impl PetriVmConfigOpenVmm {
                 Firmware::LinuxDirect { .. } => {
                     vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect
                 }
+                Firmware::SnpLinuxDirect { .. } => {
+                    vm_manifest_builder::BaseChipsetType::EnlightenedLinuxDirect
+                }
                 Firmware::OpenhclLinuxDirect { .. } => {
                     vm_manifest_builder::BaseChipsetType::HclHost
                 }
@@ -179,6 +184,25 @@ impl PetriVmConfigOpenVmm {
         );
 
         let mut load_mode = setup.load_firmware()?;
+
+        let pending_snp_igvm = match &firmware {
+            Firmware::SnpLinuxDirect {
+                kernel,
+                initrd,
+                igvmfilegen,
+                snp_bootshim,
+            } => Some(PendingSnpIgvm {
+                igvmfilegen: igvmfilegen.get().to_owned(),
+                snp_bootshim: snp_bootshim.get().to_owned(),
+                kernel: kernel.get().to_owned(),
+                initrd: properties
+                    .prebuilt_initrd
+                    .clone()
+                    .unwrap_or_else(|| initrd.get().to_owned()),
+                command_line: setup.linux_direct_command_line(),
+            }),
+            _ => None,
+        };
 
         // If using pipette-as-init, replace the initrd with the pre-built
         // one that has pipette injected. run_core() guarantees that
@@ -581,7 +605,7 @@ impl PetriVmConfigOpenVmm {
             }
         };
 
-        let vmgs = if firmware.is_openhcl() {
+        let vmgs = if firmware.is_openhcl() || matches!(firmware, Firmware::SnpLinuxDirect { .. }) {
             None
         } else {
             Some(memdiff_vmgs(&vmgs).await?)
@@ -656,12 +680,13 @@ impl PetriVmConfigOpenVmm {
 
             // Basic virtualization device support
             hypervisor: HypervisorConfig {
-                with_hv: !properties.no_hv,
+                with_hv: !properties.no_hv && !matches!(firmware, Firmware::SnpLinuxDirect { .. }),
                 with_vtl2,
                 with_isolation: match firmware.isolation() {
                     Some(IsolationType::Vbs) => Some(openvmm_defs::config::IsolationType::Vbs),
+                    Some(IsolationType::Snp) => Some(openvmm_defs::config::IsolationType::Snp),
                     None => None,
-                    _ => anyhow::bail!("unsupported isolation type"),
+                    Some(IsolationType::Tdx) => anyhow::bail!("unsupported isolation type"),
                 },
                 nested_virt: false,
             },
@@ -685,8 +710,12 @@ impl PetriVmConfigOpenVmm {
             // Devices
             floppy_disks: vec![],
             ide_disks,
-            pcie_root_complexes: vec![],
-            pcie_ecam_below_4gb: false,
+            pcie_root_complexes: if matches!(firmware, Firmware::SnpLinuxDirect { .. }) {
+                pcie_root_topology(1, 1, 1)
+            } else {
+                vec![]
+            },
+            pcie_ecam_below_4gb: matches!(firmware, Firmware::SnpLinuxDirect { .. }),
             pcie_devices,
             pcie_switches: vec![],
             pcie_generic_initiators: vec![],
@@ -766,6 +795,7 @@ impl PetriVmConfigOpenVmm {
             framebuffer_view,
 
             pending_iommu: Vec::new(),
+            pending_snp_igvm,
         })
     }
 }
@@ -798,11 +828,36 @@ enum VideoDevice {
 }
 
 impl PetriVmConfigSetupCore<'_> {
+    fn linux_direct_command_line(&self) -> String {
+        let console = match self.arch {
+            MachineArch::X86_64 => "console=ttyS0",
+            MachineArch::Aarch64 => "console=ttyAMA0 earlycon",
+        };
+        let init = if self.uses_pipette_as_init {
+            "/pipette"
+        } else {
+            "/bin/sh"
+        };
+        let serial_args = if self.enable_serial {
+            format!("{console} debug ")
+        } else {
+            String::new()
+        };
+        let vsock_blacklist = if self.use_virtio_vsock {
+            "initcall_blacklist=hv_sock_init"
+        } else {
+            "initcall_blacklist=virtio_vsock_init"
+        };
+        format!("{serial_args}panic=-1 rdinit={init} {vsock_blacklist}")
+    }
+
     fn configure_serial(&self, logger: &PetriLogSource) -> anyhow::Result<SerialData> {
         let mut serial_tasks = Vec::new();
 
         let serial0_log_file = logger.log_file(match self.firmware {
-            Firmware::LinuxDirect { .. } | Firmware::OpenhclLinuxDirect { .. } => "linux",
+            Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
+            | Firmware::OpenhclLinuxDirect { .. } => "linux",
             Firmware::Pcat { .. } | Firmware::OpenhclPcat { .. } => "pcat",
             Firmware::Uefi { .. } | Firmware::OpenhclUefi { .. } => "uefi",
         })?;
@@ -880,11 +935,7 @@ impl PetriVmConfigSetupCore<'_> {
         };
 
         Ok(match (self.arch, &self.firmware) {
-            (arch, Firmware::LinuxDirect { kernel, initrd }) => {
-                let console = match arch {
-                    MachineArch::X86_64 => "console=ttyS0",
-                    MachineArch::Aarch64 => "console=ttyAMA0 earlycon",
-                };
+            (_, Firmware::LinuxDirect { kernel, initrd }) => {
                 let kernel = File::open(kernel.clone())
                     .context("Failed to open kernel")?
                     .into();
@@ -892,19 +943,7 @@ impl PetriVmConfigSetupCore<'_> {
                     .context("Failed to open initrd")?
                     .into();
 
-                let init = if self.uses_pipette_as_init {
-                    "/pipette"
-                } else {
-                    "/bin/sh"
-                };
-
-                let serial_args = if self.enable_serial {
-                    format!("{console} debug ")
-                } else {
-                    String::new()
-                };
-
-                let cmdline = format!("{serial_args}panic=-1 rdinit={init} {vsock_blacklist}");
+                let cmdline = self.linux_direct_command_line();
 
                 LoadMode::Linux {
                     kernel,
@@ -914,6 +953,7 @@ impl PetriVmConfigSetupCore<'_> {
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
                 }
             }
+            (MachineArch::X86_64, Firmware::SnpLinuxDirect { .. }) => LoadMode::None,
             (
                 MachineArch::X86_64,
                 Firmware::Pcat {
@@ -1227,6 +1267,7 @@ impl PetriVmConfigSetupCore<'_> {
                 ))
             }
             Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::LinuxDirect { .. }
             | Firmware::Uefi { .. }
             | Firmware::OpenhclUefi { .. } => None,

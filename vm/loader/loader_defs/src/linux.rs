@@ -295,3 +295,38 @@ pub struct cc_setup_data {
     pub cc_blob_address: u32,
     pub _padding: [u32; 3],
 }
+
+pub const SNP_BOOT_SHIM_PARAMS_MAGIC: u64 = u64::from_le_bytes(*b"SNPBSHIM");
+pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 1;
+const SNP_BOOT_SHIM_PARAMS_HEADER_SIZE: usize = 48;
+pub const SNP_BOOT_SHIM_MAX_RANGES: usize = (hvdef::HV_PAGE_SIZE as usize
+    - SNP_BOOT_SHIM_PARAMS_HEADER_SIZE)
+    / size_of::<SnpBootShimRange>();
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct SnpBootShimRange {
+    pub start_gpn: u64,
+    pub page_count: u64,
+}
+
+#[repr(C, align(4096))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct SnpBootShimParams {
+    pub magic: u64,
+    pub version: u32,
+    pub range_count: u32,
+    pub linux_entry: u64,
+    pub linux_zero_page: u64,
+    pub ram_end: u64,
+    pub reserved: u64,
+    pub ranges: [SnpBootShimRange; SNP_BOOT_SHIM_MAX_RANGES],
+}
+
+const_assert_eq!(size_of::<SnpBootShimRange>(), 16);
+const_assert_eq!(align_of::<SnpBootShimRange>(), 8);
+const_assert_eq!(size_of::<SnpBootShimParams>(), hvdef::HV_PAGE_SIZE as usize);
+const_assert_eq!(
+    align_of::<SnpBootShimParams>(),
+    hvdef::HV_PAGE_SIZE as usize
+);

@@ -4,6 +4,7 @@
 //! Run a pre-built cargo-nextest based VMM tests archive.
 
 use crate::build_guest_test_uefi::GuestTestUefiOutput;
+use crate::build_igvmfilegen::IgvmfilegenOutput;
 use crate::build_incubator::IncubatorOutput;
 use crate::build_nextest_vmm_tests::NextestVmmTestsArchive;
 use crate::build_openhcl_igvm_from_recipe::OpenhclIgvmOutput;
@@ -11,6 +12,7 @@ use crate::build_openvmm::OpenvmmOutput;
 use crate::build_openvmm_vhost::OpenvmmVhostOutput;
 use crate::build_pipette::PipetteOutput;
 use crate::build_prep_steps::PrepStepsOutput;
+use crate::build_snp_bootshim::SnpBootshimOutput;
 use crate::build_test_igvm_agent_rpc_server::TestIgvmAgentRpcServerOutput;
 use crate::build_tmk_vmm::TmkVmmOutput;
 use crate::build_tmks::TmksOutput;
@@ -44,6 +46,8 @@ pub struct VmmTestsDepArtifacts {
     pub tmk_vmm_linux_musl: Option<ReadVar<TmkVmmOutput>>,
     pub vmgstool: Option<ReadVar<VmgstoolOutput>>,
     pub vmgstool_dev: Option<ReadVar<VmgstoolOutput>>,
+    pub igvmfilegen: Option<ReadVar<IgvmfilegenOutput>>,
+    pub snp_bootshim: Option<ReadVar<SnpBootshimOutput>>,
     pub tpm_guest_tests_windows: Option<ReadVar<TpmGuestTestsOutput>>,
     pub tpm_guest_tests_linux: Option<ReadVar<TpmGuestTestsOutput>>,
     pub test_igvm_agent_rpc_server: Option<ReadVar<TestIgvmAgentRpcServerOutput>>,
@@ -188,6 +192,8 @@ impl SimpleFlowNode for Node {
             tmk_vmm_linux_musl: register_tmk_vmm_linux_musl,
             vmgstool: register_vmgstool,
             vmgstool_dev: register_vmgstool_dev,
+            igvmfilegen: register_igvmfilegen,
+            snp_bootshim: register_snp_bootshim,
             tpm_guest_tests_windows: register_tpm_guest_tests_windows,
             tpm_guest_tests_linux: register_tpm_guest_tests_linux,
             test_igvm_agent_rpc_server: register_test_igvm_agent_rpc_server,
@@ -254,6 +260,8 @@ impl SimpleFlowNode for Node {
             register_tmk_vmm_linux_musl,
             register_vmgstool,
             register_vmgstool_dev,
+            register_igvmfilegen,
+            register_snp_bootshim,
             register_tpm_guest_tests_windows,
             register_tpm_guest_tests_linux,
             register_test_igvm_agent_rpc_server,

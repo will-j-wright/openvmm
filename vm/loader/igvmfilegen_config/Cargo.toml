@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 product_policy = { workspace = true, features = ["manifest"] }
+openvmm_vm_layout.workspace = true
 serde = { workspace = true, features = ["std", "derive"] }
 
 [dev-dependencies]

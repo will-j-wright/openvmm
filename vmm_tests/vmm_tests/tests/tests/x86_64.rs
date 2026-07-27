@@ -9,6 +9,21 @@ mod storage;
 
 use anyhow::Context;
 use guid::Guid;
+use igvm::IgvmDirectiveHeader;
+use igvm::IgvmFile;
+use igvm::IgvmInitializationHeader;
+use igvm::IgvmPlatformHeader;
+use igvm_defs::IgvmPlatformType;
+use igvmfilegen_config::Config as IgvmConfig;
+use igvmfilegen_config::ConfigIsolationType;
+use igvmfilegen_config::GuestArch;
+use igvmfilegen_config::GuestConfig;
+use igvmfilegen_config::Image;
+use igvmfilegen_config::LinuxImage;
+use igvmfilegen_config::ResourceType;
+use igvmfilegen_config::Resources;
+use igvmfilegen_config::SecureAvicType;
+use igvmfilegen_config::SnpInjectionType;
 use mesh::CellUpdater;
 use net_backend_resources::mac_address::MacAddress;
 use net_backend_resources::null::NullHandle;
@@ -17,20 +32,188 @@ use nvme_resources::NvmeFaultControllerHandle;
 use nvme_resources::fault::FaultConfiguration;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::VpciDeviceConfig;
+use openvmm_vm_layout::LayoutPlan;
+use openvmm_vm_layout::PcieMmioRangePlan;
+use openvmm_vm_layout::PcieRootComplexPlan;
+use openvmm_vm_layout::VmLayoutPlan;
+use openvmm_vm_layout::X2ApicModePlan;
+use openvmm_vm_layout::X86ProcessorTopologyPlan;
 use petri::ApicMode;
 use petri::PetriHaltReason;
 use petri::PetriVmBuilder;
 use petri::PetriVmmBackend;
 use petri::ProcessorTopology;
+use petri::ResolvedArtifact;
 use petri::openvmm::OpenVmmPetriBackend;
 use petri::pipette::cmd;
+use petri_artifacts_common::tags::MachineArch;
 use petri_artifacts_common::tags::OsFlavor;
+use petri_artifacts_vmm_test::artifacts::host_tools::IGVMFILEGEN_NATIVE;
+use petri_artifacts_vmm_test::artifacts::host_tools::SNP_BOOTSHIM_X64;
+use petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_INITRD_X64;
+use petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_KERNEL_X64;
+use std::ffi::CString;
+use std::process::Command;
 use virtio_resources::VirtioPciDeviceHandle;
 use virtio_resources::net::VirtioNetHandle;
 use vm_resource::IntoResource;
 use vmm_test_macros::openvmm_test;
 use vmm_test_macros::vmm_test;
 use vmm_test_macros::vmm_test_with;
+
+petri::test!(generate_snp_linux_direct_igvm, |resolver| {
+    if !cfg!(target_os = "linux") || MachineArch::host() != MachineArch::X86_64 {
+        return None;
+    }
+
+    Some([
+        resolver.require(IGVMFILEGEN_NATIVE).erase(),
+        resolver.require(SNP_BOOTSHIM_X64).erase(),
+        resolver.require(LINUX_DIRECT_TEST_KERNEL_X64).erase(),
+        resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase(),
+    ])
+});
+
+fn generate_snp_linux_direct_igvm(
+    _params: petri::PetriTestParams<'_>,
+    [igvmfilegen, bootshim, kernel, initrd]: [ResolvedArtifact; 4],
+) -> anyhow::Result<()> {
+    const RAM_SIZE: u64 = 160 * 1024 * 1024;
+
+    let temp_dir = tempfile::tempdir()?;
+    let manifest_path = temp_dir.path().join("manifest.json");
+    let resources_path = temp_dir.path().join("resources.json");
+    let output_path = temp_dir.path().join("snp-linux-direct.bin");
+
+    let manifest = IgvmConfig {
+        guest_arch: GuestArch::X64,
+        guest_configs: vec![GuestConfig {
+            guest_svn: 1,
+            max_vtl: 0,
+            isolation_type: ConfigIsolationType::Snp {
+                shared_gpa_boundary_bits: None,
+                policy: 0x30000,
+                enable_debug: true,
+                injection_type: SnpInjectionType::Normal,
+                secure_avic: SecureAvicType::Disabled,
+            },
+            image: Image::SnpLinuxDirect {
+                linux: LinuxImage {
+                    use_initrd: true,
+                    command_line: CString::new(
+                        "console=ttyS0 panic=-1 rdinit=/pipette initcall_blacklist=hv_sock_init",
+                    )?,
+                },
+                processor_topology: X86ProcessorTopologyPlan {
+                    proc_count: 2,
+                    vps_per_socket: Some(1),
+                    enable_smt: Some(false),
+                    apic_id_offset: 0,
+                    x2apic: X2ApicModePlan::Supported,
+                },
+                vm_layout: VmLayoutPlan {
+                    node_mem_sizes: vec![RAM_SIZE],
+                    layout: LayoutPlan {
+                        chipset_low_mmio_size: 128 * 1024 * 1024,
+                        chipset_high_mmio_size: 0,
+                        vtl2_chipset_mmio_size: 0,
+                    },
+                    pcie_root_complexes: vec![PcieRootComplexPlan {
+                        index: 0,
+                        name: "s0rc0".to_string(),
+                        segment: 0,
+                        start_bus: 0,
+                        end_bus: 255,
+                        low_mmio: PcieMmioRangePlan::Dynamic {
+                            size: 64 * 1024 * 1024,
+                        },
+                        high_mmio: PcieMmioRangePlan::Dynamic {
+                            size: 1024 * 1024 * 1024,
+                        },
+                        cxl: None,
+                        iommu: None,
+                        vnode: None,
+                        preserve_bars: false,
+                    }],
+                    virtio_mmio_count: 0,
+                    pcie_ecam_below_4gb: true,
+                    vtl2_layout: None,
+                    ram_start_address: 0,
+                    vtl2_framebuffer_size: 0,
+                    physical_address_size: 48,
+                },
+                // The no-hardware test must run on hosts without SNP CPUID support.
+                c_bit_position: Some(51),
+            },
+        }],
+    };
+    let resources = Resources::new(std::collections::HashMap::from([
+        (ResourceType::LinuxKernel, kernel.get().to_owned()),
+        (ResourceType::LinuxInitrd, initrd.get().to_owned()),
+        (ResourceType::SnpBootshim, bootshim.get().to_owned()),
+    ]))?;
+
+    fs_err::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs_err::write(&resources_path, serde_json::to_vec_pretty(&resources)?)?;
+
+    let output = Command::new(igvmfilegen.get())
+        .arg("manifest")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--resources")
+        .arg(&resources_path)
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .context("launching igvmfilegen")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "igvmfilegen failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let binary = fs_err::read(&output_path)?;
+    let igvm = IgvmFile::new_from_binary(&binary, Some(igvm::IsolationType::Snp))
+        .context("reparsing generated IGVM")?;
+    let [IgvmPlatformHeader::SupportedPlatform(platform)] = igvm.platforms() else {
+        anyhow::bail!("expected exactly one supported-platform header");
+    };
+    assert_eq!(platform.platform_type, IgvmPlatformType::SEV_SNP);
+    assert_eq!(platform.highest_vtl, 0);
+    assert!(igvm.initializations().iter().any(|header| matches!(
+        header,
+        IgvmInitializationHeader::GuestPolicy { policy, .. } if *policy == 0xb0000
+    )));
+
+    let mut vp_context_count = 0;
+    let mut required_memory = None;
+    let mut saw_mcfg = false;
+    let mut saw_ssdt = false;
+    for directive in igvm.directives() {
+        match directive {
+            IgvmDirectiveHeader::SnpVpContext { .. } => vp_context_count += 1,
+            IgvmDirectiveHeader::RequiredMemory {
+                gpa,
+                number_of_bytes,
+                ..
+            } => {
+                assert_eq!(*gpa, 0);
+                required_memory = Some(u64::from(*number_of_bytes));
+            }
+            IgvmDirectiveHeader::PageData { data, .. } => {
+                saw_mcfg |= data.windows(4).any(|window| window == b"MCFG");
+                saw_ssdt |= data.windows(4).any(|window| window == b"SSDT");
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(vp_context_count, 2);
+    assert_eq!(required_memory, Some(RAM_SIZE));
+    assert!(saw_mcfg, "generated ACPI did not contain an MCFG table");
+    assert!(saw_ssdt, "generated ACPI did not contain a PCIe SSDT");
+    Ok(())
+}
 
 /// Basic boot test with the VTL 0 alias map.
 // TODO: Remove once #73 is fixed.

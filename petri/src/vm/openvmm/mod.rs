@@ -93,6 +93,8 @@ impl PetriVmmBackend for OpenVmmPetriBackend {
 
     fn check_compat(firmware: &Firmware, arch: MachineArch) -> bool {
         arch == MachineArch::host()
+            && !(matches!(firmware, Firmware::SnpLinuxDirect { .. })
+                && (!cfg!(target_os = "linux") || arch != MachineArch::X86_64))
             && !(firmware.is_openhcl() && (!cfg!(windows) || arch == MachineArch::Aarch64))
             && !(firmware.is_pcat() && arch == MachineArch::Aarch64)
     }
@@ -185,6 +187,17 @@ pub struct PetriVmConfigOpenVmm {
     // Deferred IOMMU configuration: (rc_name, iommu_config) pairs resolved
     // against pcie_root_complexes at VM start time.
     pending_iommu: Vec<(String, openvmm_defs::config::PcieIommuConfig)>,
+
+    // Deferred SNP IGVM generation, finalized after backend modifiers.
+    pending_snp_igvm: Option<PendingSnpIgvm>,
+}
+
+struct PendingSnpIgvm {
+    igvmfilegen: PathBuf,
+    snp_bootshim: PathBuf,
+    kernel: PathBuf,
+    initrd: PathBuf,
+    command_line: String,
 }
 /// Various channels and resources used to interact with the VM while it is running.
 struct PetriVmResourcesOpenVmm {

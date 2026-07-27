@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::worker::memory_layout::ChipsetMmioRanges;
 use guestmem::GuestMemory;
 use guid::Guid;
 use hvdef::HV_PAGE_SIZE;
@@ -9,6 +8,7 @@ use loader::importer::Register;
 use loader::uefi::IMAGE_SIZE;
 use loader::uefi::config;
 use openvmm_defs::config::UefiConsoleMode;
+use openvmm_vm_layout::ChipsetMmioRanges;
 use std::io::Read;
 use std::io::Seek;
 use thiserror::Error;

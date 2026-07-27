@@ -53,6 +53,8 @@ pub struct BuildSelections {
     pub tmk_vmm_linux: bool,
     pub vmgstool: bool,
     pub vmgstool_dev: bool,
+    pub igvmfilegen: bool,
+    pub snp_bootshim: bool,
     pub tpm_guest_tests_windows: bool,
     pub tpm_guest_tests_linux: bool,
     pub test_igvm_agent_rpc_server: bool,
@@ -110,12 +112,14 @@ impl SimpleFlowNode for Node {
     fn imports(ctx: &mut ImportCtx<'_>) {
         ctx.import::<crate::build_guest_test_uefi::Node>();
         ctx.import::<crate::build_incubator::Node>();
+        ctx.import::<crate::build_igvmfilegen::Node>();
         ctx.import::<crate::build_nextest_vmm_tests::Node>();
         ctx.import::<crate::build_openhcl_igvm_from_recipe::Node>();
         ctx.import::<crate::build_openvmm::Node>();
         ctx.import::<crate::build_openvmm_vhost::Node>();
         ctx.import::<crate::build_pipette::Node>();
         ctx.import::<crate::build_prep_steps::Node>();
+        ctx.import::<crate::build_snp_bootshim::Node>();
         ctx.import::<crate::build_tmks::Node>();
         ctx.import::<crate::build_tmk_vmm::Node>();
         ctx.import::<crate::build_tpm_guest_tests::Node>();
@@ -164,6 +168,8 @@ impl SimpleFlowNode for Node {
 
         let target_triple = target.as_triple();
         let arch = target.common_arch().unwrap();
+        let host_arch: CommonArch = ctx.arch().try_into()?;
+        let host_platform: CommonPlatform = ctx.platform().try_into()?;
         let arch_tag = match arch {
             CommonArch::X86_64 => "x64",
             CommonArch::Aarch64 => "aarch64",
@@ -624,6 +630,30 @@ impl SimpleFlowNode for Node {
 
         let register_vmgstool_dev = build.vmgstool_dev.then(|| build_vmgstool(true));
 
+        let register_igvmfilegen = build.igvmfilegen.then(|| {
+            ctx.reqv(|v| crate::build_igvmfilegen::Request {
+                build_params: crate::build_igvmfilegen::IgvmfilegenBuildParams {
+                    target: CommonTriple::Common {
+                        arch: host_arch,
+                        platform: host_platform,
+                    },
+                    profile: CommonProfile::from_release(release).into(),
+                },
+                igvmfilegen: v,
+            })
+        });
+
+        let register_snp_bootshim = build.snp_bootshim.then(|| {
+            ctx.reqv(|v| crate::build_snp_bootshim::Request {
+                profile: if release {
+                    crate::build_snp_bootshim::SnpBootshimBuildProfile::Release
+                } else {
+                    crate::build_snp_bootshim::SnpBootshimBuildProfile::Debug
+                },
+                snp_bootshim: v,
+            })
+        });
+
         let nextest_archive = ctx.reqv(|v| crate::build_nextest_vmm_tests::Request {
             target: target.as_triple(),
             profile: CommonProfile::from_release(release),
@@ -717,6 +747,8 @@ impl SimpleFlowNode for Node {
             register_tmk_vmm_linux_musl,
             register_vmgstool,
             register_vmgstool_dev,
+            register_igvmfilegen,
+            register_snp_bootshim,
             register_tpm_guest_tests_windows,
             register_tpm_guest_tests_linux,
             register_test_igvm_agent_rpc_server,

@@ -10,11 +10,13 @@ rust-version.workspace = true
 pipette_client.workspace = true
 
 openvmm_hypervisors = { workspace = true, features = ["virt_kvm", "virt_mshv", "virt_whp", "virt_hvf"] }
+openvmm_vm_layout.workspace = true
 
 petri_artifacts_common.workspace = true
 petri_artifacts_core.workspace = true
 petri_artifacts_vmm_test.workspace = true
 initrd_cpio.workspace = true
+igvmfilegen_config.workspace = true
 chipset_device_worker_defs.workspace = true
 chipset_resources.workspace = true
 diag_client.workspace = true

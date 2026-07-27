@@ -836,6 +836,16 @@ impl ResolvedArtifactSelections {
             }
 
             // Host tools
+            petri_artifacts_vmm_test::artifacts::host_tools::IGVMFILEGEN_WIN_X64::GLOBAL_UNIQUE_ID
+            | petri_artifacts_vmm_test::artifacts::host_tools::IGVMFILEGEN_LINUX_X64::GLOBAL_UNIQUE_ID
+            | petri_artifacts_vmm_test::artifacts::host_tools::IGVMFILEGEN_WIN_AARCH64::GLOBAL_UNIQUE_ID
+            | petri_artifacts_vmm_test::artifacts::host_tools::IGVMFILEGEN_LINUX_AARCH64::GLOBAL_UNIQUE_ID
+            | petri_artifacts_vmm_test::artifacts::host_tools::IGVMFILEGEN_MACOS_AARCH64::GLOBAL_UNIQUE_ID => {
+                self.build.igvmfilegen = true;
+            }
+            petri_artifacts_vmm_test::artifacts::host_tools::SNP_BOOTSHIM_X64::GLOBAL_UNIQUE_ID => {
+                self.build.snp_bootshim = true;
+            }
             petri_artifacts_vmm_test::artifacts::host_tools::TEST_IGVM_AGENT_RPC_SERVER_WINDOWS_X64::GLOBAL_UNIQUE_ID =>
             {
                 self.build.test_igvm_agent_rpc_server = true;

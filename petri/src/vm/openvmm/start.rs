@@ -3,6 +3,7 @@
 
 //! Methods to start a [`PetriVmConfigOpenVmm`] and produce a running [`PetriVmOpenVmm`].
 
+use super::PendingSnpIgvm;
 use super::PetriVmConfigOpenVmm;
 use super::PetriVmOpenVmm;
 use super::PetriVmResourcesOpenVmm;
@@ -11,17 +12,35 @@ use crate::PetriLogFile;
 use crate::PetriVmRuntimeConfig;
 use crate::worker::Worker;
 use anyhow::Context;
+use anyhow::ensure;
+use igvmfilegen_config::Config as IgvmConfig;
+use igvmfilegen_config::ConfigIsolationType;
+use igvmfilegen_config::GuestArch;
+use igvmfilegen_config::GuestConfig;
+use igvmfilegen_config::Image;
+use igvmfilegen_config::LinuxImage;
+use igvmfilegen_config::ResourceType;
+use igvmfilegen_config::Resources;
+use igvmfilegen_config::SecureAvicType;
+use igvmfilegen_config::SnpInjectionType;
 use mesh_process::Mesh;
 use mesh_process::ProcessConfig;
 use mesh_worker::WorkerHost;
 use openvmm_defs::config::DeviceVtl;
+use openvmm_defs::config::IsolationType;
+use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::Vtl2BaseAddressType;
+use openvmm_vm_layout::VmLayoutPlan;
+use openvmm_vm_layout::X86ProcessorTopologyPlan;
 use pal_async::pipe::PolledPipe;
 use pal_async::task::Spawn;
 use petri_artifacts_common::tags::MachineArch;
 use petri_artifacts_common::tags::OsFlavor;
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::io::Write;
+use std::process::Command;
 use std::sync::Arc;
 use vm_resource::IntoResource;
 
@@ -46,6 +65,7 @@ impl PetriVmConfigOpenVmm {
             framebuffer_view,
 
             pending_iommu,
+            pending_snp_igvm,
         } = self;
 
         // Resolve deferred IOMMU assignments.
@@ -56,6 +76,12 @@ impl PetriVmConfigOpenVmm {
                 .find(|rc| rc.name == *name)
                 .with_context(|| format!("IOMMU configured for unknown root complex '{name}'"))?;
             rc.iommu = Some(iommu_config.clone());
+        }
+
+        if let Some(request) = pending_snp_igvm {
+            generate_snp_igvm(&mut config, &resources, request)
+                .await
+                .context("generating SNP Linux-direct IGVM")?;
         }
 
         // TODO: OpenHCL needs virt_whp support
@@ -83,6 +109,152 @@ impl PetriVmConfigOpenVmm {
             config
                 .vmbus_devices
                 .push((DeviceVtl::Vtl2, ged.into_resource()));
+        }
+
+        async fn generate_snp_igvm(
+            config: &mut openvmm_defs::config::Config,
+            resources: &PetriVmResourcesOpenVmm,
+            request: PendingSnpIgvm,
+        ) -> anyhow::Result<()> {
+            ensure!(
+                resources.properties.use_virtio_vsock && resources.properties.no_vmbus,
+                "generated SNP firmware requires virtio-vsock with VMBus disabled"
+            );
+            ensure!(
+                config.hypervisor.with_isolation == Some(IsolationType::Snp),
+                "generated SNP firmware requires SNP isolation"
+            );
+            ensure!(
+                !config.hypervisor.with_hv && config.hypervisor.with_vtl2.is_none(),
+                "generated SNP firmware does not support Hyper-V enlightenments or VTL2"
+            );
+            ensure!(
+                config.vmbus.is_none()
+                    && config.vtl2_vmbus.is_none()
+                    && config.vmbus_devices.is_empty(),
+                "generated SNP firmware does not support VMBus"
+            );
+            ensure!(
+                config.floppy_disks.is_empty()
+                    && config.ide_disks.is_empty()
+                    && config.virtio_devices.is_empty()
+                    && config.vpci_devices.is_empty(),
+                "generated SNP firmware does not support disks or VPCI"
+            );
+            ensure!(
+                config.pcie_switches.is_empty() && config.pcie_generic_initiators.is_empty(),
+                "generated SNP firmware does not support PCIe switches or generic initiators"
+            );
+            ensure!(
+                !config.pcie_root_complexes.is_empty(),
+                "generated SNP firmware requires a PCIe root complex"
+            );
+            ensure!(
+                config
+                    .pcie_root_complexes
+                    .iter()
+                    .all(|root_complex| root_complex.cxl.is_none()
+                        && root_complex.iommu.is_none()
+                        && !root_complex.preserve_bars),
+                "generated SNP firmware does not support CXL, IOMMUs, or pinned PCIe BARs"
+            );
+            ensure!(
+                config.pcie_devices.len() == 1 && config.pcie_devices[0].resource.id() == "virtio",
+                "generated SNP firmware supports only the PCIe virtio-vsock endpoint"
+            );
+            ensure!(
+                config.pcie_root_complexes.iter().any(|root_complex| {
+                    root_complex
+                        .ports
+                        .iter()
+                        .any(|port| port.name == config.pcie_devices[0].port_name)
+                }),
+                "virtio-vsock references a PCIe root port that does not exist"
+            );
+            ensure!(
+                config.framebuffer.is_none() && !config.vtl2_gfx,
+                "generated SNP firmware does not support a framebuffer"
+            );
+
+            let vm_layout = VmLayoutPlan::from_config(config, 48, None)
+                .context("deriving IGVM memory layout")?;
+            let processor_topology =
+                X86ProcessorTopologyPlan::from_config(&config.processor_topology)
+                    .context("deriving IGVM processor topology")?;
+            let manifest = IgvmConfig {
+                guest_arch: GuestArch::X64,
+                guest_configs: vec![GuestConfig {
+                    guest_svn: 1,
+                    max_vtl: 0,
+                    isolation_type: ConfigIsolationType::Snp {
+                        shared_gpa_boundary_bits: None,
+                        policy: 0x30000,
+                        enable_debug: true,
+                        injection_type: SnpInjectionType::Normal,
+                        secure_avic: SecureAvicType::Disabled,
+                    },
+                    image: Image::SnpLinuxDirect {
+                        linux: LinuxImage {
+                            use_initrd: true,
+                            command_line: CString::new(request.command_line)
+                                .context("Linux command line contains a NUL byte")?,
+                        },
+                        processor_topology,
+                        vm_layout,
+                        c_bit_position: None,
+                    },
+                }],
+            };
+            let resources_json = Resources::new(std::collections::HashMap::from([
+                (ResourceType::LinuxKernel, request.kernel),
+                (ResourceType::LinuxInitrd, request.initrd),
+                (ResourceType::SnpBootshim, request.snp_bootshim),
+            ]))
+            .context("building IGVM resource map")?;
+
+            let manifest_path = resources.output_dir.join("generated-snp-manifest.json");
+            let resources_path = resources.output_dir.join("generated-snp-resources.json");
+            let output_path = resources.output_dir.join("generated-snp.bin");
+            fs_err::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).context("serializing IGVM manifest")?,
+            )
+            .context("writing IGVM manifest")?;
+            fs_err::write(
+                &resources_path,
+                serde_json::to_vec_pretty(&resources_json).context("serializing IGVM resources")?,
+            )
+            .context("writing IGVM resources")?;
+
+            let mut command = Command::new(&request.igvmfilegen);
+            command
+                .arg("manifest")
+                .arg("--manifest")
+                .arg(&manifest_path)
+                .arg("--resources")
+                .arg(&resources_path)
+                .arg("--output")
+                .arg(&output_path);
+            let tool_result = crate::run_host_cmd(command).await;
+            fs_err::write(
+                resources.output_dir.join("generated-snp-igvmfilegen.log"),
+                match &tool_result {
+                    Ok(stdout) => stdout.clone(),
+                    Err(error) => format!("{error:#}"),
+                },
+            )
+            .context("writing igvmfilegen output")?;
+            tool_result.context("igvmfilegen failed")?;
+
+            config.load_mode = LoadMode::Igvm {
+                file: fs_err::File::open(&output_path)
+                    .with_context(|| format!("opening generated IGVM {}", output_path.display()))?
+                    .into(),
+                cmdline: String::new(),
+                vtl2_base_address: Vtl2BaseAddressType::File,
+                com_serial: None,
+            };
+            Ok(())
         }
 
         tracing::debug!(?config, "OpenVMM config");

@@ -35,6 +35,74 @@ use openvmm_defs::config::Vtl2BaseAddressType;
 use vm_resource::IntoResource;
 use vmotherboard::ChipsetDeviceHandle;
 
+pub(super) fn pcie_root_topology(
+    segment_count: u64,
+    root_complex_per_segment: u64,
+    root_ports_per_root_complex: u64,
+) -> Vec<PcieRootComplexConfig> {
+    pcie_root_topology_from(
+        0,
+        0,
+        segment_count,
+        root_complex_per_segment,
+        root_ports_per_root_complex,
+    )
+}
+
+fn pcie_root_topology_from(
+    segment_base: u64,
+    index_base: u64,
+    segment_count: u64,
+    root_complex_per_segment: u64,
+    root_ports_per_root_complex: u64,
+) -> Vec<PcieRootComplexConfig> {
+    const LOW_MMIO_SIZE: u64 = 64 * 1024 * 1024;
+    const HIGH_MMIO_SIZE: u64 = 1024 * 1024 * 1024;
+
+    let mut root_complexes = Vec::new();
+    for segment_offset in 0..segment_count {
+        let segment = segment_base + segment_offset;
+        let bus_count_per_rc = 256 / root_complex_per_segment;
+        for rc_index_in_segment in 0..root_complex_per_segment {
+            let index =
+                index_base + segment_offset * root_complex_per_segment + rc_index_in_segment;
+            let name = format!("s{}rc{}", segment, rc_index_in_segment);
+            let start_bus = rc_index_in_segment * bus_count_per_rc;
+            let end_bus = start_bus + bus_count_per_rc - 1;
+            let ports = (0..root_ports_per_root_complex)
+                .map(|i| PciePortConfig {
+                    name: format!("s{}rc{}rp{}", segment, rc_index_in_segment, i),
+                    devfn: None,
+                    hotplug: true,
+                    acs_capabilities_supported: Some(0),
+                    cxl: false,
+                    pasid: false,
+                })
+                .collect();
+
+            root_complexes.push(PcieRootComplexConfig {
+                index: index.try_into().unwrap(),
+                name,
+                segment: segment.try_into().unwrap(),
+                start_bus: start_bus.try_into().unwrap(),
+                end_bus: end_bus.try_into().unwrap(),
+                low_mmio: PcieMmioRangeConfig::Dynamic {
+                    size: LOW_MMIO_SIZE,
+                },
+                high_mmio: PcieMmioRangeConfig::Dynamic {
+                    size: HIGH_MMIO_SIZE,
+                },
+                cxl: None,
+                ports,
+                iommu: None,
+                vnode: None,
+                preserve_bars: false,
+            });
+        }
+    }
+    root_complexes
+}
+
 impl PetriVmConfigOpenVmm {
     /// Enable the VTL0 alias map.
     // TODO: Remove once #912 is fixed.
@@ -404,9 +472,6 @@ impl PetriVmConfigOpenVmm {
         root_complex_per_segment: u64,
         root_ports_per_root_complex: u64,
     ) -> Self {
-        const LOW_MMIO_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
-        const HIGH_MMIO_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
-
         // Offset the segments and global indices added by this call so that it
         // can be called multiple times. New segments are numbered after any
         // existing ones, and the global index continues from the existing
@@ -420,49 +485,15 @@ impl PetriVmConfigOpenVmm {
             .unwrap_or(0);
         let index_base = self.config.pcie_root_complexes.len() as u64;
 
-        // Add the root complexes to the VM
-        for segment_offset in 0..segment_count {
-            let segment = segment_base + segment_offset;
-            let bus_count_per_rc = 256 / root_complex_per_segment;
-            for rc_index_in_segment in 0..root_complex_per_segment {
-                let index =
-                    index_base + segment_offset * root_complex_per_segment + rc_index_in_segment;
-                let name = format!("s{}rc{}", segment, rc_index_in_segment);
-
-                let start_bus = rc_index_in_segment * bus_count_per_rc;
-                let end_bus = start_bus + bus_count_per_rc - 1;
-
-                let ports = (0..root_ports_per_root_complex)
-                    .map(|i| PciePortConfig {
-                        name: format!("s{}rc{}rp{}", segment, rc_index_in_segment, i),
-                        devfn: None,
-                        hotplug: true,
-                        acs_capabilities_supported: Some(0),
-                        cxl: false,
-                        pasid: false,
-                    })
-                    .collect();
-
-                self.config.pcie_root_complexes.push(PcieRootComplexConfig {
-                    index: index.try_into().unwrap(),
-                    name,
-                    segment: segment.try_into().unwrap(),
-                    start_bus: start_bus.try_into().unwrap(),
-                    end_bus: end_bus.try_into().unwrap(),
-                    low_mmio: PcieMmioRangeConfig::Dynamic {
-                        size: LOW_MMIO_SIZE,
-                    },
-                    high_mmio: PcieMmioRangeConfig::Dynamic {
-                        size: HIGH_MMIO_SIZE,
-                    },
-                    cxl: None,
-                    ports,
-                    iommu: None,
-                    vnode: None,
-                    preserve_bars: false,
-                });
-            }
-        }
+        self.config
+            .pcie_root_complexes
+            .extend(pcie_root_topology_from(
+                segment_base,
+                index_base,
+                segment_count,
+                root_complex_per_segment,
+                root_ports_per_root_complex,
+            ));
 
         self
     }

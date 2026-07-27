@@ -66,6 +66,8 @@ impl petri_artifacts_core::ResolveTestArtifact for OpenvmmKnownPathsTestArtifact
             _ if id == OPENVMM_NATIVE => openvmm_native_executable_path(),
             #[cfg(target_os = "linux")]
             _ if id == OPENVMM_VHOST_NATIVE => openvmm_vhost_native_executable_path(),
+            _ if id == host_tools::IGVMFILEGEN_NATIVE => igvmfilegen_native_executable_path(),
+            _ if id == host_tools::SNP_BOOTSHIM_X64 => snp_bootshim_x64_path(),
 
             _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_X64 => linux_direct_x64_test_kernel_path(),
             _ if id == loadable::LINUX_DIRECT_TEST_BZIMAGE_X64 => linux_direct_x64_test_bzimage_path(),
@@ -227,6 +229,12 @@ pub fn resolve_bundle_name(id: ErasedArtifactHandle) -> Option<&'static str> {
         } else {
             "openvmm"
         }),
+        _ if id == host_tools::IGVMFILEGEN_NATIVE => Some(if cfg!(windows) {
+            "igvmfilegen.exe"
+        } else {
+            "igvmfilegen"
+        }),
+        _ if id == host_tools::SNP_BOOTSHIM_X64 => Some("snp_bootshim"),
         _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_X64 => Some("x64/vmlinux"),
         _ if id == loadable::LINUX_DIRECT_TEST_BZIMAGE_X64 => Some("x64/bzImage"),
         _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_AARCH64 => Some("aarch64/Image"),
@@ -370,6 +378,43 @@ fn pipette_path(arch: MachineArch, os_flavor: PipetteFlavor) -> anyhow::Result<P
 /// Path to the output location of the openvmm executable.
 fn openvmm_native_executable_path() -> anyhow::Result<PathBuf> {
     get_output_executable_path("openvmm")
+}
+
+/// Path to the output location of the host-native igvmfilegen executable.
+fn igvmfilegen_native_executable_path() -> anyhow::Result<PathBuf> {
+    get_output_executable_path("igvmfilegen")
+}
+
+/// Path to the output location of the x86_64 SNP bootshim.
+fn snp_bootshim_x64_path() -> anyhow::Result<PathBuf> {
+    let target = "x86_64-unknown-none";
+    let profile = match cargo_build_profile() {
+        "release" => "boot-release",
+        _ => "boot-dev",
+    };
+
+    if let Some(path) = try_get_path(format!("target/{target}/{profile}"), "snp_bootshim")? {
+        return Ok(path);
+    }
+
+    if let Some(path) = flowey_built_executable_path(
+        format!("target/snp_bootshim/{target}/{profile}/deps"),
+        "snp_bootshim",
+    )? {
+        return Ok(path);
+    }
+
+    get_path(
+        format!("target/{target}/{profile}"),
+        "snp_bootshim",
+        MissingCommand::Custom {
+            description: "x86_64 SNP bootshim",
+            cmd: &format!(
+                "RUSTC_BOOTSTRAP=1 CC_FORCE_DISABLE=1 cargo build -p snp_bootshim \
+                 --profile {profile} --target {target}"
+            ),
+        },
+    )
 }
 
 /// Path to the output location of the openvmm_vhost executable.
