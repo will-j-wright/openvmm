@@ -294,6 +294,11 @@ impl SimpleFlowNode for Node {
                     fs_err::copy(bin, output_dir.join("sidecar"))?;
                     fs_err::copy(dbg, output_dir.join("sidecar.dbg"))?;
                 }
+                if let Some(built_bootshim) = openhcl_igvm_extras.snp_bootshim {
+                    let crate::build_snp_bootshim::SnpBootshimOutput { bin, dbg } = built_bootshim;
+                    fs_err::copy(bin, output_dir.join("snp_bootshim"))?;
+                    fs_err::copy(dbg, output_dir.join("snp_bootshim.dbg"))?;
+                }
 
                 let igvm_bin = openhcl_igvm.igvm_bin();
                 fs_err::copy(

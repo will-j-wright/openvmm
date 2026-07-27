@@ -17,15 +17,32 @@ normally creates the resource file that supplies each recipe's binary inputs.
 - SNP C-bit position 51, which is a test-host assumption rather than a portable
   SNP property
 
+The image contains a small measured bootshim. Only pages containing the kernel,
+initrd, boot metadata, SNP special pages, bootshim, or bootshim parameters are
+included as IGVM `PageData`. After SNP launch, the bootshim accepts the remaining
+private RAM with `PVALIDATE` and then enters Linux. This avoids loading and
+measuring every configured RAM page, but still accepts all RAM before Linux
+starts.
+
 To build it manually, create a resources file containing absolute paths:
 
 ```json
 {
     "resources": {
         "linux_kernel": "/absolute/path/to/vmlinux-or-bzImage",
-        "linux_initrd": "/absolute/path/to/initrd"
+        "linux_initrd": "/absolute/path/to/initrd",
+        "snp_bootshim": "/absolute/path/to/snp_bootshim"
     }
 }
+```
+
+Build the bootshim first:
+
+```bash
+MINIMAL_RT_BUILD=1 cargo build \
+  --profile boot-dev \
+  --target x86_64-unknown-none \
+  -p snp_bootshim
 ```
 
 Then run:
@@ -35,6 +52,15 @@ cargo run -p igvmfilegen -- manifest \
   --manifest /absolute/path/to/openvmm/vm/loader/manifests/snp-linux-direct.json \
   --resources /absolute/path/to/snp-linux-direct-resources.json \
   --output /absolute/path/to/snp-linux-direct.bin
+```
+
+Flowey can build the bootshim and populate the resource map automatically:
+
+```bash
+cargo xflowey build-igvm x64-test-linux-direct \
+  --override-manifest \
+  vm/loader/manifests/snp-linux-direct.json \
+  --build-label snp-linux-direct
 ```
 
 The standard outputs are:
