@@ -16,6 +16,7 @@ use crate::build_openvmm_hcl::OpenvmmHclBuildProfile;
 use crate::build_openvmm_hcl::OpenvmmHclFeature;
 use crate::build_openvmm_hcl::OpenvmmHclOutput;
 use crate::build_sidecar::SidecarOutput;
+use crate::build_snp_bootshim::SnpBootshimOutput;
 use crate::common::CommonArch;
 use crate::common::CommonPlatform;
 use crate::common::CommonTriple;
@@ -217,6 +218,8 @@ pub struct OpenhclIgvmExtrasOutput {
     pub openvmm_hcl: OpenvmmHclOutput,
     #[serde(flatten)]
     pub sidecar: Option<SidecarOutput>,
+    #[serde(flatten)]
+    pub snp_bootshim: Option<SnpBootshimOutput>,
     #[serde(rename = "openhcl.bin.map")]
     pub igvm_map: Option<PathBuf>,
 }
@@ -547,6 +550,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::build_openhcl_initrd::Node>();
         ctx.import::<crate::build_openvmm_hcl::Node>();
         ctx.import::<crate::build_sidecar::Node>();
+        ctx.import::<crate::build_snp_bootshim::Node>();
         ctx.import::<crate::resolve_openhcl_kernel_package::Node>();
         ctx.import::<crate::resolve_openvmm_deps::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
@@ -719,6 +723,21 @@ impl SimpleFlowNode for Node {
             None
         };
 
+        let snp_bootshim = match arch {
+            CommonArch::X86_64 => Some(ctx.reqv(|v| crate::build_snp_bootshim::Request {
+                profile: match build_profile {
+                    OpenvmmHclBuildProfile::Debug => {
+                        crate::build_snp_bootshim::SnpBootshimBuildProfile::Debug
+                    }
+                    OpenvmmHclBuildProfile::Release | OpenvmmHclBuildProfile::OpenvmmHclShip => {
+                        crate::build_snp_bootshim::SnpBootshimBuildProfile::Release
+                    }
+                },
+                snp_bootshim: v,
+            })),
+            CommonArch::Aarch64 => None,
+        };
+
         // build openvmm_hcl bin
         let openvmm_hcl = if let Some(ref path) = custom_openvmm_hcl {
             let path = path.clone();
@@ -865,6 +884,7 @@ impl SimpleFlowNode for Node {
         };
 
         let sidecar_bin = sidecar.clone().map(|x| x.map(ctx, |y| y.bin));
+        let snp_bootshim_bin = snp_bootshim.clone().map(|x| x.map(ctx, |y| y.bin));
         let openhcl_boot_bin = openhcl_boot.map(ctx, |x| x.bin);
         let resources = ctx.emit_minor_rust_stepv("enumerate igvm resources", |ctx| {
             claim_vars!(
@@ -874,6 +894,7 @@ impl SimpleFlowNode for Node {
                     kernel,
                     openhcl_boot_bin,
                     sidecar_bin,
+                    snp_bootshim_bin,
                     uefi_resource,
                     vtl0_kernel_resource
                 )
@@ -885,6 +906,9 @@ impl SimpleFlowNode for Node {
                 resources.insert(ResourceType::OpenhclBoot, rt.read(openhcl_boot_bin));
                 if let Some(sidecar_bin) = sidecar_bin {
                     resources.insert(ResourceType::UnderhillSidecar, rt.read(sidecar_bin));
+                }
+                if let Some(snp_bootshim_bin) = snp_bootshim_bin {
+                    resources.insert(ResourceType::SnpBootshim, rt.read(snp_bootshim_bin));
                 }
                 if let Some(uefi_resource) = uefi_resource {
                     uefi_resource.add_to_resources(&mut resources, rt);
@@ -925,13 +949,17 @@ impl SimpleFlowNode for Node {
                     openhcl_boot,
                     openvmm_hcl,
                     sidecar,
+                    snp_bootshim,
                     igvm_map,
                     openhcl_igvm_extras
                 )
             );
 
             |rt| {
-                read_vars!(rt, (openhcl_boot, openvmm_hcl, sidecar, igvm_map));
+                read_vars!(
+                    rt,
+                    (openhcl_boot, openvmm_hcl, sidecar, snp_bootshim, igvm_map)
+                );
 
                 rt.write(
                     openhcl_igvm_extras,
@@ -939,6 +967,7 @@ impl SimpleFlowNode for Node {
                         openhcl_boot,
                         openvmm_hcl,
                         sidecar,
+                        snp_bootshim,
                         igvm_map,
                     },
                 );
