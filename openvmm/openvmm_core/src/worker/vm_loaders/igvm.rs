@@ -109,6 +109,15 @@ pub enum Error {
     MissingRequiredMemory(MemoryRange),
 }
 
+/// Information needed to allocate a VTL2 memory range in the VM memory layout.
+#[derive(Debug, Clone, Copy)]
+pub struct Vtl2MemoryLayoutRequest {
+    /// The number of bytes to reserve for VTL2.
+    pub size: u64,
+    /// The required relocation alignment.
+    pub alignment: u64,
+}
+
 fn from_memory_range(range: &MemoryRange) -> IGVM_VHS_MEMORY_RANGE {
     assert!(range.len().is_multiple_of(HV_PAGE_SIZE));
     IGVM_VHS_MEMORY_RANGE {
@@ -338,15 +347,6 @@ pub fn vtl2_memory_info(igvm_file: &IgvmFile) -> Result<MemoryRange, Error> {
         Some(range) => Ok(range),
         None => Err(Error::Vtl2MemorySource),
     }
-}
-
-/// Information needed to allocate a VTL2 memory range in the VM memory layout.
-#[derive(Debug, Clone, Copy)]
-pub struct Vtl2MemoryLayoutRequest {
-    /// The number of bytes to reserve for VTL2.
-    pub size: u64,
-    /// The required relocation alignment.
-    pub alignment: u64,
 }
 
 /// Determine the VTL2 memory allocation constraints from a provided
