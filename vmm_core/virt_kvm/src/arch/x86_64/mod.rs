@@ -10,6 +10,9 @@ pub(crate) mod snp;
 mod vm_state;
 mod vp_state;
 
+pub(crate) use vp_state::seg_reg;
+pub(crate) use vp_state::table_reg;
+
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
