@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! SEV-SNP initial VMSA conversion.
+//! SEV-SNP launch helpers.
 //!
 //! [`vmsa_from_initial_regs`] is used by the shared direct-boot loader for SNP
 //! backends, including KVM and MSHV. [`state_from_vmsa`] is currently used by
@@ -46,6 +46,54 @@ pub enum SnpVmsaError {
 pub struct SnpVmsaConfig {
     /// Enables restricted interrupt injection.
     pub restricted_injection: bool,
+}
+
+/// Builds the PSP ID block for `id_block` and the launch `policy`.
+pub fn snp_id_block(id_block: &crate::SnpIdBlock, policy: u64) -> x86defs::snp::SnpPspIdBlock {
+    x86defs::snp::SnpPspIdBlock {
+        ld: id_block.launch_digest,
+        family_id: id_block.family_id,
+        image_id: id_block.image_id,
+        version: id_block.version,
+        guest_svn: id_block.guest_svn,
+        policy,
+    }
+}
+
+/// Serializes the PSP ID authentication data for `id_block`.
+pub fn snp_id_auth(id_block: &crate::SnpIdBlock) -> Box<[u8; 4096]> {
+    const ID_BLOCK_SIGNATURE: usize = 64;
+    const ID_KEY: usize = 576;
+    const AUTHOR_KEY_SIGNATURE: usize = 1664;
+    const AUTHOR_KEY: usize = 2176;
+
+    fn write_signature(
+        page: &mut [u8],
+        offset: usize,
+        signature: &x86defs::snp::SnpIdBlockSignature,
+    ) {
+        page[offset..offset + 72].copy_from_slice(&signature.r);
+        page[offset + 72..offset + 144].copy_from_slice(&signature.s);
+    }
+
+    fn write_public_key(page: &mut [u8], offset: usize, key: &x86defs::snp::SnpIdBlockPublicKey) {
+        page[offset..offset + 4].copy_from_slice(&key.curve.to_le_bytes());
+        page[offset + 4..offset + 76].copy_from_slice(&key.qx);
+        page[offset + 76..offset + 148].copy_from_slice(&key.qy);
+    }
+
+    let mut page = Box::new([0; 4096]);
+    page[0..4].copy_from_slice(&id_block.id_key_algorithm.to_le_bytes());
+    page[4..8].copy_from_slice(&id_block.author_key_algorithm.to_le_bytes());
+    write_signature(&mut *page, ID_BLOCK_SIGNATURE, &id_block.id_key_signature);
+    write_public_key(&mut *page, ID_KEY, &id_block.id_public_key);
+    write_signature(
+        &mut *page,
+        AUTHOR_KEY_SIGNATURE,
+        &id_block.author_key_signature,
+    );
+    write_public_key(&mut *page, AUTHOR_KEY, &id_block.author_public_key);
+    page
 }
 
 /// Builds the direct-boot SNP VMSA corresponding to `initial`.
@@ -193,6 +241,91 @@ fn table_from_vmsa(selector: SevSelector) -> TableRegister {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_id_block() -> crate::SnpIdBlock {
+        crate::SnpIdBlock {
+            author_key_enabled: 1,
+            launch_digest: [0x11; 48],
+            family_id: [0x22; 16],
+            image_id: [0x33; 16],
+            version: 1,
+            guest_svn: 7,
+            id_key_algorithm: 0x01020304,
+            author_key_algorithm: 0x05060708,
+            id_key_signature: x86defs::snp::SnpIdBlockSignature {
+                r: [0x44; 72],
+                s: [0x55; 72],
+            },
+            id_public_key: x86defs::snp::SnpIdBlockPublicKey {
+                curve: 2,
+                qx: [0x66; 72],
+                qy: [0x77; 72],
+            },
+            author_key_signature: x86defs::snp::SnpIdBlockSignature {
+                r: [0x88; 72],
+                s: [0x99; 72],
+            },
+            author_public_key: x86defs::snp::SnpIdBlockPublicKey {
+                curve: 3,
+                qx: [0xaa; 72],
+                qy: [0xbb; 72],
+            },
+        }
+    }
+
+    #[test]
+    fn snp_id_block_preserves_fields_and_policy() {
+        let source = test_id_block();
+        let id_block = snp_id_block(&source, 0x1234);
+
+        assert_eq!(id_block.ld, source.launch_digest);
+        assert_eq!(id_block.family_id, source.family_id);
+        assert_eq!(id_block.image_id, source.image_id);
+        assert_eq!(id_block.version, source.version);
+        assert_eq!(id_block.guest_svn, source.guest_svn);
+        assert_eq!(id_block.policy, 0x1234);
+    }
+
+    #[test]
+    fn snp_id_auth_serializes_algorithms() {
+        let id_block = test_id_block();
+        let id_auth = snp_id_auth(&id_block);
+
+        assert_eq!(&id_auth[0..4], &id_block.id_key_algorithm.to_le_bytes());
+        assert_eq!(&id_auth[4..8], &id_block.author_key_algorithm.to_le_bytes());
+    }
+
+    #[test]
+    fn snp_id_auth_serializes_signatures_and_keys_at_psp_offsets() {
+        let id_block = test_id_block();
+        let id_auth = snp_id_auth(&id_block);
+
+        assert_eq!(&id_auth[64..136], &id_block.id_key_signature.r);
+        assert_eq!(&id_auth[136..208], &id_block.id_key_signature.s);
+        assert_eq!(
+            &id_auth[576..580],
+            &id_block.id_public_key.curve.to_le_bytes()
+        );
+        assert_eq!(&id_auth[580..652], &id_block.id_public_key.qx);
+        assert_eq!(&id_auth[652..724], &id_block.id_public_key.qy);
+        assert_eq!(&id_auth[1664..1736], &id_block.author_key_signature.r);
+        assert_eq!(&id_auth[1736..1808], &id_block.author_key_signature.s);
+        assert_eq!(
+            &id_auth[2176..2180],
+            &id_block.author_public_key.curve.to_le_bytes()
+        );
+        assert_eq!(&id_auth[2180..2252], &id_block.author_public_key.qx);
+        assert_eq!(&id_auth[2252..2324], &id_block.author_public_key.qy);
+    }
+
+    #[test]
+    fn snp_id_auth_zero_pads_reserved_bytes() {
+        let id_auth = snp_id_auth(&test_id_block());
+
+        for reserved in [8..64, 208..576, 724..1664, 1808..2176, 2324..4096] {
+            assert!(id_auth[reserved].iter().all(|&byte| byte == 0));
+        }
+    }
 
     #[test]
     fn direct_boot_vmsa_round_trips() {
