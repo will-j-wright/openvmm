@@ -8,7 +8,6 @@ mod vp_state;
 
 use crate::Error;
 use crate::ErrorInner;
-use crate::KernelError;
 use crate::LinuxMshv;
 use crate::MshvPartition;
 use crate::MshvPartitionInner;
@@ -74,51 +73,34 @@ impl virt::Hypervisor for LinuxMshv {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
-        if config.isolation.is_isolated() {
-            return Err(ErrorInner::IsolationNotSupported.into());
-        }
-
-        // Build partition creation flags. LAPIC is always enabled (the
-        // hypervisor emulates the local APIC). X2APIC is only enabled when
-        // the topology requests it.
-        let mut pt_flags: u64 = 1 << mshv_bindings::MSHV_PT_BIT_LAPIC
-            | 1 << mshv_bindings::MSHV_PT_BIT_GPA_SUPER_PAGES
-            | 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES;
-
-        match config.processor_topology.apic_mode() {
-            vm_topology::processor::x86::ApicMode::X2ApicSupported
-            | vm_topology::processor::x86::ApicMode::X2ApicEnabled => {
-                pt_flags |= 1 << mshv_bindings::MSHV_PT_BIT_X2APIC;
-            }
-            vm_topology::processor::x86::ApicMode::XApic => {}
-        }
-
-        if config.processor_topology.smt_enabled() {
-            pt_flags |= 1 << mshv_bindings::MSHV_PT_BIT_SMT_ENABLED_GUEST;
-        }
-
-        let create_args = mshv_bindings::mshv_create_partition_v2 {
-            pt_flags,
-            pt_isolation: mshv_bindings::MSHV_PT_ISOLATION_NONE as u64,
-            pt_num_cpu_fbanks: mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16,
-            pt_cpu_fbanks: [
-                !u64::from(supported_processor_features()),
-                !u64::from(supported_processor_features1()),
-            ],
-            pt_disabled_xsave: !u64::from(supported_xsave_features()),
-            ..Default::default()
+        let snp = match config.isolation {
+            virt::IsolationType::None => false,
+            virt::IsolationType::Snp => true,
+            _ => return Err(ErrorInner::IsolationNotSupported.into()),
         };
+        let x2apic = matches!(
+            config.processor_topology.apic_mode(),
+            vm_topology::processor::x86::ApicMode::X2ApicSupported
+                | vm_topology::processor::x86::ApicMode::X2ApicEnabled
+        );
+        let create_args =
+            partition_create_args(snp, x2apic, config.processor_topology.smt_enabled());
 
         let vmfd = create_vm_with_retry(&self.mshv, &create_args)?;
 
         // Set synthetic processor features before initialization when the
-        // guest interface is configured.
-        if config.hv_config.is_some() {
-            let synthetic_features = common_synthetic_features()
-                .with_access_partition_reference_tsc(true)
-                .with_access_guest_idle_reg(true)
-                .with_access_frequency_regs(true)
-                .with_enable_extended_gva_ranges_for_flush_virtual_address_list(true);
+        // guest interface is configured. SNP partitions require the smaller
+        // early-property feature set accepted by the hypervisor.
+        if config.hv_config.is_some() || snp {
+            let synthetic_features = if snp {
+                snp_synthetic_features()
+            } else {
+                common_synthetic_features()
+                    .with_access_partition_reference_tsc(true)
+                    .with_access_guest_idle_reg(true)
+                    .with_access_frequency_regs(true)
+                    .with_enable_extended_gva_ranges_for_flush_virtual_address_list(true)
+            };
 
             vmfd.set_partition_property(
                 HvPartitionPropertyCode::SyntheticProcFeatures.0,
@@ -130,6 +112,31 @@ impl virt::Hypervisor for LinuxMshv {
         vmfd.initialize()
             .map_err(|e| ErrorInner::CreateVMInitFailed(e.into()))?;
 
+        if snp {
+            let snp_policy = mshv_bindings::snp::get_default_snp_guest_policy();
+            let vmgexit_offloads = mshv_bindings::snp::get_default_vmgexit_offload_features();
+            // SAFETY: These generated C unions always contain a valid u64 view.
+            let (snp_policy, vmgexit_offloads) =
+                unsafe { (snp_policy.as_uint64, vmgexit_offloads.as_uint64) };
+
+            for (code, value) in [
+                (HvPartitionPropertyCode::IsolationPolicy, snp_policy),
+                (
+                    HvPartitionPropertyCode::SevVmgexitOffloads,
+                    vmgexit_offloads,
+                ),
+                (
+                    HvPartitionPropertyCode::UnimplementedMsrAction,
+                    mshv_bindings::hv_unimplemented_msr_action_HV_UNIMPLEMENTED_MSR_ACTION_IGNORE_WRITE_READ_ZERO
+                        as u64,
+                ),
+                (HvPartitionPropertyCode::TimeFreeze, 1),
+            ] {
+                vmfd.set_partition_property(code.0, value)
+                    .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
+            }
+        }
+
         // Tell the hypervisor how many VPs are in each socket.
         vmfd.set_partition_property(
             HvPartitionPropertyCode::ProcessorsPerSocket.0,
@@ -139,6 +146,60 @@ impl virt::Hypervisor for LinuxMshv {
 
         MshvProtoPartition::new(config, vmfd)
     }
+}
+
+fn partition_create_args(
+    snp: bool,
+    x2apic: bool,
+    smt: bool,
+) -> mshv_bindings::mshv_create_partition_v2 {
+    let mut pt_flags =
+        1 << mshv_bindings::MSHV_PT_BIT_LAPIC | 1 << mshv_bindings::MSHV_PT_BIT_GPA_SUPER_PAGES;
+
+    if snp || x2apic {
+        pt_flags |= 1 << mshv_bindings::MSHV_PT_BIT_X2APIC;
+    }
+    if smt {
+        pt_flags |= 1 << mshv_bindings::MSHV_PT_BIT_SMT_ENABLED_GUEST;
+    }
+
+    if snp {
+        mshv_bindings::mshv_create_partition_v2 {
+            pt_flags,
+            pt_isolation: mshv_bindings::MSHV_PT_ISOLATION_SNP as u64,
+            ..Default::default()
+        }
+    } else {
+        mshv_bindings::mshv_create_partition_v2 {
+            pt_flags: pt_flags | 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
+            pt_isolation: mshv_bindings::MSHV_PT_ISOLATION_NONE as u64,
+            pt_num_cpu_fbanks: mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16,
+            pt_cpu_fbanks: [
+                !u64::from(supported_processor_features()),
+                !u64::from(supported_processor_features1()),
+            ],
+            pt_disabled_xsave: !u64::from(supported_xsave_features()),
+            ..Default::default()
+        }
+    }
+}
+
+fn snp_synthetic_features() -> hvdef::HvPartitionSyntheticProcessorFeatures {
+    hvdef::HvPartitionSyntheticProcessorFeatures::new()
+        .with_hypervisor_present(true)
+        .with_hv1(true)
+        .with_access_partition_reference_counter(true)
+        .with_access_synic_regs(true)
+        .with_access_synthetic_timer_regs(true)
+        .with_access_partition_reference_tsc(true)
+        .with_access_frequency_regs(true)
+        .with_access_intr_ctrl_regs(true)
+        .with_access_vp_index(true)
+        .with_access_hypercall_regs(true)
+        .with_access_guest_idle_reg(true)
+        .with_tb_flush_hypercalls(true)
+        .with_synthetic_cluster_ipi(true)
+        .with_direct_synthetic_timers(true)
 }
 
 impl MshvProtoPartition<'_> {
@@ -172,7 +233,9 @@ impl MshvProtoPartition<'_> {
             .get_partition_property(HvPartitionPropertyCode::MaxXsaveDataSize.0)
             .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))?;
 
-        let reset_rdx = {
+        let reset_rdx = if self.config.isolation == virt::IsolationType::Snp {
+            0
+        } else {
             let mut assoc = [HvRegisterAssoc::from((HvX64RegisterName::Rdx, 0u64))];
             self.bsp
                 .get_hvdef_regs(&mut assoc)
@@ -209,7 +272,11 @@ impl MshvProtoPartition<'_> {
             sgx: false,
             tsc_aux: false,
             vtom: None,
-            physical_address_width: self.max_physical_address_size(),
+            physical_address_width: self
+                .vmfd
+                .get_partition_property(HvPartitionPropertyCode::PhysicalAddressWidth.0)
+                .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))?
+                as u8,
             snp_c_bit: None,
             can_freeze_time: false,
             xsaves_state_bv_broken: false,
@@ -280,20 +347,28 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         }
 
         let caps = {
-            let mut caps = match self.bsp.get_cpuid_values(0, 0, 0, 0) {
-                Ok(_) => virt::PartitionCapabilities::from_cpuid(
-                    self.config.processor_topology,
-                    &mut |function, index| {
-                        self.bsp
-                            .get_cpuid_values(function, index, 0, 0)
-                            .map_err(KernelError::from)
-                            .expect("cpuid should not fail")
-                    },
-                )
-                .map_err(ErrorInner::Capabilities)?,
-                Err(_) => {
+            let mut cpuid_error = None;
+            let cpuid_caps = virt::PartitionCapabilities::from_cpuid(
+                self.config.processor_topology,
+                &mut |function, index| {
+                    self.bsp
+                        .get_cpuid_values(function, index, 0, 0)
+                        .unwrap_or_else(|err| {
+                            cpuid_error.get_or_insert(err);
+                            [0; 4]
+                        })
+                },
+            );
+            let mut caps = match (cpuid_caps, cpuid_error) {
+                (Ok(caps), None) => caps,
+                (result, error) => {
                     tracing::warn!(
-                        "failed to query CPUID, falling back to partition properties, some features may be unavailable"
+                        error = error.as_ref().map(|err| err as &dyn std::error::Error),
+                        capabilities_error = result
+                            .err()
+                            .as_ref()
+                            .map(|err| err as &dyn std::error::Error),
+                        "failed to query CPUID capabilities, falling back to partition properties; some features may be unavailable"
                     );
                     self.caps_from_properties()?
                 }
@@ -325,7 +400,9 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             synic_ports: Default::default(),
             cpuid,
             software_devices: ApicSoftwareDevices::new(apic_id_map),
-            time_frozen: Mutex::new(false),
+            isolation: self.config.isolation,
+            // SNP partition creation set TimeFreeze=1 before this object was built.
+            time_frozen: Mutex::new(self.config.isolation.is_isolated()),
         });
 
         let partition = MshvPartition {
@@ -345,6 +422,59 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             .collect();
 
         Ok((partition, vps))
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn snp_partition_creation_uses_isolation_flags() {
+        let args = partition_create_args(true, false, false);
+        let pt_isolation = args.pt_isolation;
+        let pt_num_cpu_fbanks = args.pt_num_cpu_fbanks;
+
+        assert_eq!(pt_isolation, mshv_bindings::MSHV_PT_ISOLATION_SNP as u64);
+        assert_ne!(args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_LAPIC, 0);
+        assert_ne!(
+            args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_GPA_SUPER_PAGES,
+            0
+        );
+        assert_ne!(args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_X2APIC, 0);
+        assert_eq!(
+            args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
+            0
+        );
+        assert_eq!(pt_num_cpu_fbanks, 0);
+    }
+
+    #[test]
+    fn ordinary_partition_creation_keeps_feature_banks() {
+        let args = partition_create_args(false, false, true);
+        let pt_isolation = args.pt_isolation;
+        let pt_num_cpu_fbanks = args.pt_num_cpu_fbanks;
+
+        assert_eq!(pt_isolation, mshv_bindings::MSHV_PT_ISOLATION_NONE as u64);
+        assert_ne!(
+            args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
+            0
+        );
+        assert_ne!(
+            args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_SMT_ENABLED_GUEST,
+            0
+        );
+        assert_eq!(args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_X2APIC, 0);
+        assert_ne!(
+            args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_GPA_SUPER_PAGES,
+            0
+        );
+        assert_eq!(
+            pt_num_cpu_fbanks,
+            mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16
+        );
     }
 }
 

@@ -259,6 +259,8 @@ struct MshvPartitionInner {
     cpuid: virt::CpuidLeafSet,
     #[cfg(guest_arch = "x86_64")]
     software_devices: virt::x86::apic_software_device::ApicSoftwareDevices,
+    #[cfg(guest_arch = "x86_64")]
+    isolation: virt::IsolationType,
     /// Set to `true` when partition time is frozen (e.g. during reset).
     /// The first VP to enter `run_vp` after a freeze will thaw time.
     time_frozen: Mutex<bool>,
@@ -693,9 +695,6 @@ enum ErrorInner {
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to register cpuid override")]
     RegisterCpuid(#[source] KernelError),
-    #[cfg(guest_arch = "x86_64")]
-    #[error("host does not support required cpu capabilities")]
-    Capabilities(#[source] virt::PartitionCapabilitiesError),
     #[error("too many virtual processors: {0}")]
     TooManyVps(u32),
     #[cfg(guest_arch = "x86_64")]
