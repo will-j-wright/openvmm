@@ -268,9 +268,6 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 if shared_gpa_boundary_bits.is_some() {
                     bail!("snp_linux_direct does not support a shared GPA boundary");
                 }
-                if !matches!(injection_type, SnpInjectionType::Normal) {
-                    bail!("snp_linux_direct requires normal interrupt injection");
-                }
                 if !matches!(secure_avic, SecureAvicType::Disabled) {
                     bail!("snp_linux_direct requires secure AVIC to be disabled");
                 }
@@ -282,6 +279,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                     c_bit_position: *c_bit_position,
                     guest_svn: config.guest_svn,
                     policy: SnpPolicy::from(*policy).with_debug(*enable_debug as u8),
+                    injection_type,
                     resources: &resources,
                 })?
             }

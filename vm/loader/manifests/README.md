@@ -19,12 +19,23 @@ normally creates the resource file that supplies each recipe's binary inputs.
 - SNP C-bit position 51 for reproducible checked-in profiles; omitting
   `c_bit_position` makes `igvmfilegen` derive it from host SEV-SNP CPUID
 
+The normal-injection output is a shared artifact: the same binary is intended
+to boot on KVM and MSHV. Its `SnpVpContext` uses the SNP initial-VMSA GPA
+`0xffff_ffff_f000`. KVM synthesizes its measured VMSA at that GPA, while MSHV
+maps and imports the file-provided VMSA there. Both backends submit the policy
+and SNP ID block encoded in the file.
+
+MSHV currently supports only the one-processor profile. The multi-processor
+profile remains available for KVM. The
+`snp-linux-direct-restricted.json` profile uses the same IGVM encoding with
+restricted interrupt injection and is intended only for MSHV bring-up.
+
 The image contains a small measured bootshim. Only pages containing the kernel,
 initrd, boot metadata, SNP special pages, bootshim, or bootshim parameters are
-included as IGVM `PageData`. After SNP launch, the bootshim accepts the remaining
-private RAM with `PVALIDATE` and then enters Linux. This avoids loading and
-measuring every configured RAM page, but still accepts all RAM before Linux
-starts.
+included as IGVM `PageData`. After SNP launch, the bootshim accepts the
+remaining private RAM with `PVALIDATE` and then enters Linux. This avoids
+loading and measuring every configured RAM page, but still accepts all RAM
+before Linux starts.
 
 Petri uses the same schema to generate a test-local IGVM after all OpenVMM
 backend modifiers have been applied. The final OpenVMM CPU, RAM, chipset, and
@@ -63,8 +74,9 @@ MINIMAL_RT_BUILD=1 cargo build \
 Then run:
 
 ```bash
+repo=/absolute/path/to/openvmm
 cargo run -p igvmfilegen -- manifest \
-  --manifest /absolute/path/to/openvmm/vm/loader/manifests/snp-linux-direct.json \
+  --manifest "$repo/vm/loader/manifests/snp-linux-direct.json" \
   --resources /absolute/path/to/snp-linux-direct-resources.json \
   --output /absolute/path/to/snp-linux-direct.bin
 ```
@@ -77,6 +89,10 @@ cargo xflowey build-igvm x64-test-linux-direct \
   vm/loader/manifests/snp-linux-direct.json \
   --build-label snp-linux-direct
 ```
+
+Build the MSHV restricted-injection variant by substituting
+`vm/loader/manifests/snp-linux-direct-restricted.json` and a distinct build
+label.
 
 The standard outputs are:
 

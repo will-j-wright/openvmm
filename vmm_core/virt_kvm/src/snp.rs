@@ -234,8 +234,8 @@ impl KvmPartitionInner {
             .as_ref()
             .and_then(|config| config.generic.identity.as_ref())
         {
-            let id_block = snp_id_block(identity, launch_start.policy);
-            let id_auth = snp_id_auth(identity);
+            let id_block = virt::x86::snp::snp_id_block(identity, launch_start.policy);
+            let id_auth = virt::x86::snp::snp_id_auth(identity);
             let mut finish = kvm::kvm_sev_snp_launch_finish {
                 id_block_uaddr: id_block.as_bytes().as_ptr() as u64,
                 id_auth_uaddr: id_auth.as_ptr() as u64,
@@ -355,48 +355,6 @@ impl KvmPartitionInner {
 
         Ok(())
     }
-}
-
-fn snp_id_block(identity: &virt::SnpIdentity, policy: u64) -> x86defs::snp::SnpPspIdBlock {
-    x86defs::snp::SnpPspIdBlock {
-        ld: identity.launch_digest,
-        family_id: identity.family_id,
-        image_id: identity.image_id,
-        version: identity.version,
-        guest_svn: identity.guest_svn,
-        policy,
-    }
-}
-
-fn snp_id_auth(identity: &virt::SnpIdentity) -> Box<[u8; 4096]> {
-    const ID_BLOCK_SIGNATURE: usize = 64;
-    const ID_KEY: usize = 576;
-    const AUTHOR_KEY_SIGNATURE: usize = 1664;
-    const AUTHOR_KEY: usize = 2176;
-
-    fn write_signature(page: &mut [u8], offset: usize, signature: &virt::SnpIdBlockSignature) {
-        page[offset..offset + 72].copy_from_slice(&signature.r);
-        page[offset + 72..offset + 144].copy_from_slice(&signature.s);
-    }
-
-    fn write_public_key(page: &mut [u8], offset: usize, key: &virt::SnpIdBlockPublicKey) {
-        page[offset..offset + 4].copy_from_slice(&key.curve.to_le_bytes());
-        page[offset + 4..offset + 76].copy_from_slice(&key.qx);
-        page[offset + 76..offset + 148].copy_from_slice(&key.qy);
-    }
-
-    let mut page = Box::new([0; 4096]);
-    page[0..4].copy_from_slice(&identity.id_key_algorithm.to_le_bytes());
-    page[4..8].copy_from_slice(&identity.author_key_algorithm.to_le_bytes());
-    write_signature(&mut *page, ID_BLOCK_SIGNATURE, &identity.id_key_signature);
-    write_public_key(&mut *page, ID_KEY, &identity.id_public_key);
-    write_signature(
-        &mut *page,
-        AUTHOR_KEY_SIGNATURE,
-        &identity.author_key_signature,
-    );
-    write_public_key(&mut *page, AUTHOR_KEY, &identity.author_public_key);
-    page
 }
 
 fn segment_from_vmsa(segment: x86defs::snp::SevSelector) -> kvm::kvm_segment {
@@ -691,37 +649,6 @@ mod tests {
         snp_config_with_contexts(vec![vp_context(0, page)])
     }
 
-    fn test_identity() -> virt::SnpIdentity {
-        virt::SnpIdentity {
-            author_key_enabled: 1,
-            launch_digest: [0x11; 48],
-            family_id: [0x22; 16],
-            image_id: [0x33; 16],
-            version: 1,
-            guest_svn: 7,
-            id_key_algorithm: 1,
-            author_key_algorithm: 2,
-            id_key_signature: virt::SnpIdBlockSignature {
-                r: [0x44; 72],
-                s: [0x55; 72],
-            },
-            id_public_key: virt::SnpIdBlockPublicKey {
-                curve: 2,
-                qx: [0x66; 72],
-                qy: [0x77; 72],
-            },
-            author_key_signature: virt::SnpIdBlockSignature {
-                r: [0x88; 72],
-                s: [0x99; 72],
-            },
-            author_public_key: virt::SnpIdBlockPublicKey {
-                curve: 3,
-                qx: [0xaa; 72],
-                qy: [0xbb; 72],
-            },
-        }
-    }
-
     #[test]
     fn propagates_supported_nonzero_vmsa_features() {
         let features = x86defs::snp::SevFeatures::new()
@@ -777,26 +704,6 @@ mod tests {
                 "VP contexts have inconsistent VMSA features"
             ))
         ));
-    }
-
-    #[test]
-    fn converts_snp_identity_without_recomputing_digest() {
-        let identity = test_identity();
-        let id_block = snp_id_block(&identity, 0x1234);
-        assert_eq!(id_block.ld, identity.launch_digest);
-        assert_eq!(id_block.policy, 0x1234);
-        assert_eq!(id_block.guest_svn, 7);
-
-        let auth = snp_id_auth(&identity);
-        assert_eq!(&auth[0..4], &1u32.to_le_bytes());
-        assert_eq!(&auth[4..8], &2u32.to_le_bytes());
-        assert_eq!(&auth[64..136], &[0x44; 72]);
-        assert_eq!(&auth[136..208], &[0x55; 72]);
-        assert_eq!(&auth[576..580], &2u32.to_le_bytes());
-        assert_eq!(&auth[580..652], &[0x66; 72]);
-        assert_eq!(&auth[652..724], &[0x77; 72]);
-        assert_eq!(&auth[1664..1736], &[0x88; 72]);
-        assert_eq!(&auth[2176..2180], &3u32.to_le_bytes());
     }
 
     #[test]

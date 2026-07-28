@@ -205,6 +205,10 @@ impl<'a> MshvProtoPartition<'a> {
             vmfd,
             vps,
             bsp,
+            #[cfg(guest_arch = "x86_64")]
+            snp_config: None,
+            #[cfg(guest_arch = "x86_64")]
+            isolation_configured: false,
         })
     }
 }
@@ -224,6 +228,10 @@ pub struct MshvProtoPartition<'a> {
     vmfd: VmFd,
     vps: Vec<MshvVpInner>,
     bsp: VcpuFd,
+    #[cfg(guest_arch = "x86_64")]
+    snp_config: Option<Arc<arch::MshvSnpConfig>>,
+    #[cfg(guest_arch = "x86_64")]
+    isolation_configured: bool,
 }
 
 /// A partition running on the /dev/mshv hypervisor.
@@ -263,6 +271,9 @@ struct MshvPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     snp_sev_features: Mutex<Option<u64>>,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    snp_config: Option<Arc<arch::MshvSnpConfig>>,
     isolation: virt::IsolationType,
     /// Set to `true` when partition time is frozen (e.g. during reset).
     /// The first VP to enter `run_vp` after a freeze will thaw time.
@@ -707,6 +718,36 @@ enum ErrorInner {
     Vtl2NotSupported,
     #[error("isolation not supported")]
     IsolationNotSupported,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("partition isolation configuration changed after prototype creation")]
+    IsolationConfigurationMismatch,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("partition isolation configuration was already supplied")]
+    IsolationConfigurationAlreadySet,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("partition isolation configuration was not supplied before build")]
+    IsolationConfigurationMissing,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("SNP IGVM requests unsupported highest VTL {0}")]
+    UnsupportedSnpVtl(u8),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("SNP IGVM requests unsupported shared GPA boundary {0:#x}")]
+    UnsupportedSnpSharedGpaBoundary(u64),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("MSHV does not support SNP IGVM relocation")]
+    SnpIgvmRelocationUnsupported,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("SNP IGVM VP contexts do not match the configured virtual processors")]
+    InvalidSnpIgvmTopology,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("invalid SNP IGVM VMSA")]
+    InvalidSnpIgvmVmsa,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("SNP IGVM VMSA GPA {0:#x} is invalid")]
+    InvalidSnpVmsaGpa(u64),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("SNP IGVM VMSA overlaps configured guest RAM")]
+    SnpVmsaOverlapsRam,
     #[error("failed to stat /dev/mshv")]
     AvailableCheck(#[source] io::Error),
     #[cfg(guest_arch = "x86_64")]
@@ -732,6 +773,9 @@ enum ErrorInner {
     #[cfg(guest_arch = "x86_64")]
     #[error("multiple SNP VMSA imports")]
     MultipleSnpVmsa,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("loader supplied an SNP VMSA for a metadata-backed IGVM launch")]
+    UnexpectedSnpVmsaImport,
     #[cfg(guest_arch = "x86_64")]
     #[error("missing SNP CPUID import")]
     MissingSnpCpuid,

@@ -78,15 +78,30 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `snp`.
 
   SNP support is currently limited to Linux direct boot and is intended for
-  bring-up. MSHV SNP can expose Hyper-V enlightenments with `--hv --no-vmbus`;
-  VMBus devices remain unsupported. SNP does not support UEFI, VTL2, or
-  hugetlb-backed memory. In addition to the minimal emulated chipset and serial
-  console, optional devices are limited to virtio devices attached through
-  PCIe.
+  bring-up. It supports either loader-based kernel/initrd boot or an SNP IGVM
+  selected with `--igvm-personality linux-direct`. MSHV SNP can expose Hyper-V
+  enlightenments with `--hv --no-vmbus`; VMBus devices remain unsupported.
+  MSHV SNP IGVM boot is limited to one VP; the IGVM must use VTL0, no shared
+  GPA boundary, and no relocation metadata.
+
+  SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
+  the minimal emulated chipset and serial console, optional devices are
+  limited to virtio devices attached through PCIe.
+
+  A minimal MSHV IGVM invocation is:
+
+  ```bash
+  openvmm --hypervisor mshv --isolation snp \
+    --igvm path/to/snp-linux-direct.bin \
+    --igvm-personality linux-direct --com1 console \
+    --no-vmbus -m 160MB -p 1
+  ```
 * `--snp-restricted-injection`: Enable restricted interrupt injection in the
   loader-generated SNP VMSA. This bring-up option has no default and requires
   `--hypervisor mshv --isolation snp` with Linux direct boot. Do not enable it
-  for the KVM SNP repro.
+  for the KVM SNP repro. For IGVM boot, interrupt injection is encoded in the
+  IGVM VMSA instead; use an IGVM generated with the restricted-injection
+  configuration rather than this flag.
 * `--snp-disable-cpuid-offload`: Disable MSHV handling of SNP GHCB CPUID
   requests so they are forwarded to OpenVMM. The default is offloading enabled.
   This diagnostic option requires `--hypervisor mshv --isolation snp`.

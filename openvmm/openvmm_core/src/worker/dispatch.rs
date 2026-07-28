@@ -1043,6 +1043,7 @@ impl InitializedVm {
         let mut proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
+                igvm_isolation_config: igvm_isolation_config.as_ref(),
                 hv_config,
                 vmtime: &vmtime_source,
                 isolation: partition_isolation,

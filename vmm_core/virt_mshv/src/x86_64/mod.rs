@@ -63,6 +63,8 @@ use virt_support_x86emu::translate::TranslationRegisters;
 use vmcore::reference_time::ReferenceTimeSource;
 use x86defs::RFlags;
 use x86defs::SegmentRegister;
+use x86defs::snp::SevFeatures;
+use x86defs::snp::SevVmsa;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
@@ -107,6 +109,75 @@ fn can_disable_snp_cpuid_offloads() {
             enabled.__bindgen_anon_1.nae_rdmsr()
         );
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct MshvSnpConfig {
+    generic: Arc<virt::SnpConfig>,
+    vmsa: Arc<virt::SnpVpContext>,
+    vmsa_memory: GuestMemory,
+    sev_features: u64,
+    restricted_injection: bool,
+}
+
+fn prepare_snp_config(
+    config: Arc<virt::SnpConfig>,
+    processor_topology: &vm_topology::processor::ProcessorTopology,
+    physical_address_width: u8,
+) -> Result<Arc<MshvSnpConfig>, Error> {
+    if config.highest_vtl != 0 {
+        return Err(ErrorInner::UnsupportedSnpVtl(config.highest_vtl).into());
+    }
+    if config.shared_gpa_boundary != 0 {
+        return Err(ErrorInner::UnsupportedSnpSharedGpaBoundary(config.shared_gpa_boundary).into());
+    }
+    if config.has_relocation {
+        return Err(ErrorInner::SnpIgvmRelocationUnsupported.into());
+    }
+    if processor_topology.vp_count() != 1
+        || config.vp_contexts.len() != 1
+        || config.vp_contexts[0].vp_index != VpIndex::BSP
+    {
+        return Err(ErrorInner::InvalidSnpIgvmTopology.into());
+    }
+
+    let vmsa = config.vp_contexts[0].clone();
+    let vmsa_end = vmsa
+        .gpa
+        .checked_add(hvdef::HV_PAGE_SIZE)
+        .ok_or(ErrorInner::InvalidSnpVmsaGpa(vmsa.gpa))?;
+    if !vmsa.gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+        || (physical_address_width < u64::BITS as u8 && vmsa_end > (1u64 << physical_address_width))
+    {
+        return Err(ErrorInner::InvalidSnpVmsaGpa(vmsa.gpa).into());
+    }
+
+    let (parsed_vmsa, _) = SevVmsa::read_from_prefix(vmsa.page.as_ref())
+        .map_err(|_| ErrorInner::InvalidSnpIgvmVmsa)?;
+    let allowed_features = SevFeatures::new()
+        .with_snp(true)
+        .with_restrict_injection(true);
+    if !parsed_vmsa.sev_features.snp()
+        || parsed_vmsa.sev_features.vtom()
+        || parsed_vmsa.virtual_tom != 0
+        || u64::from(parsed_vmsa.sev_features) & !u64::from(allowed_features) != 0
+    {
+        return Err(ErrorInner::InvalidSnpIgvmVmsa.into());
+    }
+
+    let mut vmsa_memory = GuestMemory::allocate(hvdef::HV_PAGE_SIZE as usize);
+    let Some(vmsa_bytes) = vmsa_memory.inner_buf_mut() else {
+        return Err(ErrorInner::InvalidSnpIgvmVmsa.into());
+    };
+    vmsa_bytes.copy_from_slice(vmsa.page.as_ref());
+
+    Ok(Arc::new(MshvSnpConfig {
+        generic: config,
+        vmsa,
+        vmsa_memory,
+        sev_features: parsed_vmsa.sev_features.into_bits(),
+        restricted_injection: parsed_vmsa.sev_features.restrict_injection(),
+    }))
 }
 
 #[repr(C)]
@@ -527,11 +598,17 @@ impl virt::Hypervisor for LinuxMshv {
             .map_err(|e| ErrorInner::CreateVMInitFailed(e.into()))?;
 
         if snp {
-            let snp_policy = mshv_bindings::snp::get_default_snp_guest_policy();
+            let snp_policy = match config.igvm_isolation_config {
+                Some(virt::IgvmIsolationConfig::Snp(config)) => config.policy,
+                None => {
+                    let policy = mshv_bindings::snp::get_default_snp_guest_policy();
+                    // SAFETY: This generated C union contains a valid u64 view.
+                    unsafe { policy.as_uint64 }
+                }
+            };
             let vmgexit_offloads = snp_vmgexit_offloads(config.snp_disable_cpuid_offload);
-            // SAFETY: These generated C unions always contain a valid u64 view.
-            let (snp_policy, vmgexit_offloads) =
-                unsafe { (snp_policy.as_uint64, vmgexit_offloads.as_uint64) };
+            // SAFETY: This generated C union contains a valid u64 view.
+            let vmgexit_offloads = unsafe { vmgexit_offloads.as_uint64 };
 
             for (code, value) in [
                 (HvPartitionPropertyCode::IsolationPolicy, snp_policy),
@@ -738,9 +815,24 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         &mut self,
         config: Option<&virt::IgvmIsolationConfig>,
     ) -> Result<(), Self::Error> {
-        if config.is_some() {
-            return Err(ErrorInner::IsolationNotSupported.into());
+        if self.isolation_configured {
+            return Err(ErrorInner::IsolationConfigurationAlreadySet.into());
         }
+        if config != self.config.igvm_isolation_config {
+            return Err(ErrorInner::IsolationConfigurationMismatch.into());
+        }
+        self.snp_config = match (self.config.isolation, config) {
+            (virt::IsolationType::None, None) | (virt::IsolationType::Snp, None) => None,
+            (virt::IsolationType::Snp, Some(virt::IgvmIsolationConfig::Snp(config))) => {
+                Some(prepare_snp_config(
+                    config.clone(),
+                    self.config.processor_topology,
+                    self.max_physical_address_size(),
+                )?)
+            }
+            _ => return Err(ErrorInner::IsolationConfigurationMismatch.into()),
+        };
+        self.isolation_configured = true;
         Ok(())
     }
 
@@ -748,6 +840,21 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         self,
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
+        if !self.isolation_configured {
+            return Err(ErrorInner::IsolationConfigurationMissing.into());
+        }
+        if let Some(snp_config) = &self.snp_config {
+            let vmsa_range =
+                MemoryRange::new(snp_config.vmsa.gpa..snp_config.vmsa.gpa + hvdef::HV_PAGE_SIZE);
+            if config
+                .mem_layout
+                .ram()
+                .iter()
+                .any(|range| range.range.overlaps(&vmsa_range))
+            {
+                return Err(ErrorInner::SnpVmsaOverlapsRam.into());
+            }
+        }
         let mut cpuid = config.cpuid.to_vec();
         if self.config.isolation == virt::IsolationType::Snp && self.config.hv_config.is_some() {
             let native_max_leaf = self
@@ -854,10 +961,12 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             software_devices: ApicSoftwareDevices::new(apic_id_map),
             snp_launch_state: Mutex::new(SnpLaunchState::NotStarted),
             snp_sev_features: Mutex::new(None),
+            snp_config: self.snp_config,
             isolation: self.config.isolation,
             // SNP partition creation set TimeFreeze=1 before this object was built.
             time_frozen: Mutex::new(self.config.isolation.is_isolated()),
         });
+        inner.add_snp_vmsa_mapping()?;
 
         let partition = MshvPartition {
             synic_ports: Arc::new(virt::synic::SynicPorts::new(inner.clone())),
@@ -885,7 +994,150 @@ impl ProtoPartition for MshvProtoPartition<'_> {
 #[expect(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use test_with_tracing::test;
+    use vm_topology::processor::TopologyBuilder;
+    use zerocopy::IntoBytes;
+
+    fn test_snp_config(
+        vp_count: u32,
+        vmsa_gpa: u64,
+        restricted_injection: bool,
+    ) -> (
+        vm_topology::processor::ProcessorTopology,
+        Arc<virt::SnpConfig>,
+    ) {
+        let topology = TopologyBuilder::new_x86().build(vp_count).unwrap();
+        let mut vmsa = SevVmsa::new_zeroed();
+        vmsa.sev_features.set_snp(true);
+        vmsa.sev_features
+            .set_restrict_injection(restricted_injection);
+        let mut page = [0; hvdef::HV_PAGE_SIZE as usize];
+        page[..vmsa.as_bytes().len()].copy_from_slice(vmsa.as_bytes());
+        let config = Arc::new(virt::SnpConfig {
+            policy: 0xb0000,
+            highest_vtl: 0,
+            shared_gpa_boundary: 0,
+            has_relocation: false,
+            vp_contexts: vec![Arc::new(virt::SnpVpContext {
+                gpa: vmsa_gpa,
+                vp_index: VpIndex::BSP,
+                page: Arc::new(page),
+            })],
+            identity: None,
+        });
+        (topology, config)
+    }
+
+    fn test_identity() -> virt::SnpIdentity {
+        virt::SnpIdentity {
+            author_key_enabled: 1,
+            launch_digest: [0x11; 48],
+            family_id: [0x22; 16],
+            image_id: [0x33; 16],
+            version: 1,
+            guest_svn: 7,
+            id_key_algorithm: 1,
+            author_key_algorithm: 2,
+            id_key_signature: virt::SnpIdBlockSignature {
+                r: [0x44; 72],
+                s: [0x55; 72],
+            },
+            id_public_key: virt::SnpIdBlockPublicKey {
+                curve: 2,
+                qx: [0x66; 72],
+                qy: [0x77; 72],
+            },
+            author_key_signature: virt::SnpIdBlockSignature {
+                r: [0x88; 72],
+                s: [0x99; 72],
+            },
+            author_public_key: virt::SnpIdBlockPublicKey {
+                curve: 3,
+                qx: [0xaa; 72],
+                qy: [0xbb; 72],
+            },
+        }
+    }
+
+    #[test]
+    fn prepares_one_vp_snp_igvm_config() {
+        let vmsa_gpa = 0xffff_ffff_f000;
+        let (topology, config) = test_snp_config(1, vmsa_gpa, true);
+        let prepared = prepare_snp_config(config.clone(), &topology, 48).unwrap();
+
+        assert_eq!(prepared.generic, config);
+        assert_eq!(prepared.vmsa.gpa, vmsa_gpa);
+        assert_eq!(
+            prepared.sev_features,
+            SevFeatures::new()
+                .with_snp(true)
+                .with_restrict_injection(true)
+                .into_bits()
+        );
+        assert!(prepared.restricted_injection);
+        let copied_vmsa = prepared
+            .vmsa_memory
+            .inner_buf()
+            .unwrap()
+            .iter()
+            .map(|byte| byte.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        assert_eq!(copied_vmsa, prepared.vmsa.page.as_ref());
+    }
+
+    #[test]
+    fn rejects_multi_vp_snp_igvm_config() {
+        let (topology, config) = test_snp_config(2, 0xffff_ffff_f000, false);
+        assert!(matches!(
+            prepare_snp_config(config, &topology, 48),
+            Err(Error(ErrorInner::InvalidSnpIgvmTopology))
+        ));
+    }
+
+    #[test]
+    fn rejects_snp_igvm_vmsa_outside_physical_address_width() {
+        let (topology, config) = test_snp_config(1, 0xffff_ffff_f000, false);
+        assert!(matches!(
+            prepare_snp_config(config, &topology, 47),
+            Err(Error(ErrorInner::InvalidSnpVmsaGpa(0xffff_ffff_f000)))
+        ));
+    }
+
+    #[test]
+    fn builds_snp_launch_finish_identity() {
+        let (topology, mut config) = test_snp_config(1, 0xffff_ffff_f000, false);
+        Arc::make_mut(&mut config).identity = Some(test_identity());
+        let prepared = prepare_snp_config(config, &topology, 48).unwrap();
+        let (parameters, policy) = snp_launch_finish_data(Some(&prepared));
+        let id_block = parameters.id_block;
+        let id_auth = parameters.id_auth_info;
+        // Copy packed scalar fields before assertions to avoid unaligned
+        // references generated by the assertion macros.
+        let id_block_policy = unsafe { id_block.policy.as_uint64 };
+        let version = id_block.version;
+        let guest_svn = id_block.guest_svn;
+        let id_key_algorithm = id_auth.id_key_algorithm;
+        let auth_key_algorithm = id_auth.auth_key_algorithm;
+
+        assert_eq!(policy, 0xb0000);
+        assert_eq!(id_block_policy, policy);
+        assert_eq!(id_block.launch_digest, [0x11; 48]);
+        assert_eq!(id_block.family_id, [0x22; 16]);
+        assert_eq!(id_block.image_id, [0x33; 16]);
+        assert_eq!(version, 1);
+        assert_eq!(guest_svn, 7);
+        assert_eq!(parameters.id_block_enabled, 1);
+        assert_eq!(parameters.author_key_enabled, 1);
+        assert_eq!(id_key_algorithm, 1);
+        assert_eq!(auth_key_algorithm, 2);
+        assert_eq!(&id_auth.id_block_signature[..72], &[0x44; 72]);
+        assert_eq!(&id_auth.id_block_signature[72..144], &[0x55; 72]);
+        assert_eq!(&id_auth.id_key[..4], &2u32.to_le_bytes());
+        assert_eq!(&id_auth.id_key[4..76], &[0x66; 72]);
+        assert_eq!(&id_auth.id_key_signature[..72], &[0x88; 72]);
+        assert_eq!(&id_auth.author_key[..4], &3u32.to_le_bytes());
+    }
 
     #[test]
     fn snp_partition_creation_uses_isolation_flags() {
@@ -1075,6 +1327,30 @@ mod tests {
             unique_snp_page(&pages, virt::InitialPageImportType::VpContext),
             Err(Error(ErrorInner::InvalidSnpPageRange))
         ));
+    }
+
+    #[test]
+    fn preserves_metadata_backed_snp_import_order() {
+        let pages = [
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x3000..0x4000),
+                import_type: virt::InitialPageImportType::Normal,
+                tag: "higher",
+            },
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x1000..0x2000),
+                import_type: virt::InitialPageImportType::Normal,
+                tag: "lower",
+            },
+        ];
+
+        let preserved = ordered_snp_import_pages(&pages, true);
+        assert_eq!(preserved[0].range.start(), 0x3000);
+        assert_eq!(preserved[1].range.start(), 0x1000);
+
+        let sorted = ordered_snp_import_pages(&pages, false);
+        assert_eq!(sorted[0].range.start(), 0x1000);
+        assert_eq!(sorted[1].range.start(), 0x3000);
     }
 
     #[test]
@@ -1290,6 +1566,29 @@ impl virt::AcceptInitialPages for MshvPartition {
 }
 
 impl MshvPartitionInner {
+    fn add_snp_vmsa_mapping(&self) -> Result<(), Error> {
+        let Some(config) = &self.snp_config else {
+            return Ok(());
+        };
+        let Some(vmsa_bytes) = config.vmsa_memory.inner_buf() else {
+            return Err(ErrorInner::InvalidSnpIgvmVmsa.into());
+        };
+        let flags = (1 << mshv_bindings::MSHV_SET_MEM_BIT_WRITABLE)
+            | (1 << mshv_bindings::MSHV_SET_MEM_BIT_EXECUTABLE);
+        let region = mshv_bindings::mshv_user_mem_region {
+            size: hvdef::HV_PAGE_SIZE,
+            guest_pfn: config.vmsa.gpa / hvdef::HV_PAGE_SIZE,
+            userspace_addr: vmsa_bytes.as_ptr() as u64,
+            flags,
+            rsvd: [0; 7],
+        };
+        self.memory.lock().ranges.push(Some(crate::MshvMemoryRange {
+            region,
+            mapped: false,
+        }));
+        Ok(())
+    }
+
     fn snp_launch_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), Error> {
         {
             let mut state = self.snp_launch_state.lock();
@@ -1319,15 +1618,26 @@ impl MshvPartitionInner {
         &self,
         pages: &[virt::InitialPageImport],
     ) -> Result<(), Error> {
-        let vmsa_gpa = unique_snp_page(pages, virt::InitialPageImportType::VpContext)?;
+        let (vmsa_gpa, sev_features) = if let Some(config) = &self.snp_config {
+            if pages
+                .iter()
+                .any(|page| page.import_type == virt::InitialPageImportType::VpContext)
+            {
+                return Err(ErrorInner::UnexpectedSnpVmsaImport.into());
+            }
+            (config.vmsa.gpa, config.sev_features)
+        } else {
+            let vmsa_gpa = unique_snp_page(pages, virt::InitialPageImportType::VpContext)?;
+            let vmsa = self
+                .gm
+                .read_plain::<SevVmsa>(vmsa_gpa)
+                .map_err(ErrorInner::SnpGuestMemory)?;
+            (vmsa_gpa, vmsa.sev_features.into_bits())
+        };
         let cpuid_gpa = unique_snp_page(pages, virt::InitialPageImportType::Cpuid)?;
-        let vmsa = self
-            .gm
-            .read_plain::<x86defs::snp::SevVmsa>(vmsa_gpa)
-            .map_err(ErrorInner::SnpGuestMemory)?;
         // The loader currently sets only guest-visible SEV feature bits, so an
         // AP VMSA must reproduce the BSP VMSA bit-for-bit.
-        *self.snp_sev_features.lock() = Some(vmsa.sev_features.into_bits());
+        *self.snp_sev_features.lock() = Some(sev_features);
         self.write_snp_cpuid_page(cpuid_gpa)?;
 
         self.vmfd
@@ -1351,9 +1661,7 @@ impl MshvPartitionInner {
 
         let mut batch_type = None;
         let mut batch = Vec::with_capacity(SNP_IMPORT_CHUNK_PAGES);
-        let mut sorted_pages = pages.to_vec();
-        sorted_pages.sort_by_key(|page| page.range.start());
-        for page in sorted_pages {
+        for page in ordered_snp_import_pages(pages, self.snp_config.is_some()) {
             let Some(page_type) = snp_isolated_page_type(page.import_type)? else {
                 continue;
             };
@@ -1373,6 +1681,12 @@ impl MshvPartitionInner {
         }
         if let Some(page_type) = batch_type {
             self.import_isolated_pages(page_type, &batch)?;
+        }
+        if self.snp_config.is_some() {
+            self.import_isolated_pages(
+                mshv_bindings::MSHV_ISOLATED_PAGE_VMSA as u8,
+                &[vmsa_gpa / hvdef::HV_PAGE_SIZE],
+            )?;
         }
 
         self.complete_isolated_import()?;
@@ -1475,15 +1789,82 @@ impl MshvPartitionInner {
 
     fn complete_isolated_import(&self) -> Result<(), Error> {
         let mut data = mshv_bindings::mshv_complete_isolated_import::default();
-        data.import_data.psp_parameters.id_block.policy =
-            mshv_bindings::snp::get_default_snp_guest_policy();
-        data.import_data.psp_parameters.id_block_enabled = 0;
-        data.import_data.psp_parameters.author_key_enabled = 0;
+        let (parameters, policy) = snp_launch_finish_data(self.snp_config.as_deref());
+        tracing::info!(
+            policy,
+            identity_enabled = parameters.id_block_enabled != 0,
+            vmsa_gpa = self.snp_config.as_ref().map(|config| config.vmsa.gpa),
+            restricted_injection = self
+                .snp_config
+                .as_ref()
+                .map(|config| config.restricted_injection),
+            "completing MSHV SNP launch"
+        );
+        data.import_data.psp_parameters = parameters;
         self.vmfd
             .complete_isolated_import(&data)
             .map_err(|e| ErrorInner::CompleteIsolatedImport(e.into()))?;
         Ok(())
     }
+}
+
+fn snp_launch_finish_data(
+    config: Option<&MshvSnpConfig>,
+) -> (mshv_bindings::hv_psp_launch_finish_data, u64) {
+    let mut parameters = mshv_bindings::hv_psp_launch_finish_data::default();
+    let policy = config.map_or_else(
+        || {
+            let policy = mshv_bindings::snp::get_default_snp_guest_policy();
+            // SAFETY: This generated C union contains a valid u64 view.
+            unsafe { policy.as_uint64 }
+        },
+        |config| config.generic.policy,
+    );
+    parameters.id_block.policy = mshv_bindings::hv_snp_guest_policy { as_uint64: policy };
+
+    if let Some(identity) = config.and_then(|config| config.generic.identity.as_ref()) {
+        let id_block = virt::x86::snp::snp_id_block(identity, policy);
+        parameters.id_block.launch_digest = id_block.ld;
+        parameters.id_block.family_id = id_block.family_id;
+        parameters.id_block.image_id = id_block.image_id;
+        parameters.id_block.version = id_block.version;
+        parameters.id_block.guest_svn = id_block.guest_svn;
+
+        let id_auth = virt::x86::snp::snp_id_auth(identity);
+        parameters
+            .id_auth_info
+            .id_block_signature
+            .copy_from_slice(&id_auth[64..576]);
+        parameters
+            .id_auth_info
+            .id_key
+            .copy_from_slice(&id_auth[576..1604]);
+        parameters
+            .id_auth_info
+            .id_key_signature
+            .copy_from_slice(&id_auth[1664..2176]);
+        parameters
+            .id_auth_info
+            .author_key
+            .copy_from_slice(&id_auth[2176..3204]);
+        parameters.id_auth_info.id_key_algorithm = identity.id_key_algorithm;
+        parameters.id_auth_info.auth_key_algorithm = identity.author_key_algorithm;
+        parameters.id_block_enabled = 1;
+        parameters.author_key_enabled = u8::from(identity.author_key_enabled != 0);
+    }
+
+    (parameters, policy)
+}
+
+fn ordered_snp_import_pages(
+    pages: &[virt::InitialPageImport],
+    preserve_order: bool,
+) -> Vec<virt::InitialPageImport> {
+    let mut ordered_pages = pages.to_vec();
+    if !preserve_order {
+        ordered_pages.sort_by_key(|page| page.range.start());
+    }
+    ordered_pages
 }
 
 fn unique_snp_page(

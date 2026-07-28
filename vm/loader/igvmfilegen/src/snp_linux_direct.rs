@@ -26,6 +26,7 @@ use igvm_defs::SnpPolicy;
 use igvmfilegen_config::LinuxImage;
 use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
+use igvmfilegen_config::SnpInjectionType;
 use loader::importer::BootPageAcceptance;
 use loader::importer::IgvmParameterType;
 use loader::importer::ImageLoad;
@@ -79,6 +80,7 @@ pub struct BuildParams<'a> {
     pub c_bit_position: Option<u8>,
     pub guest_svn: u32,
     pub policy: SnpPolicy,
+    pub injection_type: &'a SnpInjectionType,
     pub resources: &'a Resources,
 }
 
@@ -144,9 +146,10 @@ impl TestIgvmImporter {
     fn finish(
         self,
         processor_count: u32,
+        injection_type: &SnpInjectionType,
         bootshim_ranges: &[SnpBootShimRange],
     ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, SevVmsa, String)> {
-        let vmsa = build_vmsa(&self.registers, self.c_bit_mask)?;
+        let vmsa = build_vmsa(&self.registers, self.c_bit_mask, injection_type)?;
         let (mut directives, map) = build_sparse_ram_directives(
             &self.pages,
             &vmsa,
@@ -363,9 +366,9 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
             page_base < self.ram_page_count,
             "Linux-selected VP context page lies outside RAM"
         );
-        // KVM supplies the real launch VMSA at its fixed GPA. The page chosen
-        // by the generic Linux loader remains ordinary RAM and is accepted by
-        // the bootshim with the rest of the unimported range.
+        // The runtime loader needs a guest-RAM VMSA page, but this fixed IGVM
+        // emits its VMSAs separately as SnpVpContext directives. The selected
+        // page remains ordinary RAM and is accepted with the unimported range.
         Ok(())
     }
 
@@ -404,6 +407,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         c_bit_position,
         guest_svn,
         policy,
+        injection_type,
         resources,
     } = params;
     validate_plan(vm_layout)?;
@@ -559,7 +563,8 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
     importer.replace_register(X86Register::Rsi(params_gpa))?;
 
     let explicit_pages = importer.pages.keys().copied().collect::<BTreeSet<_>>();
-    let (mut directives, _vmsa, map) = importer.finish(processor_count, &bootshim_ranges)?;
+    let (mut directives, _vmsa, map) =
+        importer.finish(processor_count, injection_type, &bootshim_ranges)?;
     let policy: u64 = policy.into();
     let platform_headers = vec![IgvmPlatformHeader::SupportedPlatform(
         IGVM_VHS_SUPPORTED_PLATFORM {
@@ -599,6 +604,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         launch_digest,
         policy,
         guest_svn,
+        injection_type,
         processor_count,
         memory_page_count,
         1u64 << c_bit_position,
@@ -719,6 +725,7 @@ fn validate_generated_igvm(
     expected_launch_digest: [u8; 48],
     expected_policy: u64,
     expected_guest_svn: u32,
+    injection_type: &SnpInjectionType,
     processor_count: u32,
     ram_page_count: u64,
     c_bit_mask: u64,
@@ -813,8 +820,7 @@ fn validate_generated_igvm(
                     u32::from(*vp_index) == next_vmsa_index,
                     "VMSA VP contexts are not ordered by VP index"
                 );
-                ensure!(vmsa.sev_features.snp(), "VMSA does not enable SNP");
-                ensure!(!vmsa.sev_features.vtom(), "VMSA unexpectedly enables vTOM");
+                validate_vmsa_features(vmsa.sev_features, injection_type)?;
                 ensure!(vmsa.virtual_tom == 0, "VMSA virtual TOM is not zero");
                 ensure!(
                     vmsa.cr3 & c_bit_mask != 0,
@@ -943,10 +949,39 @@ fn validate_generated_igvm(
     Ok(())
 }
 
-fn build_vmsa(registers: &[X86Register], c_bit_mask: u64) -> anyhow::Result<SevVmsa> {
+fn expected_vmsa_features(injection_type: &SnpInjectionType) -> SevFeatures {
+    SevFeatures::new()
+        .with_snp(true)
+        .with_restrict_injection(matches!(injection_type, SnpInjectionType::Restricted))
+}
+
+fn validate_vmsa_features(
+    features: SevFeatures,
+    injection_type: &SnpInjectionType,
+) -> anyhow::Result<()> {
+    let expected_restricted = matches!(injection_type, SnpInjectionType::Restricted);
+    ensure!(
+        features.restrict_injection() == expected_restricted,
+        "VMSA restricted-injection feature does not match the configured injection type"
+    );
+
+    let expected = u64::from(expected_vmsa_features(injection_type));
+    let actual = u64::from(features);
+    ensure!(
+        actual == expected,
+        "unexpected VMSA SEV feature combination: expected {expected:#x}, found {actual:#x}"
+    );
+    Ok(())
+}
+
+fn build_vmsa(
+    registers: &[X86Register],
+    c_bit_mask: u64,
+    injection_type: &SnpInjectionType,
+) -> anyhow::Result<SevVmsa> {
     let mut vmsa = SevVmsa::new_zeroed();
     vmsa.efer = x86defs::X64_EFER_SVME;
-    vmsa.sev_features = SevFeatures::new().with_snp(true);
+    vmsa.sev_features = expected_vmsa_features(injection_type);
     vmsa.virtual_tom = 0;
     vmsa.xcr0 = 1;
     vmsa.rflags = u64::from(x86defs::RFlags::at_reset());
@@ -1286,23 +1321,100 @@ mod tests {
         assert!(matches!(validate_plan(&plan), Err(ConfigError::Iommu(_))));
     }
 
+    fn test_vmsa(injection_type: &SnpInjectionType) -> SevVmsa {
+        build_vmsa(
+            &[
+                X86Register::Rip(0x100000),
+                X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
+                X86Register::Cr0(x86defs::X64_CR0_PE | x86defs::X64_CR0_PG),
+                X86Register::Cr4(x86defs::X64_CR4_PAE),
+                X86Register::Efer(x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA),
+            ],
+            TEST_C_BIT_MASK,
+            injection_type,
+        )
+        .unwrap()
+    }
+
+    fn remeasure_vmsa(injection_type: &SnpInjectionType) -> [u8; 48] {
+        let initialization_headers = vec![IgvmInitializationHeader::GuestPolicy {
+            policy: 196608,
+            compatibility_mask: COMPATIBILITY_MASK,
+        }];
+        let mut directives = vec![IgvmDirectiveHeader::SnpVpContext {
+            gpa: KVM_VMSA_GPA,
+            compatibility_mask: COMPATIBILITY_MASK,
+            vp_index: 0,
+            vmsa: Box::new(test_vmsa(injection_type)),
+        }];
+        let expected = generate_snp_measurement(
+            &initialization_headers,
+            &mut directives,
+            1,
+            SnpImageIdentity::LINUX_DIRECT,
+        )
+        .unwrap();
+        let igvm = IgvmFile::new(
+            IgvmRevision::V1,
+            vec![IgvmPlatformHeader::SupportedPlatform(
+                IGVM_VHS_SUPPORTED_PLATFORM {
+                    compatibility_mask: COMPATIBILITY_MASK,
+                    highest_vtl: 0,
+                    platform_type: IgvmPlatformType::SEV_SNP,
+                    platform_version: igvm_defs::IGVM_SEV_SNP_PLATFORM_VERSION,
+                    shared_gpa_boundary: 0,
+                },
+            )],
+            initialization_headers,
+            directives,
+        )
+        .unwrap();
+        let mut binary = Vec::new();
+        igvm.serialize(&mut binary).unwrap();
+        let reparsed = IgvmFile::new_from_binary(&binary, Some(igvm::IsolationType::Snp)).unwrap();
+        let parsed_vmsa = reparsed
+            .directives()
+            .iter()
+            .find_map(|directive| match directive {
+                IgvmDirectiveHeader::SnpVpContext { vmsa, .. } => Some(vmsa),
+                _ => None,
+            })
+            .unwrap();
+        validate_vmsa_features(parsed_vmsa.sev_features, injection_type).unwrap();
+
+        let mut measured_directives = reparsed
+            .directives()
+            .iter()
+            .filter(|directive| !matches!(directive, IgvmDirectiveHeader::SnpIdBlock { .. }))
+            .cloned()
+            .collect();
+        let actual = generate_snp_measurement(
+            reparsed.initializations(),
+            &mut measured_directives,
+            1,
+            SnpImageIdentity::LINUX_DIRECT,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        actual
+    }
+
     #[test]
-    fn vmsa_uses_c_bit_model() {
-        let registers = [
-            X86Register::Rip(0x100000),
-            X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
-            X86Register::Cr0(x86defs::X64_CR0_PE | x86defs::X64_CR0_PG),
-            X86Register::Cr4(x86defs::X64_CR4_PAE),
-            X86Register::Efer(x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA),
-        ];
-        let vmsa = build_vmsa(&registers, TEST_C_BIT_MASK).unwrap();
+    fn normal_vmsa_uses_c_bit_model() {
+        let vmsa = test_vmsa(&SnpInjectionType::Normal);
         assert_eq!(vmsa.rip, 0x100000);
         assert_ne!(vmsa.cr3 & TEST_C_BIT_MASK, 0);
         assert_ne!(vmsa.cr0 & x86defs::X64_CR0_ET, 0);
         assert_ne!(vmsa.cr4 & x86defs::X64_CR4_MCE, 0);
         assert!(vmsa.sev_features.snp());
         assert!(!vmsa.sev_features.vtom());
+        assert!(!vmsa.sev_features.restrict_injection());
+        assert!(!vmsa.sev_features.alternate_injection());
         assert!(!vmsa.sev_features.debug_swap());
+        assert_eq!(
+            u64::from(vmsa.sev_features),
+            u64::from(expected_vmsa_features(&SnpInjectionType::Normal))
+        );
         assert_eq!(vmsa.virtual_tom, 0);
         assert_eq!(vmsa.rflags, 2);
         assert_eq!(vmsa.dr6, 0xffff_0ff0);
@@ -1314,6 +1426,39 @@ mod tests {
         assert_eq!(vmsa.idtr.limit, 0xffff);
         assert_eq!(vmsa.x87_fcw, x86defs::xsave::INIT_FCW);
         assert_eq!(vmsa.mxcsr, x86defs::xsave::DEFAULT_MXCSR);
+    }
+
+    #[test]
+    fn restricted_vmsa_uses_restrict_injection_feature() {
+        let vmsa = test_vmsa(&SnpInjectionType::Restricted);
+
+        assert!(vmsa.sev_features.snp());
+        assert!(vmsa.sev_features.restrict_injection());
+        assert!(!vmsa.sev_features.alternate_injection());
+        assert_eq!(
+            u64::from(vmsa.sev_features),
+            u64::from(expected_vmsa_features(&SnpInjectionType::Restricted))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_unexpected_injection_features() {
+        let alternate_only = SevFeatures::new()
+            .with_snp(true)
+            .with_alternate_injection(true);
+        assert!(validate_vmsa_features(alternate_only, &SnpInjectionType::Restricted).is_err());
+
+        let combined =
+            expected_vmsa_features(&SnpInjectionType::Restricted).with_alternate_injection(true);
+        assert!(validate_vmsa_features(combined, &SnpInjectionType::Restricted).is_err());
+    }
+
+    #[test]
+    fn normal_and_restricted_vmsa_remeasure_stably() {
+        let normal = remeasure_vmsa(&SnpInjectionType::Normal);
+        let restricted = remeasure_vmsa(&SnpInjectionType::Restricted);
+
+        assert_ne!(normal, restricted);
     }
 
     #[test]
@@ -1333,6 +1478,7 @@ mod tests {
                 X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
             ],
             TEST_C_BIT_MASK,
+            &SnpInjectionType::Normal,
         )
         .unwrap();
         let accepted_ranges = [
@@ -1367,13 +1513,14 @@ mod tests {
     }
 
     #[test]
-    fn sparse_ram_emits_one_vmsa_per_processor() {
+    fn normal_sparse_ram_emits_one_vmsa_per_processor() {
         let vmsa = build_vmsa(
             &[
                 X86Register::Rip(0x100000),
                 X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
             ],
             TEST_C_BIT_MASK,
+            &SnpInjectionType::Normal,
         )
         .unwrap();
         let accepted_ranges = [SnpBootShimRange {
@@ -1385,7 +1532,16 @@ mod tests {
         let vp_indexes = directives
             .iter()
             .filter_map(|directive| match directive {
-                IgvmDirectiveHeader::SnpVpContext { vp_index, .. } => Some(*vp_index),
+                IgvmDirectiveHeader::SnpVpContext {
+                    gpa,
+                    vp_index,
+                    vmsa,
+                    ..
+                } => {
+                    assert_eq!(*gpa, KVM_VMSA_GPA);
+                    validate_vmsa_features(vmsa.sev_features, &SnpInjectionType::Normal).unwrap();
+                    Some(*vp_index)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1473,7 +1629,12 @@ mod tests {
         importer
             .replace_register(X86Register::Rsi(0x90000))
             .unwrap();
-        let vmsa = build_vmsa(&importer.registers, TEST_C_BIT_MASK).unwrap();
+        let vmsa = build_vmsa(
+            &importer.registers,
+            TEST_C_BIT_MASK,
+            &SnpInjectionType::Normal,
+        )
+        .unwrap();
         assert_eq!(vmsa.rip, 0x80000);
         assert_eq!(vmsa.rsi, 0x90000);
     }
