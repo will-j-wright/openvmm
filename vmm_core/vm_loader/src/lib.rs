@@ -16,6 +16,7 @@ use loader::importer::BootPageAcceptance;
 use loader::importer::GuestArch;
 use loader::importer::ImageLoad;
 use loader::importer::StartupMemoryType;
+use loader::importer::X86Register;
 use memory_range::MemoryRange;
 use range_map_vec::Entry;
 use range_map_vec::RangeMap;
@@ -47,6 +48,7 @@ pub struct Loader<'a, R> {
     mem_layout: &'a MemoryLayout,
     page_imports: RangeMap<u64, RangeInfo>,
     max_vtl: Vtl,
+    vp_context_page: Option<u64>,
 }
 
 impl<R> Loader<'_, R> {
@@ -57,6 +59,7 @@ impl<R> Loader<'_, R> {
             mem_layout,
             page_imports: RangeMap::new(),
             max_vtl,
+            vp_context_page: None,
         }
     }
 
@@ -262,8 +265,17 @@ impl<R: Debug + GuestArch> ImageLoad<R> for Loader<'_, R> {
         }
     }
 
-    fn set_vp_context_page(&mut self, _page_base: u64) -> anyhow::Result<()> {
-        unimplemented!()
+    fn set_vp_context_page(&mut self, page_base: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.vp_context_page.is_none(),
+            "VP context page was already set"
+        );
+        self.accept_new_range(page_base, 1, "snp-vmsa", BootPageAcceptance::VpContext)?;
+        self.gm
+            .fill_at(page_base * HV_PAGE_SIZE, 0, HV_PAGE_SIZE as usize)
+            .context("unable to zero VP context page")?;
+        self.vp_context_page = Some(page_base);
+        Ok(())
     }
 
     fn create_parameter_area(
@@ -320,6 +332,25 @@ impl<R: Debug + GuestArch> ImageLoad<R> for Loader<'_, R> {
 
     fn set_imported_regions_config_page(&mut self, _page_base: u64) {
         unimplemented!()
+    }
+}
+
+impl Loader<'_, X86Register> {
+    /// Finalizes the loader-provided SNP VMSA at the configured VP context page.
+    pub fn finalize_snp_vmsa(
+        &mut self,
+        caps: &virt::x86::X86PartitionCapabilities,
+        bsp: &vm_topology::processor::x86::X86VpInfo,
+    ) -> anyhow::Result<()> {
+        let page_base = self
+            .vp_context_page
+            .ok_or_else(|| anyhow::anyhow!("SNP VP context page was not configured"))?;
+        let regs = self.regs.values().copied().collect::<Vec<_>>();
+        let initial = initial_regs::x86_initial_regs(&regs, caps, bsp);
+        let vmsa = virt::x86::snp::vmsa_from_initial_regs(&initial);
+        self.gm
+            .write_plain(page_base * HV_PAGE_SIZE, &vmsa)
+            .context("unable to write SNP VMSA")
     }
 }
 

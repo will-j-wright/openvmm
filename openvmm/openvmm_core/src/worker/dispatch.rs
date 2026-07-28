@@ -3303,26 +3303,32 @@ impl LoadedVmInner {
                     shared_gpa_bit: None,
                     snp_c_bit: self.partition.caps().snp_c_bit,
                 };
-                super::vm_loaders::linux::load_linux_x86(&kernel_config, &self.gm, |gpa| {
-                    let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
-                        add_devices_to_dsdt_x64(
-                            dsdt,
-                            &self.chipset_cfg,
-                            &self.chipset_capabilities,
-                            enable_serial,
-                            self.vmbus_server.is_some(),
-                            &self.chipset_mmio,
-                            self.virtio_mmio_region,
-                            self.virtio_mmio_irq,
-                            &self.pci_legacy_interrupts,
-                        )
-                    });
+                super::vm_loaders::linux::load_linux_x86(
+                    &kernel_config,
+                    &self.gm,
+                    self.partition.caps(),
+                    &self.processor_topology.vp_arch(VpIndex::BSP),
+                    |gpa| {
+                        let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
+                            add_devices_to_dsdt_x64(
+                                dsdt,
+                                &self.chipset_cfg,
+                                &self.chipset_capabilities,
+                                enable_serial,
+                                self.vmbus_server.is_some(),
+                                &self.chipset_mmio,
+                                self.virtio_mmio_region,
+                                self.virtio_mmio_irq,
+                                &self.pci_legacy_interrupts,
+                            )
+                        });
 
-                    loader::linux::AcpiTables {
-                        rsdp: tables.rsdp,
-                        tables: tables.tables,
-                    }
-                })?
+                        loader::linux::AcpiTables {
+                            rsdp: tables.rsdp,
+                            tables: tables.tables,
+                        }
+                    },
+                )?
             }
             #[cfg(guest_arch = "aarch64")]
             &LoadMode::Linux {

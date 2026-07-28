@@ -60,6 +60,14 @@ pub enum KvmError {
     OpenSev(#[source] std::io::Error),
     #[error("unsupported SNP launch page import type: {0:?}")]
     UnsupportedSnpPageImportType(InitialPageImportType),
+    #[error("missing SNP VMSA import")]
+    MissingSnpVmsa,
+    #[error("multiple SNP VMSA imports")]
+    MultipleSnpVmsa,
+    #[error("invalid SNP VMSA")]
+    InvalidSnpVmsa(#[source] virt::x86::snp::SnpVmsaError),
+    #[error("failed to access SNP VMSA memory")]
+    SnpVmsaMemory(#[source] guestmem::GuestMemoryError),
     #[error("kvm error")]
     Kvm(#[from] kvm::Error),
     #[error("failed to stat /dev/kvm")]

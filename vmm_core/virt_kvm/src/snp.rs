@@ -72,6 +72,7 @@ impl KvmPartitionInner {
         pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
         let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
+        self.apply_snp_vmsa(pages)?;
         self.kvm.check_sev_snp_launch_extensions()?;
         let mut launch_start = kvm::kvm_sev_snp_launch_start {
             // TODO: This debug-capable policy is for bring-up.
@@ -122,6 +123,74 @@ impl KvmPartitionInner {
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
         self.kvm
             .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
+        Ok(())
+    }
+
+    fn apply_snp_vmsa(&self, pages: &[virt::InitialPageImport]) -> Result<(), KvmError> {
+        let mut vmsa_pages = pages
+            .iter()
+            .filter(|page| page.import_type == InitialPageImportType::VpContext);
+        let page = vmsa_pages.next().ok_or(KvmError::MissingSnpVmsa)?;
+        if vmsa_pages.next().is_some() {
+            return Err(KvmError::MultipleSnpVmsa);
+        }
+        if page.range.len() != hvdef::HV_PAGE_SIZE {
+            return Err(KvmError::InvalidSnpLaunchRange);
+        }
+
+        let vmsa = self
+            .gm
+            .read_plain::<x86defs::snp::SevVmsa>(page.range.start())
+            .map_err(KvmError::SnpVmsaMemory)?;
+        let state = virt::x86::snp::state_from_vmsa(&vmsa).map_err(KvmError::InvalidSnpVmsa)?;
+        let kvm_vp = self.vp_kvm(virt::VpIndex::BSP);
+        let registers = state.registers;
+        let regs = kvm::kvm_regs {
+            rax: registers.rax,
+            rbx: registers.rbx,
+            rcx: registers.rcx,
+            rdx: registers.rdx,
+            rsi: registers.rsi,
+            rdi: registers.rdi,
+            rsp: registers.rsp,
+            rbp: registers.rbp,
+            r8: registers.r8,
+            r9: registers.r9,
+            r10: registers.r10,
+            r11: registers.r11,
+            r12: registers.r12,
+            r13: registers.r13,
+            r14: registers.r14,
+            r15: registers.r15,
+            rip: registers.rip,
+            rflags: registers.rflags,
+        };
+        let old_sregs = kvm_vp.get_sregs()?;
+        let sregs = kvm::kvm_sregs {
+            cs: crate::arch::seg_reg(registers.cs),
+            ds: crate::arch::seg_reg(registers.ds),
+            es: crate::arch::seg_reg(registers.es),
+            fs: crate::arch::seg_reg(registers.fs),
+            gs: crate::arch::seg_reg(registers.gs),
+            ss: crate::arch::seg_reg(registers.ss),
+            tr: crate::arch::seg_reg(registers.tr),
+            ldt: crate::arch::seg_reg(registers.ldtr),
+            gdt: crate::arch::table_reg(registers.gdtr),
+            idt: crate::arch::table_reg(registers.idtr),
+            cr0: registers.cr0,
+            cr2: registers.cr2,
+            cr3: registers.cr3,
+            cr4: registers.cr4,
+            cr8: registers.cr8,
+            efer: registers.efer,
+            interrupt_bitmap: [0; 4],
+            ..old_sregs
+        };
+
+        kvm_vp.set_regs(&regs)?;
+        kvm_vp.set_sregs(&sregs)?;
+        kvm_vp.set_msrs(&[(x86defs::X86X_MSR_CR_PAT, state.pat)])?;
+        kvm_vp.set_xcr0(state.xcr0)?;
         Ok(())
     }
 
