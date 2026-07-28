@@ -39,6 +39,7 @@ use std::io::SeekFrom;
 use std::mem::size_of;
 use thiserror::Error;
 use vm_topology::memory::MemoryLayout;
+use x86defs::cpuid::CpuidFunction;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
@@ -366,14 +367,18 @@ fn import_snp_boot_pages(
         )
         .map_err(Error::Importer)?;
     let mut cpuid_page = crate::cpuid::HV_PSP_CPUID_PAGE::default();
-    for (index, leaf) in crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI
+    for (index, leaf) in crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_PARAVISOR
         .iter()
         .enumerate()
     {
-        cpuid_page.cpuid_leaf_info[index].eax_in = leaf.eax;
-        cpuid_page.cpuid_leaf_info[index].ecx_in = leaf.ecx;
+        let entry = &mut cpuid_page.cpuid_leaf_info[index];
+        entry.eax_in = leaf.eax;
+        entry.ecx_in = leaf.ecx;
+        if leaf.eax == CpuidFunction::ExtendedStateEnumeration.0 && leaf.ecx <= 1 {
+            entry.xfem_in = 1;
+        }
     }
-    cpuid_page.count = crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI.len() as u32;
+    cpuid_page.count = crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_PARAVISOR.len() as u32;
     importer
         .import_pages(
             cpuid_address / HV_PAGE_SIZE,
@@ -1630,12 +1635,21 @@ mod tests {
             crate::cpuid::HV_PSP_CPUID_PAGE::read_from_bytes(&importer.imports[1].data).unwrap();
         assert_eq!(
             cpuid_page.count as usize,
-            crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI.len()
+            crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_PARAVISOR.len()
         );
-        assert_eq!(
-            cpuid_page.cpuid_leaf_info[0].eax_in,
-            crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI[0].eax
-        );
+        for (entry, leaf) in cpuid_page
+            .cpuid_leaf_info
+            .iter()
+            .zip(crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_PARAVISOR)
+        {
+            assert_eq!(entry.eax_in, leaf.eax);
+            assert_eq!(entry.ecx_in, leaf.ecx);
+            assert_eq!(
+                entry.xfem_in,
+                u64::from(leaf.eax == CpuidFunction::ExtendedStateEnumeration.0 && leaf.ecx <= 1)
+            );
+            assert_eq!(entry.xss_in, 0);
+        }
 
         let cc_blob = defs::cc_blob_sev_info::read_from_bytes(&importer.imports[2].data).unwrap();
         assert_eq!(cc_blob.magic, defs::CC_BLOB_SEV_INFO_MAGIC);
