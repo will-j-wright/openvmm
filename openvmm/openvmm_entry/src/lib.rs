@@ -1882,6 +1882,20 @@ async fn vm_config_from_command_line(
         );
     }
 
+    #[cfg(target_os = "linux")]
+    if let Some(guest_cid) = opt.virtio_vsock_vhost_cid {
+        let vhost = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/vhost-vsock")
+            .context("failed to open /dev/vhost-vsock")?
+            .into();
+        add_virtio_device(
+            VirtioBusCli::Auto,
+            virtio_resources::vsock::VirtioVsockVhostHandle { vhost, guest_cid }.into_resource(),
+        );
+    }
+
     let mut cfg = Config {
         chipset,
         load_mode,
