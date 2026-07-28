@@ -38,9 +38,10 @@ impl RunContext<'_> {
     where
         H::Partition: Partition + PartitionMemoryMapper,
     {
-        let proto = hv
+        let mut proto = hv
             .new_partition(ProtoPartitionConfig {
                 processor_topology: &self.state.processor_topology,
+                igvm_isolation_config: None,
                 hv_config: None,
                 vmtime: self.vmtime_source,
                 isolation: virt::IsolationType::None,
@@ -48,6 +49,9 @@ impl RunContext<'_> {
                 nested_virt: false,
             })
             .context("failed to create proto partition")?;
+        proto
+            .configure_isolation(None)
+            .context("failed to configure partition isolation")?;
 
         let guest_memory = GuestMemory::allocate(self.state.memory_layout.end_of_ram() as usize);
 

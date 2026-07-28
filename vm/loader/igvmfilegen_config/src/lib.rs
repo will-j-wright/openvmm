@@ -540,6 +540,43 @@ mod test {
     }
 
     #[test]
+    fn parse_restricted_snp_linux_direct_manifest() {
+        let normal: serde_json::Value =
+            serde_json::from_str(include_str!("../../manifests/snp-linux-direct.json")).unwrap();
+        let mut restricted: serde_json::Value = serde_json::from_str(include_str!(
+            "../../manifests/snp-linux-direct-restricted.json"
+        ))
+        .unwrap();
+        let config: Config = serde_json::from_value(restricted.clone()).unwrap();
+
+        let injection_type = restricted
+            .pointer_mut("/guest_configs/0/isolation_type/snp/injection_type")
+            .unwrap();
+        assert_eq!(injection_type.as_str(), Some("restricted"));
+        *injection_type = serde_json::Value::String("normal".into());
+        assert_eq!(restricted, normal);
+
+        let [guest] = config.guest_configs.as_slice() else {
+            panic!("expected one guest config");
+        };
+        assert!(matches!(
+            &guest.isolation_type,
+            ConfigIsolationType::Snp {
+                injection_type: SnpInjectionType::Restricted,
+                ..
+            }
+        ));
+        let Image::SnpLinuxDirect {
+            processor_count, ..
+        } = &guest.image
+        else {
+            panic!("expected SNP Linux-direct image");
+        };
+        assert_eq!(*processor_count, 1);
+        guest.image.validate().unwrap();
+    }
+
+    #[test]
     fn snp_linux_direct_required_resources_with_initrd() {
         let image = snp_linux_direct_image(true, 1, 40960, Some(51));
 

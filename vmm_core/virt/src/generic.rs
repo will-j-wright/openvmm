@@ -305,6 +305,13 @@ pub enum IgvmIsolationConfig {
 pub struct ProtoPartitionConfig<'a> {
     /// The set of VPs to create.
     pub processor_topology: &'a ProcessorTopology,
+    /// Isolation configuration extracted from the selected IGVM platform.
+    ///
+    /// Backends that require isolation properties before prototype creation
+    /// may inspect this value early. The orchestrator still calls
+    /// [`ProtoPartition::configure_isolation`] exactly once with the same
+    /// value.
+    pub igvm_isolation_config: Option<&'a IgvmIsolationConfig>,
     /// Microsoft hypervisor guest interface configuration.
     pub hv_config: Option<HvConfig>,
     /// VM time access.
