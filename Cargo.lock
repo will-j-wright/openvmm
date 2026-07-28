@@ -10546,6 +10546,7 @@ dependencies = [
  "guid",
  "hvs_file",
  "hyperv_ic_resources",
+ "initrd_cpio",
  "inspect",
  "jiff",
  "kmsg",
