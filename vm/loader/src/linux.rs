@@ -365,16 +365,22 @@ fn import_snp_boot_pages(
             &[],
         )
         .map_err(Error::Importer)?;
-    // The backend finalization path owns the CPUID page contents because they
-    // must match the configured vCPU CPUID. The loader only reserves and tags
-    // the page for that backend-specific initialization.
+    let mut cpuid_page = crate::cpuid::HV_PSP_CPUID_PAGE::default();
+    for (index, leaf) in crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI
+        .iter()
+        .enumerate()
+    {
+        cpuid_page.cpuid_leaf_info[index].eax_in = leaf.eax;
+        cpuid_page.cpuid_leaf_info[index].ecx_in = leaf.ecx;
+    }
+    cpuid_page.count = crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI.len() as u32;
     importer
         .import_pages(
             cpuid_address / HV_PAGE_SIZE,
             1,
             "linux-snp-cpuid",
             BootPageAcceptance::CpuidPage,
-            &[],
+            cpuid_page.as_bytes(),
         )
         .map_err(Error::Importer)?;
 
@@ -1619,6 +1625,16 @@ mod tests {
         assert_eq!(
             importer.imports[1].acceptance,
             BootPageAcceptance::CpuidPage
+        );
+        let cpuid_page =
+            crate::cpuid::HV_PSP_CPUID_PAGE::read_from_bytes(&importer.imports[1].data).unwrap();
+        assert_eq!(
+            cpuid_page.count as usize,
+            crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI.len()
+        );
+        assert_eq!(
+            cpuid_page.cpuid_leaf_info[0].eax_in,
+            crate::cpuid::SNP_REQUIRED_CPUID_LEAF_LIST_UEFI[0].eax
         );
 
         let cc_blob = defs::cc_blob_sev_info::read_from_bytes(&importer.imports[2].data).unwrap();

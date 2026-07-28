@@ -21,6 +21,7 @@ use crate::create_vm_with_retry;
 
 use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
+use headervec::HeaderVec;
 use hv1_hypercall::X64RegisterIo;
 use hvdef::HvDeliverabilityNotificationsRegister;
 use hvdef::HvMessage;
@@ -31,6 +32,7 @@ use hvdef::HvX64RegisterName;
 use hvdef::HvX64RegisterPage;
 use hvdef::Vtl;
 use hvdef::hypercall::HvRegisterAssoc;
+use memory_range::MemoryRange;
 use mshv_ioctls::InterruptRequest;
 use mshv_ioctls::VcpuFd;
 use pal::unix::pthread::Pthread;
@@ -59,6 +61,24 @@ use virt_support_x86emu::translate::TranslationRegisters;
 use vmcore::reference_time::ReferenceTimeSource;
 use x86defs::RFlags;
 use x86defs::SegmentRegister;
+
+const SNP_IMPORT_CHUNK_PAGES: usize = 256;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum SnpLaunchState {
+    NotStarted,
+    Started,
+    Finished,
+    Failed,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct ImportIsolatedPagesHeader {
+    page_type: u8,
+    rsvd: [u8; 7],
+    page_count: u64,
+}
 
 impl virt::Hypervisor for LinuxMshv {
     type ProtoPartition<'a> = MshvProtoPartition<'a>;
@@ -398,8 +418,8 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             )),
             caps,
             synic_ports: Default::default(),
-            cpuid,
             software_devices: ApicSoftwareDevices::new(apic_id_map),
+            snp_launch_state: Mutex::new(SnpLaunchState::NotStarted),
             isolation: self.config.isolation,
             // SNP partition creation set TimeFreeze=1 before this object was built.
             time_frozen: Mutex::new(self.config.isolation.is_isolated()),
@@ -476,13 +496,321 @@ mod tests {
             mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16
         );
     }
+
+    #[test]
+    fn maps_supported_snp_import_types() {
+        assert_eq!(
+            snp_isolated_page_type(virt::InitialPageImportType::Normal).unwrap(),
+            Some(mshv_bindings::MSHV_ISOLATED_PAGE_NORMAL as u8)
+        );
+        assert_eq!(
+            snp_isolated_page_type(virt::InitialPageImportType::NormalUnmeasured).unwrap(),
+            Some(mshv_bindings::MSHV_ISOLATED_PAGE_UNMEASURED as u8)
+        );
+        assert_eq!(
+            snp_isolated_page_type(virt::InitialPageImportType::VpContext).unwrap(),
+            Some(mshv_bindings::MSHV_ISOLATED_PAGE_VMSA as u8)
+        );
+        assert_eq!(
+            snp_isolated_page_type(virt::InitialPageImportType::Secrets).unwrap(),
+            Some(mshv_bindings::MSHV_ISOLATED_PAGE_SECRETS as u8)
+        );
+        assert_eq!(
+            snp_isolated_page_type(virt::InitialPageImportType::Cpuid).unwrap(),
+            Some(mshv_bindings::MSHV_ISOLATED_PAGE_CPUID as u8)
+        );
+        assert_eq!(
+            snp_isolated_page_type(virt::InitialPageImportType::Shared).unwrap(),
+            None
+        );
+        assert!(matches!(
+            snp_isolated_page_type(virt::InitialPageImportType::CpuidExtendedState),
+            Err(Error(ErrorInner::UnsupportedSnpPageImportType(
+                virt::InitialPageImportType::CpuidExtendedState
+            )))
+        ));
+    }
+
+    #[test]
+    fn validates_unique_snp_pages() {
+        let pages = [
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x1000..0x2000),
+                import_type: virt::InitialPageImportType::VpContext,
+                tag: "vmsa",
+            },
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x2000..0x3000),
+                import_type: virt::InitialPageImportType::Cpuid,
+                tag: "cpuid",
+            },
+        ];
+
+        assert_eq!(
+            unique_snp_page(&pages, virt::InitialPageImportType::VpContext).unwrap(),
+            0x1000
+        );
+        assert_eq!(
+            unique_snp_page(&pages, virt::InitialPageImportType::Cpuid).unwrap(),
+            0x2000
+        );
+
+        let duplicate = [pages[0].clone(), pages[0].clone()];
+        assert!(matches!(
+            unique_snp_page(&duplicate, virt::InitialPageImportType::VpContext),
+            Err(Error(ErrorInner::MultipleSnpVmsa))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_snp_page_ranges() {
+        assert!(matches!(
+            validate_snp_page_range(MemoryRange::EMPTY),
+            Err(Error(ErrorInner::InvalidSnpPageRange))
+        ));
+
+        let pages = [virt::InitialPageImport {
+            range: MemoryRange::new(0x1000..0x3000),
+            import_type: virt::InitialPageImportType::VpContext,
+            tag: "vmsa",
+        }];
+        assert!(matches!(
+            unique_snp_page(&pages, virt::InitialPageImportType::VpContext),
+            Err(Error(ErrorInner::InvalidSnpPageRange))
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Partition trait impls
 // ---------------------------------------------------------------------------
 
+impl virt::AcceptInitialPages for MshvPartition {
+    type Error = Error;
+
+    fn accept_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), Self::Error> {
+        self.inner.snp_launch_initial_pages(pages)
+    }
+}
+
+impl MshvPartitionInner {
+    fn snp_launch_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), Error> {
+        {
+            let mut state = self.snp_launch_state.lock();
+            match *state {
+                SnpLaunchState::NotStarted => *state = SnpLaunchState::Started,
+                SnpLaunchState::Started => return Err(ErrorInner::SnpLaunchInProgress.into()),
+                // The partition is sealed after completion, so repeated
+                // acceptance is an idempotent no-op.
+                SnpLaunchState::Finished => return Ok(()),
+                SnpLaunchState::Failed => return Err(ErrorInner::SnpLaunchFailed.into()),
+            }
+        }
+
+        match self.snp_launch_initial_pages_inner(pages) {
+            Ok(()) => {
+                *self.snp_launch_state.lock() = SnpLaunchState::Finished;
+                Ok(())
+            }
+            Err(err) => {
+                *self.snp_launch_state.lock() = SnpLaunchState::Failed;
+                Err(err)
+            }
+        }
+    }
+
+    fn snp_launch_initial_pages_inner(
+        &self,
+        pages: &[virt::InitialPageImport],
+    ) -> Result<(), Error> {
+        let vmsa_gpa = unique_snp_page(pages, virt::InitialPageImportType::VpContext)?;
+        let cpuid_gpa = unique_snp_page(pages, virt::InitialPageImportType::Cpuid)?;
+        self.write_snp_cpuid_page(cpuid_gpa)?;
+
+        self.vmfd
+            .set_partition_property(
+                HvPartitionPropertyCode::IsolationState.0,
+                mshv_bindings::hv_partition_isolation_state_HV_PARTITION_ISOLATION_SECURE as u64,
+            )
+            .map_err(|e| ErrorInner::SetPartitionProperty(e.into()))?;
+
+        {
+            let mut memory = self.memory.lock();
+            for range in memory.ranges.iter_mut().flatten() {
+                if !range.mapped {
+                    self.vmfd
+                        .map_user_memory(range.region)
+                        .map_err(|e| ErrorInner::SnpMapGuestMemory(e.into()))?;
+                    range.mapped = true;
+                }
+            }
+        }
+
+        let mut batch_type = None;
+        let mut batch = Vec::with_capacity(SNP_IMPORT_CHUNK_PAGES);
+        let mut sorted_pages = pages.to_vec();
+        sorted_pages.sort_by_key(|page| page.range.start());
+        for page in sorted_pages {
+            let Some(page_type) = snp_isolated_page_type(page.import_type)? else {
+                continue;
+            };
+            validate_snp_page_range(page.range)?;
+            for pfn in
+                page.range.start() / hvdef::HV_PAGE_SIZE..page.range.end() / hvdef::HV_PAGE_SIZE
+            {
+                if batch_type != Some(page_type) || batch.len() == SNP_IMPORT_CHUNK_PAGES {
+                    if let Some(current_type) = batch_type {
+                        self.import_isolated_pages(current_type, &batch)?;
+                        batch.clear();
+                    }
+                    batch_type = Some(page_type);
+                }
+                batch.push(pfn);
+            }
+        }
+        if let Some(page_type) = batch_type {
+            self.import_isolated_pages(page_type, &batch)?;
+        }
+
+        self.complete_isolated_import()?;
+
+        let sev_control =
+            mshv_bindings::snp::get_sev_control_register(vmsa_gpa / hvdef::HV_PAGE_SIZE);
+        self.bsp_vcpufd
+            .set_hvdef_regs(&[HvRegisterAssoc::from((
+                HvX64RegisterName::SevControl,
+                sev_control,
+            ))])
+            .map_err(ErrorInner::Register)?;
+        Ok(())
+    }
+
+    fn write_snp_cpuid_page(&self, cpuid_gpa: u64) -> Result<(), Error> {
+        let mut page = self
+            .gm
+            .read_plain::<x86defs::snp::HvPspCpuidPage>(cpuid_gpa)
+            .map_err(ErrorInner::SnpGuestMemory)?;
+        let count = page.count as usize;
+        if count > x86defs::snp::HV_PSP_CPUID_LEAF_COUNT_MAX {
+            return Err(ErrorInner::TooManySnpCpuidEntries(count).into());
+        }
+
+        for leaf in &mut page.cpuid_leaf_info[..count] {
+            let mut values = self
+                .bsp_vcpufd
+                .get_cpuid_values(leaf.eax_in, leaf.ecx_in, leaf.xfem_in, leaf.xss_in)
+                .map_err(|e| ErrorInner::SnpCpuid(e.into()))?;
+            if leaf.eax_in == x86defs::cpuid::CpuidFunction::VersionAndFeatures.0 {
+                values[2] &= !(1 << 31);
+            }
+            leaf.eax_out = values[0];
+            leaf.ebx_out = values[1];
+            leaf.ecx_out = values[2];
+            leaf.edx_out = values[3];
+            leaf.reserved_z = 0;
+        }
+        self.gm
+            .write_plain(cpuid_gpa, &page)
+            .map_err(ErrorInner::SnpGuestMemory)?;
+        Ok(())
+    }
+
+    fn import_isolated_pages(&self, page_type: u8, pfns: &[u64]) -> Result<(), Error> {
+        if pfns.is_empty() {
+            return Ok(());
+        }
+
+        let mut buf =
+            HeaderVec::<ImportIsolatedPagesHeader, u64, 0>::new(ImportIsolatedPagesHeader {
+                page_type,
+                rsvd: [0; 7],
+                page_count: pfns.len() as u64,
+            });
+        buf.extend_tail_from_slice(pfns);
+        // SAFETY: The custom header has the same C layout as
+        // `mshv_import_isolated_pages`, followed by `page_count` u64 PFNs.
+        let args = unsafe {
+            &*buf
+                .as_ptr()
+                .cast::<mshv_bindings::mshv_import_isolated_pages>()
+        };
+        self.vmfd
+            .import_isolated_pages(args)
+            .map_err(|e| ErrorInner::ImportIsolatedPages(e.into()))?;
+        Ok(())
+    }
+
+    fn complete_isolated_import(&self) -> Result<(), Error> {
+        let mut data = mshv_bindings::mshv_complete_isolated_import::default();
+        data.import_data.psp_parameters.id_block.policy =
+            mshv_bindings::snp::get_default_snp_guest_policy();
+        data.import_data.psp_parameters.id_block_enabled = 0;
+        data.import_data.psp_parameters.author_key_enabled = 0;
+        self.vmfd
+            .complete_isolated_import(&data)
+            .map_err(|e| ErrorInner::CompleteIsolatedImport(e.into()))?;
+        Ok(())
+    }
+}
+
+fn unique_snp_page(
+    pages: &[virt::InitialPageImport],
+    import_type: virt::InitialPageImportType,
+) -> Result<u64, Error> {
+    let mut matches = pages.iter().filter(|page| page.import_type == import_type);
+    let page = matches.next().ok_or_else(|| match import_type {
+        virt::InitialPageImportType::VpContext => ErrorInner::MissingSnpVmsa,
+        virt::InitialPageImportType::Cpuid => ErrorInner::MissingSnpCpuid,
+        _ => unreachable!(),
+    })?;
+    if matches.next().is_some() {
+        return Err(match import_type {
+            virt::InitialPageImportType::VpContext => ErrorInner::MultipleSnpVmsa,
+            virt::InitialPageImportType::Cpuid => ErrorInner::MultipleSnpCpuid,
+            _ => unreachable!(),
+        }
+        .into());
+    }
+    validate_snp_page_range(page.range)?;
+    if page.range.len() != hvdef::HV_PAGE_SIZE {
+        return Err(ErrorInner::InvalidSnpPageRange.into());
+    }
+    Ok(page.range.start())
+}
+
+fn validate_snp_page_range(range: MemoryRange) -> Result<(), Error> {
+    if range.is_empty()
+        || !range.start().is_multiple_of(hvdef::HV_PAGE_SIZE)
+        || !range.end().is_multiple_of(hvdef::HV_PAGE_SIZE)
+    {
+        return Err(ErrorInner::InvalidSnpPageRange.into());
+    }
+    Ok(())
+}
+
+fn snp_isolated_page_type(import_type: virt::InitialPageImportType) -> Result<Option<u8>, Error> {
+    Ok(Some(match import_type {
+        virt::InitialPageImportType::Normal => mshv_bindings::MSHV_ISOLATED_PAGE_NORMAL as u8,
+        virt::InitialPageImportType::NormalUnmeasured => {
+            mshv_bindings::MSHV_ISOLATED_PAGE_UNMEASURED as u8
+        }
+        virt::InitialPageImportType::VpContext => mshv_bindings::MSHV_ISOLATED_PAGE_VMSA as u8,
+        virt::InitialPageImportType::Secrets => mshv_bindings::MSHV_ISOLATED_PAGE_SECRETS as u8,
+        virt::InitialPageImportType::Cpuid => mshv_bindings::MSHV_ISOLATED_PAGE_CPUID as u8,
+        virt::InitialPageImportType::Shared => return Ok(None),
+        virt::InitialPageImportType::CpuidExtendedState => {
+            return Err(ErrorInner::UnsupportedSnpPageImportType(import_type).into());
+        }
+    }))
+}
+
 impl virt::Partition for MshvPartition {
+    fn supports_initial_page_acceptance(
+        &self,
+    ) -> Option<&dyn virt::AcceptInitialPages<Error = Error>> {
+        (self.inner.isolation == virt::IsolationType::Snp).then_some(self)
+    }
+
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
         Some(self)
     }
