@@ -61,6 +61,7 @@ use virt_support_x86emu::translate::TranslationRegisters;
 use vmcore::reference_time::ReferenceTimeSource;
 use x86defs::RFlags;
 use x86defs::SegmentRegister;
+use zerocopy::FromZeros;
 
 const SNP_IMPORT_CHUNK_PAGES: usize = 256;
 
@@ -438,6 +439,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                 partition: partition.inner.clone(),
                 vpindex: vp.vp_index,
                 vcpufd: None,
+                register_page: None,
             })
             .collect();
 
@@ -983,11 +985,19 @@ impl virt::BindProcessor for MshvProcessorBinder {
             self.vcpufd.as_ref().unwrap()
         };
 
-        let reg_page_ptr = vcpufd
-            .get_vp_reg_page()
-            .expect("register page must be mapped")
-            .0
-            .cast::<HvX64RegisterPage>();
+        let reg_page_ptr = if self.partition.isolation == virt::IsolationType::Snp {
+            std::ptr::from_mut(
+                self.register_page
+                    .get_or_insert_with(|| Box::new(HvX64RegisterPage::new_zeroed()))
+                    .as_mut(),
+            )
+        } else {
+            vcpufd
+                .get_vp_reg_page()
+                .ok_or(ErrorInner::MissingRegisterPage)?
+                .0
+                .cast::<HvX64RegisterPage>()
+        };
 
         let runner = MshvVpRunner {
             vcpufd,
@@ -1002,24 +1012,29 @@ impl virt::BindProcessor for MshvProcessorBinder {
             deliverability_notifications: HvDeliverabilityNotificationsRegister::new(),
         };
 
-        // Set the APIC state.
-        let apic_base =
-            virt::vp::Apic::at_reset(&this.partition.caps, &this.inner.vp_info).apic_base;
+        if this.partition.isolation != virt::IsolationType::Snp {
+            // Set the APIC state.
+            let apic_base =
+                virt::vp::Apic::at_reset(&this.partition.caps, &this.inner.vp_info).apic_base;
 
-        let regs = &[
-            HvRegisterAssoc::from((
-                HvX64RegisterName::InitialApicId,
-                u64::from(inner.vp_info.apic_id),
-            )),
-            HvRegisterAssoc::from((HvX64RegisterName::ApicBase, apic_base)),
-            HvRegisterAssoc::from((HvX64RegisterName::ApicId, u64::from(inner.vp_info.apic_id))),
-        ];
+            let regs = &[
+                HvRegisterAssoc::from((
+                    HvX64RegisterName::InitialApicId,
+                    u64::from(inner.vp_info.apic_id),
+                )),
+                HvRegisterAssoc::from((HvX64RegisterName::ApicBase, apic_base)),
+                HvRegisterAssoc::from((
+                    HvX64RegisterName::ApicId,
+                    u64::from(inner.vp_info.apic_id),
+                )),
+            ];
 
-        let reg_count = if this.partition.caps.x2apic { 2 } else { 3 };
+            let reg_count = if this.partition.caps.x2apic { 2 } else { 3 };
 
-        vcpufd
-            .set_hvdef_regs(&regs[..reg_count])
-            .map_err(ErrorInner::Register)?;
+            vcpufd
+                .set_hvdef_regs(&regs[..reg_count])
+                .map_err(ErrorInner::Register)?;
+        }
 
         Ok(this)
     }
@@ -1054,6 +1069,20 @@ impl MshvProcessor<'_> {
         exit: &HvMessage,
         dev: &impl CpuIo,
     ) -> Result<(), VpHaltReason> {
+        if self.partition.isolation == virt::IsolationType::Snp
+            && !matches!(
+                exit.header.typ,
+                HvMessageType::HvMessageTypeUnrecoverableException
+                    | HvMessageType::HvMessageTypeX64SevVmgexitIntercept
+            )
+        {
+            tracelimit::warn_ratelimited!(
+                exit_type = ?exit.header.typ,
+                "unexpected non-VMGEXIT message for SNP VP"
+            );
+            return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+        }
+
         match exit.header.typ {
             HvMessageType::HvMessageTypeUnrecoverableException => {
                 return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
@@ -1076,6 +1105,10 @@ impl MshvProcessor<'_> {
             HvMessageType::HvMessageTypeX64ApicEoi => {
                 let msg = exit.as_message::<hvdef::HvX64ApicEoiMessage>();
                 dev.handle_eoi(msg.interrupt_vector);
+            }
+            HvMessageType::HvMessageTypeX64SevVmgexitIntercept => {
+                tracelimit::warn_ratelimited!("SNP VMGEXIT handling is not implemented");
+                return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
             }
             exit_type => {
                 panic!("Unhandled vcpu exit code {exit_type:?}");

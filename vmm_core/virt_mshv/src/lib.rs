@@ -416,6 +416,8 @@ pub struct MshvProcessorBinder {
     partition: Arc<MshvPartitionInner>,
     vcpufd: Option<VcpuFd>,
     vpindex: VpIndex,
+    #[cfg(guest_arch = "x86_64")]
+    register_page: Option<Box<hvdef::HvX64RegisterPage>>,
 }
 
 /// Wraps a VcpuFd for running a VP. On x86_64, also provides access to the
@@ -439,8 +441,9 @@ impl MshvVpRunner<'_> {
     #[cfg(guest_arch = "x86_64")]
     fn reg_page(&mut self) -> &mut hvdef::HvX64RegisterPage {
         // SAFETY: VP is stopped (returned from run()), so we have exclusive
-        // access. The raw pointer was obtained from the kernel's mmap of
-        // the register page and remains valid for the VP's lifetime.
+        // access. The pointer is either the kernel's VP register-page mapping
+        // or an SNP scratch page owned by the processor binder; both remain
+        // valid for the processor borrow.
         unsafe { &mut *self.reg_page }
     }
 }
@@ -661,6 +664,9 @@ enum ErrorInner {
     CreateVMInitFailed(#[source] anyhow::Error),
     #[error("failed to create VCPU")]
     CreateVcpu(#[source] KernelError),
+    #[cfg(guest_arch = "x86_64")]
+    #[error("VP register page is unavailable")]
+    MissingRegisterPage,
     #[error("vtl2 not supported")]
     Vtl2NotSupported,
     #[error("isolation not supported")]
