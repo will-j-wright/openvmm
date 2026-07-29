@@ -3287,6 +3287,7 @@ impl LoadedVmInner {
                 ref initrd,
                 ref cmdline,
                 enable_serial,
+                snp_restricted_injection,
                 boot_mode,
             } => {
                 match boot_mode {
@@ -3303,6 +3304,7 @@ impl LoadedVmInner {
                     isolation: self.hypervisor_cfg.with_isolation,
                     shared_gpa_bit: None,
                     snp_c_bit: self.partition.caps().snp_c_bit,
+                    snp_restricted_injection,
                 };
                 super::vm_loaders::linux::load_linux_x86(
                     &kernel_config,
@@ -3337,6 +3339,7 @@ impl LoadedVmInner {
                 ref initrd,
                 ref cmdline,
                 enable_serial,
+                snp_restricted_injection: _,
                 boot_mode,
             } => {
                 use openvmm_defs::config::LinuxDirectBootMode;
@@ -3356,6 +3359,7 @@ impl LoadedVmInner {
                     isolation: self.hypervisor_cfg.with_isolation,
                     shared_gpa_bit,
                     snp_c_bit: None,
+                    snp_restricted_injection: false,
                 };
 
                 if self.hypervisor_cfg.with_isolation
