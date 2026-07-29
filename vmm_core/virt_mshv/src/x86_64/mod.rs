@@ -82,6 +82,14 @@ struct ImportIsolatedPagesHeader {
     page_count: u64,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct ModifyGpaHostAccessHeader {
+    flags: u8,
+    rsvd: [u8; 7],
+    page_count: u64,
+}
+
 const GHCB_RAX_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, rax) / size_of::<u64>());
 const GHCB_SW_EXIT_CODE_VALID_BIT: u64 =
@@ -116,6 +124,45 @@ fn ghcb_mmio_fields_are_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
 
 fn ghcb_exit_info2_is_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
     ghcb.save.valid_bitmap1 & GHCB_SW_EXIT_INFO2_VALID_BIT != 0
+}
+
+fn snp_host_access_flags(visibility: u32) -> Option<u8> {
+    let acquire = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE;
+    let readable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE;
+    let writable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE;
+    match visibility {
+        0 => Some(0),
+        // The current MSHV kernel tests the readable flag when setting
+        // writable access, so a read-only request would become read-write.
+        1 => None,
+        3 => Some(acquire | readable | writable),
+        _ => None,
+    }
+}
+
+fn parse_snp_gpa_range(
+    range: mshv_bindings::hv_gpa_page_range,
+) -> Result<(u64, u64), VpHaltReason> {
+    const PAGES_PER_2MB: u64 = 512;
+
+    // SAFETY: The GPA attribute intercept supplies the `page` union variant.
+    let page = unsafe { range.page };
+    let start_pfn = page.basepfn();
+    let unit_count = page
+        .additional_pages()
+        .checked_add(1)
+        .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+    let page_count = if page.largepage() == 0 {
+        unit_count
+    } else {
+        if !start_pfn.is_multiple_of(PAGES_PER_2MB) {
+            return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+        }
+        unit_count
+            .checked_mul(PAGES_PER_2MB)
+            .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?
+    };
+    Ok((start_pfn, page_count))
 }
 
 impl virt::Hypervisor for LinuxMshv {
@@ -661,6 +708,49 @@ mod tests {
         ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO2_VALID_BIT;
         assert!(ghcb_exit_info2_is_valid(&ghcb));
     }
+
+    #[test]
+    fn builds_snp_host_access_flags() {
+        assert_eq!(snp_host_access_flags(0), Some(0));
+        assert_eq!(snp_host_access_flags(1), None);
+        assert_eq!(
+            snp_host_access_flags(3),
+            Some(
+                1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE
+                    | 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE
+                    | 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE
+            )
+        );
+        assert_eq!(snp_host_access_flags(2), None);
+    }
+
+    #[test]
+    fn parses_snp_gpa_ranges() {
+        let mut range = mshv_bindings::hv_gpa_page_range::default();
+        range.page = mshv_bindings::hv_gpa_page_range__bindgen_ty_1 {
+            _bitfield_align_1: [],
+            _bitfield_1: mshv_bindings::hv_gpa_page_range__bindgen_ty_1::new_bitfield_1(
+                2, 0, 0x1234,
+            ),
+        };
+        assert_eq!(parse_snp_gpa_range(range).unwrap(), (0x1234, 3));
+
+        range.page = mshv_bindings::hv_gpa_page_range__bindgen_ty_1 {
+            _bitfield_align_1: [],
+            _bitfield_1: mshv_bindings::hv_gpa_page_range__bindgen_ty_1::new_bitfield_1(
+                1, 1, 0x200,
+            ),
+        };
+        assert_eq!(parse_snp_gpa_range(range).unwrap(), (0x200, 1024));
+
+        range.page = mshv_bindings::hv_gpa_page_range__bindgen_ty_1 {
+            _bitfield_align_1: [],
+            _bitfield_1: mshv_bindings::hv_gpa_page_range__bindgen_ty_1::new_bitfield_1(
+                0, 1, 0x201,
+            ),
+        };
+        assert!(parse_snp_gpa_range(range).is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,6 +1270,7 @@ impl MshvProcessor<'_> {
             && !matches!(
                 exit.header.typ,
                 HvMessageType::HvMessageTypeUnrecoverableException
+                    | HvMessageType::HvMessageTypeGpaAttributeIntercept
                     | HvMessageType::HvMessageTypeX64SevVmgexitIntercept
             )
         {
@@ -1228,6 +1319,9 @@ impl MshvProcessor<'_> {
                 let msg = exit.as_message::<hvdef::HvX64ApicEoiMessage>();
                 dev.handle_eoi(msg.interrupt_vector);
             }
+            HvMessageType::HvMessageTypeGpaAttributeIntercept => {
+                self.handle_snp_gpa_attribute_intercept(exit)?;
+            }
             HvMessageType::HvMessageTypeX64SevVmgexitIntercept => {
                 self.handle_sev_vmgexit_intercept(exit, dev).await?;
             }
@@ -1236,6 +1330,93 @@ impl MshvProcessor<'_> {
             }
         }
         Ok(())
+    }
+
+    fn modify_gpa_host_access(&self, gpas: &[u64], flags: u8) -> Result<(), VpHaltReason> {
+        if gpas.is_empty() {
+            return Ok(());
+        }
+
+        let mut buf =
+            HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
+                flags,
+                rsvd: [0; 7],
+                page_count: gpas.len() as u64,
+            });
+        buf.extend_tail_from_slice(gpas);
+        // SAFETY: The custom header matches `mshv_modify_gpa_host_access`
+        // followed by `page_count` contiguous GPA values. Despite the UAPI
+        // field name `guest_pfns`, the kernel converts each entry with
+        // `HVPFN_DOWN`, so the variable array contains byte GPAs.
+        let args = unsafe {
+            &*buf
+                .as_ptr()
+                .cast::<mshv_bindings::mshv_modify_gpa_host_access>()
+        };
+        self.partition
+            .vmfd
+            .modify_gpa_host_access(args)
+            .map_err(|err| {
+                tracelimit::error_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    first_gpa = gpas[0],
+                    page_count = gpas.len(),
+                    flags,
+                    "failed to modify SNP GPA host access"
+                );
+                VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+            })
+    }
+
+    fn handle_snp_gpa_attribute_intercept(&self, message: &HvMessage) -> Result<(), VpHaltReason> {
+        const BATCH_PAGES: usize = 256;
+        const {
+            assert!(
+                size_of::<mshv_bindings::hv_x64_gpa_attribute_intercept_message>()
+                    <= hvdef::HV_MESSAGE_PAYLOAD_SIZE
+            );
+        }
+
+        // SAFETY: The complete Hyper-V message payload buffer has the checked
+        // size, and read_unaligned handles the packed message alignment.
+        let info = unsafe {
+            std::ptr::read_unaligned(
+                message
+                    .payload_buffer
+                    .as_ptr()
+                    .cast::<mshv_bindings::hv_x64_gpa_attribute_intercept_message>(),
+            )
+        };
+        let range_count = info.__bindgen_anon_1.range_count() as usize;
+        let ranges = info.ranges;
+        if range_count == 0 || range_count > ranges.len() {
+            return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+        }
+
+        let flags = snp_host_access_flags(info.__bindgen_anon_1.host_visibility())
+            .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+
+        // TODO: Before revoking host access, block new GuestMemory accesses
+        // to these pages and drain concurrent accesses and locked ranges.
+        let mut gpas = Vec::with_capacity(BATCH_PAGES);
+        for range in &ranges[..range_count] {
+            let (start_pfn, page_count) = parse_snp_gpa_range(*range)?;
+            let end_pfn = start_pfn
+                .checked_add(page_count)
+                .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+
+            for pfn in start_pfn..end_pfn {
+                gpas.push(
+                    pfn.checked_mul(hvdef::HV_PAGE_SIZE)
+                        .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?,
+                );
+                if gpas.len() == BATCH_PAGES {
+                    self.modify_gpa_host_access(&gpas, flags)?;
+                    gpas.clear();
+                }
+            }
+        }
+        self.modify_gpa_host_access(&gpas, flags)
     }
 
     fn sev_set_reg(&self, name: HvX64RegisterName, value: u64) -> Result<(), VpHaltReason> {
