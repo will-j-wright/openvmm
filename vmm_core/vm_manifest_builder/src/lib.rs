@@ -536,7 +536,10 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::EnlightenedLinuxDirect => {
-                result.chipset = BaseChipsetManifest::empty();
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: is_x86,
+                    ..BaseChipsetManifest::empty()
+                };
                 result.capabilities.with_ioapic = is_x86;
                 result.capabilities.with_psp = self.psp;
                 if is_x86 {

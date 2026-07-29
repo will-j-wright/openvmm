@@ -24,6 +24,8 @@ pub struct SnpVmsaState {
     pub pat: u64,
     /// Extended control register 0.
     pub xcr0: u64,
+    /// Whether restricted interrupt injection is enabled.
+    pub restricted_injection: bool,
 }
 
 /// An error parsing a direct-boot SNP VMSA.
@@ -34,12 +36,20 @@ pub enum SnpVmsaError {
     UnsupportedState,
 }
 
+/// Configuration for a direct-boot SNP VMSA.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+pub struct SnpVmsaConfig {
+    /// Enables restricted interrupt injection.
+    pub restricted_injection: bool,
+}
+
 /// Builds the direct-boot SNP VMSA corresponding to `initial`.
-pub fn vmsa_from_initial_regs(initial: &X86InitialRegs) -> SevVmsa {
+pub fn vmsa_from_initial_regs(initial: &X86InitialRegs, config: SnpVmsaConfig) -> SevVmsa {
     vmsa_from_state(&SnpVmsaState {
         registers: initial.registers,
         pat: initial.pat.value,
         xcr0: x86defs::xsave::XFEATURE_X87,
+        restricted_injection: config.restricted_injection,
     })
 }
 
@@ -84,6 +94,7 @@ pub fn state_from_vmsa(vmsa: &SevVmsa) -> Result<SnpVmsaState, SnpVmsaError> {
         },
         pat: vmsa.pat,
         xcr0: vmsa.xcr0,
+        restricted_injection: vmsa.sev_features.restrict_injection(),
     };
 
     if &vmsa_from_state(&state) != vmsa {
@@ -133,6 +144,8 @@ fn vmsa_from_state(state: &SnpVmsaState) -> SevVmsa {
     vmsa.r14 = registers.r14;
     vmsa.r15 = registers.r15;
     vmsa.sev_features.set_snp(true);
+    vmsa.sev_features
+        .set_restrict_injection(state.restricted_injection);
     vmsa.xcr0 = state.xcr0;
 
     vmsa
@@ -199,7 +212,7 @@ mod tests {
             },
         };
 
-        let vmsa = vmsa_from_initial_regs(&initial);
+        let vmsa = vmsa_from_initial_regs(&initial, SnpVmsaConfig::default());
         let state = state_from_vmsa(&vmsa).unwrap();
 
         assert_eq!(state.registers, initial.registers);
@@ -216,12 +229,31 @@ mod tests {
             mtrrs: Default::default(),
             pat: Default::default(),
         };
-        let mut vmsa = vmsa_from_initial_regs(&initial);
+        let mut vmsa = vmsa_from_initial_regs(&initial, SnpVmsaConfig::default());
         vmsa.virtual_tom = 0x1000;
 
         assert!(matches!(
             state_from_vmsa(&vmsa),
             Err(SnpVmsaError::UnsupportedState)
         ));
+    }
+
+    #[test]
+    fn enables_restricted_injection() {
+        let initial = X86InitialRegs {
+            registers: Default::default(),
+            mtrrs: Default::default(),
+            pat: Default::default(),
+        };
+
+        let vmsa = vmsa_from_initial_regs(
+            &initial,
+            SnpVmsaConfig {
+                restricted_injection: true,
+            },
+        );
+
+        assert!(vmsa.sev_features.restrict_injection());
+        assert!(state_from_vmsa(&vmsa).unwrap().restricted_injection);
     }
 }
