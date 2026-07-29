@@ -418,6 +418,27 @@ pub struct MshvProcessorBinder {
     vpindex: VpIndex,
     #[cfg(guest_arch = "x86_64")]
     register_page: Option<Box<hvdef::HvX64RegisterPage>>,
+    #[cfg(guest_arch = "x86_64")]
+    ghcb_page: Option<MshvGhcbPage>,
+}
+
+#[cfg(guest_arch = "x86_64")]
+struct MshvGhcbPage(*mut x86defs::snp::GhcbPage);
+
+// SAFETY: The mapping is uniquely owned by the processor binder and is only
+// accessed while the binder is mutably borrowed by a bound processor.
+#[cfg(guest_arch = "x86_64")]
+unsafe impl Send for MshvGhcbPage {}
+
+#[cfg(guest_arch = "x86_64")]
+impl Drop for MshvGhcbPage {
+    fn drop(&mut self) {
+        // SAFETY: The pointer was returned by mmap for exactly one page and is
+        // unmapped exactly once here.
+        unsafe {
+            libc::munmap(self.0.cast(), hvdef::HV_PAGE_SIZE as usize);
+        }
+    }
 }
 
 /// Wraps a VcpuFd for running a VP. On x86_64, also provides access to the
@@ -426,6 +447,8 @@ struct MshvVpRunner<'a> {
     vcpufd: &'a VcpuFd,
     #[cfg(guest_arch = "x86_64")]
     reg_page: *mut hvdef::HvX64RegisterPage,
+    #[cfg(guest_arch = "x86_64")]
+    ghcb_page: Option<*mut x86defs::snp::GhcbPage>,
 }
 
 impl MshvVpRunner<'_> {
@@ -445,6 +468,13 @@ impl MshvVpRunner<'_> {
         // or an SNP scratch page owned by the processor binder; both remain
         // valid for the processor borrow.
         unsafe { &mut *self.reg_page }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn ghcb_page(&mut self) -> Option<&mut x86defs::snp::GhcbPage> {
+        // SAFETY: The mapped page is owned by the mutably borrowed processor
+        // binder and remains valid for this processor borrow.
+        self.ghcb_page.map(|page| unsafe { &mut *page })
     }
 }
 
@@ -667,6 +697,9 @@ enum ErrorInner {
     #[cfg(guest_arch = "x86_64")]
     #[error("VP register page is unavailable")]
     MissingRegisterPage,
+    #[cfg(guest_arch = "x86_64")]
+    #[error("failed to map the SNP GHCB page")]
+    MapGhcbPage(#[source] io::Error),
     #[error("vtl2 not supported")]
     Vtl2NotSupported,
     #[error("isolation not supported")]
