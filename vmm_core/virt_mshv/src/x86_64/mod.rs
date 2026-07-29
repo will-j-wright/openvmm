@@ -114,6 +114,10 @@ fn ghcb_mmio_fields_are_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
         == GHCB_SW_EXIT_INFO2_VALID_BIT | GHCB_SW_SCRATCH_VALID_BIT
 }
 
+fn ghcb_exit_info2_is_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
+    ghcb.save.valid_bitmap1 & GHCB_SW_EXIT_INFO2_VALID_BIT != 0
+}
+
 impl virt::Hypervisor for LinuxMshv {
     type ProtoPartition<'a> = MshvProtoPartition<'a>;
     type Partition = MshvPartition;
@@ -647,6 +651,15 @@ mod tests {
         assert!(!ghcb_mmio_fields_are_valid(&ghcb));
         ghcb.save.valid_bitmap1 |= GHCB_SW_SCRATCH_VALID_BIT;
         assert!(ghcb_mmio_fields_are_valid(&ghcb));
+    }
+
+    #[test]
+    fn validates_ghcb_exit_info2() {
+        let mut ghcb = x86defs::snp::GhcbPage::new_zeroed();
+
+        assert!(!ghcb_exit_info2_is_valid(&ghcb));
+        ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO2_VALID_BIT;
+        assert!(ghcb_exit_info2_is_valid(&ghcb));
     }
 }
 
@@ -1458,6 +1471,43 @@ impl MshvProcessor<'_> {
                         .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
                     ghcb.save.sw_exit_info1 = 0;
                 }
+            }
+            exit_code if exit_code == u64::from(SVM_EXITCODE_HV_DOORBELL_PAGE) => {
+                if info.ghcb_page.standard.sw_exit_info1 != u64::from(SVM_NAE_HV_DOORBELL_PAGE_SET)
+                {
+                    return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                }
+
+                let ghcb = self
+                    .runner
+                    .ghcb_page()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                let doorbell_gpa = info.ghcb_page.standard.sw_exit_info2;
+                let doorbell_end = doorbell_gpa
+                    .checked_add(hvdef::HV_PAGE_SIZE)
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                if !ghcb_exit_info2_is_valid(ghcb)
+                    || ghcb.save.sw_exit_info2 != doorbell_gpa
+                    || !doorbell_gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+                    || !self.partition.mem_layout.ram().iter().any(|range| {
+                        range
+                            .range
+                            .contains(&MemoryRange::new(doorbell_gpa..doorbell_end))
+                    })
+                {
+                    return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                }
+
+                // Userspace does not maintain SNP page-visibility state yet.
+                // Hyper-V validates that the GPA is suitable for use as a
+                // doorbell page; propagate a rejected register write as a
+                // fatal guest error.
+                self.sev_set_reg(HvX64RegisterName::SevDoorbellGpa, doorbell_gpa | 1)?;
+                let ghcb = self
+                    .runner
+                    .ghcb_page()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                ghcb.save.sw_exit_info1 = 0;
             }
             exit_code => {
                 tracelimit::warn_ratelimited!(
