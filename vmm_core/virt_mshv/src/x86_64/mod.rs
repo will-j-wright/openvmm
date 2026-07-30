@@ -165,6 +165,20 @@ fn parse_snp_gpa_range(
     Ok((start_pfn, page_count))
 }
 
+fn sanitize_snp_cpuid(function: u32, index: u32, values: &mut [u32; 4]) {
+    if function == x86defs::cpuid::CpuidFunction::VersionAndFeatures.0 {
+        values[2] &= !(1 << 31);
+    }
+    if function == x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0 && index == 1 {
+        // TODO: Import a CPUID extended-state page and preserve supported XSS
+        // components. The normal SNP CPUID page does not contain the required
+        // component subleaves, so exposing this bitmap makes Linux consume
+        // missing entries as zero-offset user state.
+        values[2] = 0;
+        values[3] = 0;
+    }
+}
+
 impl virt::Hypervisor for LinuxMshv {
     type ProtoPartition<'a> = MshvProtoPartition<'a>;
     type Partition = MshvPartition;
@@ -751,6 +765,25 @@ mod tests {
         };
         assert!(parse_snp_gpa_range(range).is_err());
     }
+
+    #[test]
+    fn sanitizes_snp_cpuid() {
+        let mut values = [0, 0, 1 << 31, 0];
+        sanitize_snp_cpuid(
+            x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
+            0,
+            &mut values,
+        );
+        assert_eq!(values[2], 0);
+
+        let mut values = [0xb, 0x240, 0x1800, 1];
+        sanitize_snp_cpuid(
+            x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0,
+            1,
+            &mut values,
+        );
+        assert_eq!(values, [0xb, 0x240, 0, 0]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,9 +905,7 @@ impl MshvPartitionInner {
                 .bsp_vcpufd
                 .get_cpuid_values(leaf.eax_in, leaf.ecx_in, leaf.xfem_in, leaf.xss_in)
                 .map_err(|e| ErrorInner::SnpCpuid(e.into()))?;
-            if leaf.eax_in == x86defs::cpuid::CpuidFunction::VersionAndFeatures.0 {
-                values[2] &= !(1 << 31);
-            }
+            sanitize_snp_cpuid(leaf.eax_in, leaf.ecx_in, &mut values);
             leaf.eax_out = values[0];
             leaf.ebx_out = values[1];
             leaf.ecx_out = values[2];
