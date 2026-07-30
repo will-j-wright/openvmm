@@ -324,6 +324,7 @@ fn load_linux(params: LoadLinuxParams<'_>) -> Result<VpContext, Error> {
         initrd: initrd_info,
         dtb: None,
         bzimage_setup_header: None,
+        aci_initial_import_ranges: Vec::new(),
     };
 
     // The loader owns the sub-1 MB layout; we supply only the command line and
