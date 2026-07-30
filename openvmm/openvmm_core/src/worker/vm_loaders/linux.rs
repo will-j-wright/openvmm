@@ -57,6 +57,7 @@ pub struct KernelConfig<'a> {
     pub isolation: Option<IsolationType>,
     pub snp_c_bit: Option<u8>,
     pub snp_restricted_injection: bool,
+    pub vp_count: u32,
 }
 
 // Bring-up hack for SNP Linux direct boot. Without a bootshim or firmware to
@@ -151,9 +152,20 @@ pub fn load_linux_x86(
     });
 
     let cmdline = CString::new(cfg.cmdline).unwrap();
+    // TODO: Replace restricted injection as this temporary selector with an
+    // explicit ACI Hyper-V SNP direct-boot configuration and CLI argument.
+    // The CLI currently validates restricted injection as MSHV-only, which
+    // keeps the shared KVM SNP direct-boot layout unchanged.
+    let aci_hyperv = cfg.isolation == Some(IsolationType::Snp) && cfg.snp_restricted_injection;
+    if aci_hyperv {
+        tracing::info!("using ACI Hyper-V SNP direct-boot layout");
+    }
     let snp_boot = if cfg.isolation == Some(IsolationType::Snp) {
         Some(loader::linux::SnpBootConfig {
             c_bit: cfg.snp_c_bit.ok_or(Error::MissingSnpCBit)?,
+            aci_hyperv: aci_hyperv.then_some(loader::linux::AciHypervSnpBootConfig {
+                vp_count: cfg.vp_count,
+            }),
         })
     } else {
         None
@@ -163,7 +175,7 @@ pub fn load_linux_x86(
 
     // The loader owns the sub-1 MB layout; we supply only the kernel, command
     // line, an ACPI builder, and the default SMBIOS identity.
-    loader::linux::load_x86(
+    let load_info = loader::linux::load_x86(
         &mut loader,
         &mut kernel_file,
         initrd_config,
@@ -192,10 +204,14 @@ pub fn load_linux_x86(
         mut page_imports,
     } = loader.initial_regs_and_page_imports();
     if cfg.isolation == Some(IsolationType::Snp) {
-        complete_snp_direct_ram_imports(
-            &mut page_imports,
-            cfg.mem_layout.ram().iter().map(|range| range.range),
-        );
+        if aci_hyperv {
+            complete_snp_direct_ram_imports(&mut page_imports, load_info.aci_initial_import_ranges);
+        } else {
+            complete_snp_direct_ram_imports(
+                &mut page_imports,
+                cfg.mem_layout.ram().iter().map(|range| range.range),
+            );
+        }
     }
 
     Ok(InitialLoad { regs, page_imports })
@@ -1068,5 +1084,54 @@ mod tests {
             page_imports[0].import_type,
             virt::InitialPageImportType::Secrets
         );
+    }
+
+    #[test]
+    fn completes_only_aci_initial_ranges() {
+        let mut page_imports = vec![
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x1000..0x2000),
+                import_type: virt::InitialPageImportType::Normal,
+                tag: "loader",
+            },
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x1a00000..0x1b00000),
+                import_type: virt::InitialPageImportType::Normal,
+                tag: "loader",
+            },
+            virt::InitialPageImport {
+                range: MemoryRange::new(0x800000..0x801000),
+                import_type: virt::InitialPageImportType::Cpuid,
+                tag: "loader-metadata",
+            },
+        ];
+
+        complete_snp_direct_ram_imports(
+            &mut page_imports,
+            [
+                MemoryRange::new(0..0x300000),
+                MemoryRange::new(0x1a00000..0x4000000),
+            ],
+        );
+
+        assert!(
+            page_imports
+                .iter()
+                .filter(|page| page.tag == "linux-snp-direct-ram")
+                .all(|page| {
+                    page.range.end() <= 0x300000
+                        || (page.range.start() >= 0x1a00000 && page.range.end() <= 0x4000000)
+                })
+        );
+        assert!(
+            !page_imports
+                .iter()
+                .any(|page| page.range.start() >= 0x4000000)
+        );
+        assert!(page_imports.iter().any(|page| {
+            page.tag == "loader-metadata"
+                && page.range == MemoryRange::new(0x800000..0x801000)
+                && page.import_type == virt::InitialPageImportType::Cpuid
+        }));
     }
 }
