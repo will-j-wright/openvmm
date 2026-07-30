@@ -3,7 +3,6 @@
 
 //! Loader implementation to load IGVM files.
 
-use super::super::memory_layout::ChipsetMmioRanges;
 use guestmem::GuestMemory;
 use hvdef::HV_PAGE_SIZE;
 use igvm::IgvmDirectiveHeader;
@@ -30,6 +29,8 @@ use memory_range::MemoryRange;
 use memory_range::subtract_ranges;
 use openvmm_defs::config::SerialInformation;
 use openvmm_defs::config::Vtl2BaseAddressType;
+use openvmm_vm_layout::ChipsetMmioRanges;
+use openvmm_vm_layout::Vtl2MemoryLayoutRequest;
 use range_map_vec::RangeMap;
 use std::collections::HashMap;
 use std::io::Read;
@@ -338,15 +339,6 @@ pub fn vtl2_memory_info(igvm_file: &IgvmFile) -> Result<MemoryRange, Error> {
         Some(range) => Ok(range),
         None => Err(Error::Vtl2MemorySource),
     }
-}
-
-/// Information needed to allocate a VTL2 memory range in the VM memory layout.
-#[derive(Debug, Clone, Copy)]
-pub struct Vtl2MemoryLayoutRequest {
-    /// The number of bytes to reserve for VTL2.
-    pub size: u64,
-    /// The required relocation alignment.
-    pub alignment: u64,
 }
 
 /// Determine the VTL2 memory allocation constraints from a provided

@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::worker::memory_layout::ChipsetMmioRanges;
 use guestmem::GuestMemory;
 use loader::importer::Aarch64Register;
 use loader::importer::X86Register;
@@ -9,6 +8,7 @@ use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
 use memory_range::MemoryRange;
 use openvmm_defs::config::IsolationType;
+use openvmm_vm_layout::ChipsetMmioRanges;
 use std::ffi::CString;
 use std::io::Seek;
 use thiserror::Error;

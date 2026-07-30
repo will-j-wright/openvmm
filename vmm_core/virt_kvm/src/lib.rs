@@ -112,7 +112,7 @@ pub enum KvmError {
     UnsupportedSnpIgvmVmsaOrder,
     #[error("SNP IGVM VMSA GPA {0:#x} is not supported by KVM")]
     InvalidSnpVmsaGpa(u64),
-    #[error("invalid SNP VMSA: {0}")]
+    #[error("invalid SNP IGVM VMSA: {0}")]
     InvalidSnpIgvmVmsa(&'static str),
     #[error("KVM does not support SNP VMSA feature bits {0:#x}")]
     UnsupportedSnpVmsaFeatures(u64),

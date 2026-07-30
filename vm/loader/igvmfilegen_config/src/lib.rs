@@ -7,6 +7,8 @@
 #![expect(missing_docs)]
 #![forbid(unsafe_code)]
 
+use openvmm_vm_layout::VmLayoutPlan;
+use openvmm_vm_layout::X86ProcessorTopologyPlan;
 use product_policy::ProductPolicy;
 use serde::Deserialize;
 use serde::Serialize;
@@ -128,13 +130,13 @@ pub enum Image {
     SnpLinuxDirect {
         /// The Linux image to load.
         linux: LinuxImage,
-        /// The number of virtual processors in the guest.
-        #[serde(default = "default_processor_count")]
-        processor_count: u32,
-        /// The number of pages in the guest.
-        memory_page_count: u64,
-        /// The page-table address bit used as the SNP encryption bit.
-        c_bit_position: u8,
+        /// Processor topology shared with OpenVMM.
+        processor_topology: X86ProcessorTopologyPlan,
+        /// Address-space layout shared with OpenVMM.
+        vm_layout: VmLayoutPlan,
+        /// Explicit SNP encryption-bit position. When omitted, query host CPUID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        c_bit_position: Option<u8>,
     },
 }
 
@@ -176,27 +178,32 @@ impl Image {
     /// Validate constraints intrinsic to this image configuration.
     pub fn validate(&self) -> Result<(), ImageValidationError> {
         if let Image::SnpLinuxDirect {
-            processor_count,
-            memory_page_count,
+            processor_topology,
+            ref vm_layout,
             c_bit_position,
             ..
         } = *self
         {
-            if processor_count == 0 {
+            if processor_topology.proc_count == 0 {
                 return Err(ImageValidationError::ZeroProcessorCount);
             }
-            if memory_page_count == 0 {
+            let memory_byte_count = vm_layout
+                .node_mem_sizes
+                .iter()
+                .try_fold(0u64, |total, size| total.checked_add(*size))
+                .ok_or(ImageValidationError::MemoryByteCountOverflow)?;
+            if memory_byte_count == 0 {
                 return Err(ImageValidationError::ZeroMemoryPageCount);
             }
-
-            let memory_byte_count = memory_page_count
-                .checked_mul(IGVM_PAGE_SIZE_BYTES)
-                .ok_or(ImageValidationError::MemoryByteCountTooLarge { memory_page_count })?;
             if u32::try_from(memory_byte_count).is_err() {
-                return Err(ImageValidationError::MemoryByteCountTooLarge { memory_page_count });
+                return Err(ImageValidationError::MemoryByteCountTooLarge {
+                    memory_page_count: memory_byte_count / IGVM_PAGE_SIZE_BYTES,
+                });
             }
 
-            if !X64_PAGE_TABLE_ADDRESS_BIT_RANGE.contains(&c_bit_position) {
+            if let Some(c_bit_position) = c_bit_position
+                && !X64_PAGE_TABLE_ADDRESS_BIT_RANGE.contains(&c_bit_position)
+            {
                 return Err(ImageValidationError::InvalidCBitPosition { c_bit_position });
             }
         }
@@ -218,6 +225,8 @@ pub enum ImageValidationError {
         /// The invalid number of 4-KiB pages.
         memory_page_count: u64,
     },
+    /// The requested NUMA memory sizes overflow `u64`.
+    MemoryByteCountOverflow,
     /// The SNP C-bit is outside the address bits available in x64 page tables.
     InvalidCBitPosition {
         /// The invalid C-bit position.
@@ -234,6 +243,7 @@ impl std::fmt::Display for ImageValidationError {
                 f,
                 "memory_page_count {memory_page_count} has a byte count that does not fit in u32"
             ),
+            Self::MemoryByteCountOverflow => write!(f, "memory byte count overflows u64"),
             Self::InvalidCBitPosition { c_bit_position } => write!(
                 f,
                 "c_bit_position {c_bit_position} is outside the supported range 32..=51"
@@ -243,10 +253,6 @@ impl std::fmt::Display for ImageValidationError {
 }
 
 impl std::error::Error for ImageValidationError {}
-
-const fn default_processor_count() -> u32 {
-    1
-}
 
 impl LinuxImage {
     fn required_resources(&self) -> Vec<ResourceType> {
@@ -432,15 +438,35 @@ mod test {
         use_initrd: bool,
         processor_count: u32,
         memory_page_count: u64,
-        c_bit_position: u8,
+        c_bit_position: Option<u8>,
     ) -> Image {
         Image::SnpLinuxDirect {
             linux: LinuxImage {
                 use_initrd,
                 command_line: CString::new("console=ttyS0").unwrap(),
             },
-            processor_count,
-            memory_page_count,
+            processor_topology: X86ProcessorTopologyPlan {
+                proc_count: processor_count,
+                vps_per_socket: Some(1),
+                enable_smt: Some(false),
+                apic_id_offset: 0,
+                x2apic: openvmm_vm_layout::X2ApicModePlan::Supported,
+            },
+            vm_layout: VmLayoutPlan {
+                node_mem_sizes: vec![memory_page_count * IGVM_PAGE_SIZE_BYTES],
+                layout: openvmm_vm_layout::LayoutPlan {
+                    chipset_low_mmio_size: 128 * 1024 * 1024,
+                    chipset_high_mmio_size: 0,
+                    vtl2_chipset_mmio_size: 0,
+                },
+                pcie_root_complexes: Vec::new(),
+                virtio_mmio_count: 0,
+                pcie_ecam_below_4gb: true,
+                vtl2_layout: None,
+                ram_start_address: 0,
+                vtl2_framebuffer_size: 0,
+                physical_address_size: 48,
+            },
             c_bit_position,
         }
     }
@@ -476,8 +502,8 @@ mod test {
         match &guest.image {
             Image::SnpLinuxDirect {
                 linux,
-                processor_count,
-                memory_page_count,
+                processor_topology,
+                vm_layout,
                 c_bit_position,
             } => {
                 assert!(linux.use_initrd);
@@ -485,9 +511,9 @@ mod test {
                     linux.command_line.as_bytes(),
                     b"console=ttyS0 earlyprintk=serial earlycon panic=-1"
                 );
-                assert_eq!(*processor_count, 1);
-                assert_eq!(*memory_page_count, 40960);
-                assert_eq!(*c_bit_position, 51);
+                assert_eq!(processor_topology.proc_count, 1);
+                assert_eq!(vm_layout.node_mem_sizes, [40960 * IGVM_PAGE_SIZE_BYTES]);
+                assert_eq!(*c_bit_position, Some(51));
                 guest.image.validate().unwrap();
             }
             image => panic!("unexpected image: {image:?}"),
@@ -504,18 +530,18 @@ mod test {
             panic!("expected one guest config");
         };
         let Image::SnpLinuxDirect {
-            processor_count, ..
+            processor_topology, ..
         } = &guest.image
         else {
             panic!("expected SNP Linux-direct image");
         };
-        assert_eq!(*processor_count, 2);
+        assert_eq!(processor_topology.proc_count, 2);
         guest.image.validate().unwrap();
     }
 
     #[test]
     fn snp_linux_direct_required_resources_with_initrd() {
-        let image = snp_linux_direct_image(true, 1, 40960, 51);
+        let image = snp_linux_direct_image(true, 1, 40960, Some(51));
 
         assert_eq!(
             image.required_resources(),
@@ -529,7 +555,7 @@ mod test {
 
     #[test]
     fn snp_linux_direct_required_resources_without_initrd() {
-        let image = snp_linux_direct_image(false, 1, 40960, 51);
+        let image = snp_linux_direct_image(false, 1, 40960, Some(51));
 
         assert_eq!(
             image.required_resources(),
@@ -539,7 +565,7 @@ mod test {
 
     #[test]
     fn snp_linux_direct_rejects_zero_memory() {
-        let image = snp_linux_direct_image(false, 1, 0, 51);
+        let image = snp_linux_direct_image(false, 1, 0, Some(51));
 
         assert_eq!(
             image.validate(),
@@ -550,7 +576,7 @@ mod test {
     #[test]
     fn snp_linux_direct_rejects_oversized_memory() {
         let memory_page_count = u64::from(u32::MAX) / IGVM_PAGE_SIZE_BYTES + 1;
-        let image = snp_linux_direct_image(false, 1, memory_page_count, 51);
+        let image = snp_linux_direct_image(false, 1, memory_page_count, Some(51));
 
         assert_eq!(
             image.validate(),
@@ -561,7 +587,7 @@ mod test {
     #[test]
     fn snp_linux_direct_rejects_invalid_c_bit_positions() {
         for c_bit_position in [31, 52] {
-            let image = snp_linux_direct_image(false, 1, 40960, c_bit_position);
+            let image = snp_linux_direct_image(false, 1, 40960, Some(c_bit_position));
 
             assert_eq!(
                 image.validate(),
@@ -572,7 +598,7 @@ mod test {
 
     #[test]
     fn snp_linux_direct_rejects_zero_processors() {
-        let image = snp_linux_direct_image(false, 0, 40960, 51);
+        let image = snp_linux_direct_image(false, 0, 40960, Some(51));
 
         assert_eq!(
             image.validate(),

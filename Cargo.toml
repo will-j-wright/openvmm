@@ -90,6 +90,7 @@ openvmm_hypervisors = { path = "openvmm/openvmm_hypervisors" }
 openvmm_pcat_locator = { path = "openvmm/openvmm_pcat_locator" }
 openvmm_resources = { path = "openvmm/openvmm_resources" }
 openvmm_ttrpc_vmservice = { path = "openvmm/openvmm_ttrpc_vmservice" }
+openvmm_vm_layout = { path = "openvmm/openvmm_vm_layout" }
 hypervisor_resources = { path = "openvmm/hypervisor_resources" }
 membacking = { path = "openvmm/membacking" }
 vhost_user_backend = { path = "openvmm_vhost/vhost_user_backend" }
