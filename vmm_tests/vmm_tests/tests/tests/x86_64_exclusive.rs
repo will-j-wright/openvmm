@@ -11,6 +11,17 @@ use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
 use pipette_client::cmd;
 use vmm_test_macros::openvmm_test;
+use vmm_test_macros::vmm_test_with;
+
+/// Boot the per-run generated Linux-direct IGVM under KVM SEV-SNP.
+#[vmm_test_with(openvmm, amd, requires(kvm_snp), configs(snp_linux_direct_x64))]
+async fn boot_snp(config: PetriVmBuilder<OpenVmmPetriBackend>) -> Result<(), anyhow::Error> {
+    let (vm, agent) = config.run().await?;
+    agent.ping().await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
 
 /// Validate we can run with VP index != APIC ID.
 #[openvmm_test(linux_direct_x64)]

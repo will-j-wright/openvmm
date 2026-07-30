@@ -59,7 +59,7 @@ impl KvmSnpConfig {
 
 fn parse_vmsa_page(context: Arc<virt::SnpVpContext>) -> Result<KvmSnpVpConfig, KvmError> {
     let (vmsa, _) = x86defs::snp::SevVmsa::read_from_prefix(context.page.as_ref())
-        .map_err(|_| KvmError::InvalidSnpVmsa("invalid VMSA page size"))?;
+        .map_err(|_| KvmError::InvalidSnpIgvmVmsa("invalid VMSA page size"))?;
     Ok(KvmSnpVpConfig { context, vmsa })
 }
 
@@ -91,12 +91,12 @@ pub(crate) fn prepare_snp_config(
     for context in &config.vp_contexts {
         let vp = parse_vmsa_page(context.clone())?;
         if vp.vmsa.sev_features.vtom() || vp.vmsa.virtual_tom != 0 {
-            return Err(KvmError::InvalidSnpVmsa("vTOM is not supported"));
+            return Err(KvmError::InvalidSnpIgvmVmsa("vTOM is not supported"));
         }
         let features = u64::from(vp.vmsa.sev_features) & !1;
         match vmsa_features {
             Some(previous) if previous != features => {
-                return Err(KvmError::InvalidSnpVmsa(
+                return Err(KvmError::InvalidSnpIgvmVmsa(
                     "VP contexts have inconsistent VMSA features",
                 ));
             }
@@ -161,7 +161,9 @@ impl KvmPartitionInner {
         pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
         let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
-        self.apply_snp_vmsa(pages)?;
+        if self.snp_config.is_none() {
+            self.apply_snp_vmsa(pages)?;
+        }
         self.kvm.check_sev_snp_launch_extensions()?;
         let mut launch_start = kvm::kvm_sev_snp_launch_start {
             policy: self
@@ -771,7 +773,7 @@ mod tests {
                 ]),
                 u64::MAX,
             ),
-            Err(KvmError::InvalidSnpVmsa(
+            Err(KvmError::InvalidSnpIgvmVmsa(
                 "VP contexts have inconsistent VMSA features"
             ))
         ));
