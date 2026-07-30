@@ -43,13 +43,21 @@ use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
 use loader_defs::linux::SnpBootShimParams;
 use loader_defs::linux::SnpBootShimRange;
+use openvmm_vm_layout::VmLayoutPlan;
+use openvmm_vm_layout::X86ProcessorTopologyPlan;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::Seek;
 use std::mem::discriminant;
-use vm_topology::memory::MemoryLayout;
-use vm_topology::processor::TopologyBuilder;
+use thiserror::Error;
+use vm_topology::memory::MemoryRangeWithNode;
+#[cfg(any(target_arch = "x86_64", test))] // xtask-fmt allow-target-arch cpu-intrinsic
+use x86defs::cpuid::CpuidFunction;
+#[cfg(any(target_arch = "x86_64", test))] // xtask-fmt allow-target-arch cpu-intrinsic
+use x86defs::cpuid::ExtendedSevFeaturesEax;
+#[cfg(any(target_arch = "x86_64", test))] // xtask-fmt allow-target-arch cpu-intrinsic
+use x86defs::cpuid::ExtendedSevFeaturesEbx;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
@@ -66,9 +74,9 @@ const COM1_IRQ: u32 = 4;
 
 pub struct BuildParams<'a> {
     pub linux: &'a LinuxImage,
-    pub processor_count: u32,
-    pub memory_page_count: u64,
-    pub c_bit_position: u8,
+    pub processor_topology: &'a X86ProcessorTopologyPlan,
+    pub vm_layout: &'a VmLayoutPlan,
+    pub c_bit_position: Option<u8>,
     pub guest_svn: u32,
     pub policy: SnpPolicy,
     pub resources: &'a Resources,
@@ -78,6 +86,34 @@ pub struct BuildOutput {
     pub guest: IgvmFile,
     pub map: String,
     pub measurement: Measurement,
+}
+
+#[derive(Debug, Error)]
+enum ConfigError {
+    #[error("SNP Linux-direct requires exactly one NUMA node, found {0}")]
+    Numa(usize),
+    #[error("SNP Linux-direct requires RAM to start at GPA 0")]
+    RamStart,
+    #[error("SNP Linux-direct requires one contiguous RAM range, found {0}")]
+    RamRanges(usize),
+    #[error("SNP Linux-direct RAM size {0:#x} does not fit in an IGVM required-memory directive")]
+    RamTooLarge(u64),
+    #[error("SNP Linux-direct does not support VTL2 memory")]
+    Vtl2,
+    #[error("SNP Linux-direct does not support VTL2 chipset MMIO")]
+    Vtl2ChipsetMmio,
+    #[error("SNP Linux-direct does not support a framebuffer")]
+    Framebuffer,
+    #[error("SNP Linux-direct does not support virtio-mmio devices")]
+    VirtioMmio,
+    #[error("SNP Linux-direct requires PCIe ECAM below 4 GiB")]
+    HighPcieEcam,
+    #[error("SNP Linux-direct does not support CXL on root complex '{0}'")]
+    Cxl(String),
+    #[error("SNP Linux-direct does not support an IOMMU on root complex '{0}'")]
+    Iommu(String),
+    #[error("host CPUID does not report SEV-SNP C-bit information")]
+    MissingHostCBit,
 }
 
 #[derive(Debug, Clone)]
@@ -322,8 +358,15 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
         Ok(())
     }
 
-    fn set_vp_context_page(&mut self, _page_base: u64) -> anyhow::Result<()> {
-        bail!("the direct-Linux path must not select a guest-RAM VMSA page")
+    fn set_vp_context_page(&mut self, page_base: u64) -> anyhow::Result<()> {
+        ensure!(
+            page_base < self.ram_page_count,
+            "Linux-selected VP context page lies outside RAM"
+        );
+        // KVM supplies the real launch VMSA at its fixed GPA. The page chosen
+        // by the generic Linux loader remains ordinary RAM and is accepted by
+        // the bootshim with the rest of the unimported range.
+        Ok(())
     }
 
     fn relocation_region(
@@ -356,25 +399,36 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
 pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
     let BuildParams {
         linux,
-        processor_count,
-        memory_page_count,
+        processor_topology,
+        vm_layout,
         c_bit_position,
         guest_svn,
         policy,
         resources,
     } = params;
-    let memory_size = memory_page_count
-        .checked_mul(PAGE_SIZE)
-        .context("RAM size overflow")?;
-    let memory_layout =
-        MemoryLayout::new(memory_size, &[], &[], &[], None).context("building memory layout")?;
-    let processor_topology = TopologyBuilder::new_x86()
-        .build(processor_count)
+    validate_plan(vm_layout)?;
+    let c_bit_position = resolve_c_bit_position(c_bit_position)?;
+    let resolved_layout = vm_layout.resolve().context("resolving VM layout")?;
+    let pcie_host_bridges = vm_layout
+        .pcie_host_bridges(&resolved_layout.pcie_root_complex_ranges)
+        .context("building PCIe host bridges")?;
+    let memory_layout = &resolved_layout.memory_layout;
+    let [MemoryRangeWithNode { range: ram, .. }] = memory_layout.ram() else {
+        return Err(ConfigError::RamRanges(memory_layout.ram().len()).into());
+    };
+    if ram.start() != 0 {
+        return Err(ConfigError::RamStart.into());
+    }
+    let memory_size = ram.len();
+    let memory_page_count = memory_size / PAGE_SIZE;
+    u32::try_from(memory_size).map_err(|_| ConfigError::RamTooLarge(memory_size))?;
+    let processor_topology = processor_topology
+        .resolve()
         .context("building processor topology")?;
-    let pcie_host_bridges = Vec::new();
+    let processor_count = processor_topology.vp_count();
     let acpi_builder = vmm_core::acpi_builder::AcpiTablesBuilder {
         processor_topology: &processor_topology,
-        mem_layout: &memory_layout,
+        mem_layout: memory_layout,
         cache_topology: None,
         pcie_host_bridges: &pcie_host_bridges,
         slit_info: None,
@@ -426,7 +480,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         &mut kernel,
         initrd_config,
         &linux.command_line,
-        &memory_layout,
+        memory_layout,
         |gpa| {
             let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
                 dsdt.add_apic();
@@ -563,6 +617,68 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
             SnpPolicy::from(policy).debug() == 1,
         )),
     })
+}
+
+fn validate_plan(plan: &VmLayoutPlan) -> Result<(), ConfigError> {
+    if plan.node_mem_sizes.len() != 1 {
+        return Err(ConfigError::Numa(plan.node_mem_sizes.len()));
+    }
+    if plan.vtl2_layout.is_some() {
+        return Err(ConfigError::Vtl2);
+    }
+    if plan.layout.vtl2_chipset_mmio_size != 0 {
+        return Err(ConfigError::Vtl2ChipsetMmio);
+    }
+    if plan.vtl2_framebuffer_size != 0 {
+        return Err(ConfigError::Framebuffer);
+    }
+    if plan.virtio_mmio_count != 0 {
+        return Err(ConfigError::VirtioMmio);
+    }
+    if !plan.pcie_root_complexes.is_empty() && !plan.pcie_ecam_below_4gb {
+        return Err(ConfigError::HighPcieEcam);
+    }
+    for root_complex in &plan.pcie_root_complexes {
+        if root_complex.cxl.is_some() {
+            return Err(ConfigError::Cxl(root_complex.name.clone()));
+        }
+        if root_complex.iommu.is_some() {
+            return Err(ConfigError::Iommu(root_complex.name.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_c_bit_position(c_bit_position: Option<u8>) -> Result<u8, ConfigError> {
+    c_bit_position
+        .or_else(host_snp_c_bit_position)
+        .ok_or(ConfigError::MissingHostCBit)
+}
+
+#[cfg(target_arch = "x86_64")] // xtask-fmt allow-target-arch cpu-intrinsic
+fn host_snp_c_bit_position() -> Option<u8> {
+    snp_c_bit_from_cpuid(|function, subfunction| {
+        let result = safe_intrinsics::cpuid(function, subfunction);
+        [result.eax, result.ebx, result.ecx, result.edx]
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))] // xtask-fmt allow-target-arch cpu-intrinsic
+fn host_snp_c_bit_position() -> Option<u8> {
+    None
+}
+
+#[cfg(any(target_arch = "x86_64", test))] // xtask-fmt allow-target-arch cpu-intrinsic
+fn snp_c_bit_from_cpuid(mut cpuid: impl FnMut(u32, u32) -> [u32; 4]) -> Option<u8> {
+    let max_extended = cpuid(CpuidFunction::ExtendedMaxFunction.0, 0)[0];
+    if max_extended < CpuidFunction::ExtendedSevFeatures.0 {
+        return None;
+    }
+
+    let [eax, ebx, _, _] = cpuid(CpuidFunction::ExtendedSevFeatures.0, 0);
+    ExtendedSevFeaturesEax::from(eax)
+        .sev_snp()
+        .then(|| ExtendedSevFeaturesEbx::from(ebx).cbit_position())
 }
 
 fn align_up_to_page(value: u64) -> anyhow::Result<u64> {
@@ -1093,9 +1209,82 @@ fn format_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openvmm_vm_layout::LayoutPlan;
+    use openvmm_vm_layout::PcieIommuPlan;
+    use openvmm_vm_layout::PcieMmioRangePlan;
+    use openvmm_vm_layout::PcieRootComplexPlan;
     use test_with_tracing::test;
 
     const TEST_C_BIT_MASK: u64 = 1 << 51;
+
+    fn test_plan() -> VmLayoutPlan {
+        VmLayoutPlan {
+            node_mem_sizes: vec![160 * 1024 * 1024],
+            layout: LayoutPlan {
+                chipset_low_mmio_size: 128 * 1024 * 1024,
+                chipset_high_mmio_size: 0,
+                vtl2_chipset_mmio_size: 0,
+            },
+            pcie_root_complexes: vec![PcieRootComplexPlan {
+                index: 0,
+                name: "s0rc0".to_string(),
+                segment: 0,
+                start_bus: 0,
+                end_bus: 255,
+                low_mmio: PcieMmioRangePlan::Dynamic {
+                    size: 64 * 1024 * 1024,
+                },
+                high_mmio: PcieMmioRangePlan::Dynamic {
+                    size: 1024 * 1024 * 1024,
+                },
+                cxl: None,
+                iommu: None,
+                vnode: None,
+                preserve_bars: false,
+            }],
+            virtio_mmio_count: 0,
+            pcie_ecam_below_4gb: true,
+            vtl2_layout: None,
+            ram_start_address: 0,
+            vtl2_framebuffer_size: 0,
+            physical_address_size: 48,
+        }
+    }
+
+    #[test]
+    fn explicit_c_bit_overrides_host_detection() {
+        assert_eq!(resolve_c_bit_position(Some(47)).unwrap(), 47);
+    }
+
+    #[test]
+    fn detects_host_c_bit_from_cpuid_shape() {
+        let cpuid = |function, _| match CpuidFunction(function) {
+            CpuidFunction::ExtendedMaxFunction => [CpuidFunction::ExtendedSevFeatures.0, 0, 0, 0],
+            CpuidFunction::ExtendedSevFeatures => [
+                ExtendedSevFeaturesEax::new().with_sev_snp(true).into(),
+                ExtendedSevFeaturesEbx::new().with_cbit_position(51).into(),
+                0,
+                0,
+            ],
+            _ => [0; 4],
+        };
+        assert_eq!(snp_c_bit_from_cpuid(cpuid), Some(51));
+    }
+
+    #[test]
+    fn rejects_unsupported_layout_features() {
+        let mut plan = test_plan();
+        plan.node_mem_sizes.push(4096);
+        assert!(matches!(validate_plan(&plan), Err(ConfigError::Numa(2))));
+
+        let mut plan = test_plan();
+        plan.virtio_mmio_count = 1;
+        assert!(matches!(validate_plan(&plan), Err(ConfigError::VirtioMmio)));
+
+        let mut plan = test_plan();
+        plan.pcie_root_complexes[0].iommu = Some(PcieIommuPlan::AmdVi);
+        assert!(matches!(validate_plan(&plan), Err(ConfigError::Iommu(_))));
+    }
 
     #[test]
     fn vmsa_uses_c_bit_model() {

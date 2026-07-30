@@ -16,6 +16,7 @@ test_with_tracing.workspace = true
 hypervisor_resources.workspace = true
 openvmm_defs.workspace = true
 openvmm_pcat_locator.workspace = true
+openvmm_vm_layout.workspace = true
 membacking.workspace = true
 amd_iommu.workspace = true
 intel_vtd.workspace = true

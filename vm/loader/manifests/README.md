@@ -6,16 +6,18 @@ normally creates the resource file that supplies each recipe's binary inputs.
 `snp-linux-direct.json` is a bring-up profile with these assumptions:
 
 - x64 and one VTL0 SEV-SNP guest that boots Linux directly
-- one virtual processor; `snp-linux-direct-multi-vp.json` uses two
+- a serializable processor-topology plan; the default profile uses one virtual
+  processor and `snp-linux-direct-multi-vp.json` uses two
 - 160 MiB of contiguous RAM (40,960 4-KiB pages)
-- COM1-only serial ACPI, with no VMBus, PCIe, disks, IOMMU, or PSP
+- COM1 serial ACPI and an optional PCIe root-complex layout; the checked-in
+  profiles do not add PCIe
 - no shared GPA boundary, normal interrupt injection, and secure AVIC disabled
 - base SNP policy `0x30000`; `enable_debug` adds the debug bit to produce the
   current debug-capable policy `0xb0000`
 - an initrd and the kernel command line
   `console=ttyS0 earlyprintk=serial earlycon panic=-1`
-- SNP C-bit position 51, which is a test-host assumption rather than a portable
-  SNP property
+- SNP C-bit position 51 for reproducible checked-in profiles; omitting
+  `c_bit_position` makes `igvmfilegen` derive it from host SEV-SNP CPUID
 
 The image contains a small measured bootshim. Only pages containing the kernel,
 initrd, boot metadata, SNP special pages, bootshim, or bootshim parameters are
@@ -23,6 +25,19 @@ included as IGVM `PageData`. After SNP launch, the bootshim accepts the remainin
 private RAM with `PVALIDATE` and then enters Linux. This avoids loading and
 measuring every configured RAM page, but still accepts all RAM before Linux
 starts.
+
+Petri uses the same schema to generate a test-local IGVM after all OpenVMM
+backend modifiers have been applied. The final OpenVMM CPU, RAM, chipset, and
+PCIe configuration is converted into the shared layout plan, so the ECAM and
+MMIO apertures baked into measured ACPI match the root complex OpenVMM
+instantiates. Generated manifests, maps, measurement metadata, and IGVM files
+remain in the individual test output directory.
+
+The generated SNP profile currently supports one contiguous RAM range starting
+at GPA 0 and PCIe root complexes without switches, CXL, IOMMUs, pinned BARs, or
+generic initiators. VTL2, VMBus, framebuffer, virtio-mmio, disks, and VPCI are
+rejected. Petri's generated boot configuration uses a PCIe virtio-vsock
+endpoint for pipette.
 
 To build it manually, create a resources file containing absolute paths:
 

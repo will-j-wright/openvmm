@@ -553,9 +553,13 @@ impl IntoPipeline for CheckinGatesCli {
             let (pub_test_igvm_agent_rpc_server, use_test_igvm_agent_rpc_server) = pipeline
                 .new_typed_artifact(format!("{arch_tag}-windows-test_igvm_agent_rpc_server"));
 
+            let (pub_igvmfilegen, use_igvmfilegen) =
+                pipeline.new_typed_artifact(format!("{arch_tag}-windows-igvmfilegen"));
+
             // filter off interesting artifacts required by the VMM tests job
             match arch {
                 CommonArch::X86_64 => {
+                    vmm_tests_artifacts_windows_x86.use_igvmfilegen = Some(use_igvmfilegen.clone());
                     vmm_tests_artifacts_windows_x86.use_openvmm = Some(use_openvmm.clone());
                     vmm_tests_artifacts_windows_x86.use_tmk_vmm = Some(use_tmk_vmm.clone());
                     vmm_tests_artifacts_windows_x86.use_prep_steps = Some(use_prep_steps.clone());
@@ -578,8 +582,6 @@ impl IntoPipeline for CheckinGatesCli {
             // emit a job for artifacts which _are not_ in the VMM tests "hot
             // path"
             // artifacts which _are not_ in the VMM tests "hot path"
-            let (pub_igvmfilegen, _use_igvmfilegen) =
-                pipeline.new_typed_artifact(format!("{arch_tag}-windows-igvmfilegen"));
             let (pub_vmgs_lib, _use_vmgs_lib) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-windows-vmgs_lib"));
             let (pub_hypestv, _use_hypestv) =
@@ -779,7 +781,7 @@ impl IntoPipeline for CheckinGatesCli {
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-openvmm"));
             let (pub_openvmm_vhost, use_openvmm_vhost) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-openvmm_vhost"));
-            let (pub_igvmfilegen, _) =
+            let (pub_igvmfilegen, use_igvmfilegen) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-igvmfilegen"));
             let (pub_vmgs_lib, _) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-vmgs_lib"));
@@ -798,10 +800,23 @@ impl IntoPipeline for CheckinGatesCli {
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-musl-openvmm_vhost"));
             let (pub_prep_steps, use_prep_steps) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-prep_steps"));
+            let (pub_snp_bootshim, use_snp_bootshim) = if arch == CommonArch::X86_64 {
+                let (published, use_) =
+                    pipeline.new_typed_artifact(format!("{arch_tag}-linux-snp_bootshim"));
+                (Some(published), Some(use_))
+            } else {
+                (None, None)
+            };
 
             // skim off interesting artifacts required by the VMM tests job
             match arch {
                 CommonArch::X86_64 => {
+                    vmm_tests_artifacts_linux_x86.use_igvmfilegen = Some(use_igvmfilegen.clone());
+                    vmm_tests_artifacts_linux_musl_x86.use_igvmfilegen =
+                        Some(use_igvmfilegen.clone());
+                    vmm_tests_artifacts_linux_x86.use_snp_bootshim = use_snp_bootshim.clone();
+                    vmm_tests_artifacts_linux_musl_x86.use_snp_bootshim = use_snp_bootshim.clone();
+                    vmm_tests_artifacts_windows_x86.use_snp_bootshim = use_snp_bootshim.clone();
                     vmm_tests_artifacts_linux_x86.use_openvmm = Some(use_openvmm.clone());
                     vmm_tests_artifacts_linux_x86.use_openvmm_vhost =
                         Some(use_openvmm_vhost.clone());
@@ -954,6 +969,19 @@ impl IntoPipeline for CheckinGatesCli {
                         prep_steps,
                     }
                 });
+
+            if let Some(pub_snp_bootshim) = pub_snp_bootshim {
+                job = job.publish(pub_snp_bootshim, |snp_bootshim| {
+                    flowey_lib_hvlite::build_snp_bootshim::Request {
+                        profile: if release {
+                            flowey_lib_hvlite::build_snp_bootshim::SnpBootshimBuildProfile::Release
+                        } else {
+                            flowey_lib_hvlite::build_snp_bootshim::SnpBootshimBuildProfile::Debug
+                        },
+                        snp_bootshim,
+                    }
+                });
+            }
 
             // Hang building the linux VMM tests off this big linux job.
             match arch {
@@ -1862,12 +1890,14 @@ impl IntoPipeline for CheckinGatesCli {
 // DEVNOTE: this is pub so internal tests can reuse the same builders
 pub mod vmm_tests_artifact_builders {
     use flowey_lib_hvlite::build_guest_test_uefi::GuestTestUefiOutput;
+    use flowey_lib_hvlite::build_igvmfilegen::IgvmfilegenOutput;
     use flowey_lib_hvlite::build_incubator::IncubatorOutput;
     use flowey_lib_hvlite::build_openhcl_igvm_from_recipe::OpenhclIgvmOutput;
     use flowey_lib_hvlite::build_openvmm::OpenvmmOutput;
     use flowey_lib_hvlite::build_openvmm_vhost::OpenvmmVhostOutput;
     use flowey_lib_hvlite::build_pipette::PipetteOutput;
     use flowey_lib_hvlite::build_prep_steps::PrepStepsOutput;
+    use flowey_lib_hvlite::build_snp_bootshim::SnpBootshimOutput;
     use flowey_lib_hvlite::build_test_igvm_agent_rpc_server::TestIgvmAgentRpcServerOutput;
     use flowey_lib_hvlite::build_tmk_vmm::TmkVmmOutput;
     use flowey_lib_hvlite::build_tmks::TmksOutput;
@@ -1889,6 +1919,8 @@ pub mod vmm_tests_artifact_builders {
             // any machine
             guest_test_uefi => GuestTestUefiOutput,
             tmks => TmksOutput,
+            igvmfilegen => IgvmfilegenOutput,
+            snp_bootshim => SnpBootshimOutput,
         )
     );
 
@@ -1905,6 +1937,8 @@ pub mod vmm_tests_artifact_builders {
             tpm_guest_tests_windows => TpmGuestTestsOutput,
             tpm_guest_tests_linux => TpmGuestTestsOutput,
             test_igvm_agent_rpc_server => TestIgvmAgentRpcServerOutput,
+            igvmfilegen => IgvmfilegenOutput,
+            snp_bootshim => SnpBootshimOutput,
             // linux build machine
             openhcl_standard => OpenhclIgvmOutput,
             openhcl_cvm => OpenhclIgvmOutput,

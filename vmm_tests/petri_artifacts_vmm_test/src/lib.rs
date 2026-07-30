@@ -84,9 +84,37 @@ pub mod artifacts {
     pub mod host_tools {
         use petri_artifacts_core::declare_artifacts;
 
+        macro_rules! igvmfilegen_native {
+            ($id_ty:ty, $os:literal, $arch:literal) => {
+                /// `igvmfilegen` executable for the host running the test.
+                // xtask-fmt allow-target-arch oneoff-petri-native-test-deps
+                #[cfg(all(target_os = $os, target_arch = $arch))]
+                pub const IGVMFILEGEN_NATIVE: petri_artifacts_core::ArtifactHandle<$id_ty> =
+                    petri_artifacts_core::ArtifactHandle::new();
+            };
+        }
+
+        igvmfilegen_native!(IGVMFILEGEN_WIN_X64, "windows", "x86_64");
+        igvmfilegen_native!(IGVMFILEGEN_LINUX_X64, "linux", "x86_64");
+        igvmfilegen_native!(IGVMFILEGEN_WIN_AARCH64, "windows", "aarch64");
+        igvmfilegen_native!(IGVMFILEGEN_LINUX_AARCH64, "linux", "aarch64");
+        igvmfilegen_native!(IGVMFILEGEN_MACOS_AARCH64, "macos", "aarch64");
+
         declare_artifacts! {
             /// Windows x86_64 build of the `test_igvm_agent_rpc_server` executable.
             TEST_IGVM_AGENT_RPC_SERVER_WINDOWS_X64,
+            /// Windows x86_64 `igvmfilegen` executable.
+            IGVMFILEGEN_WIN_X64,
+            /// Linux x86_64 `igvmfilegen` executable.
+            IGVMFILEGEN_LINUX_X64,
+            /// Windows aarch64 `igvmfilegen` executable.
+            IGVMFILEGEN_WIN_AARCH64,
+            /// Linux aarch64 `igvmfilegen` executable.
+            IGVMFILEGEN_LINUX_AARCH64,
+            /// macOS aarch64 `igvmfilegen` executable.
+            IGVMFILEGEN_MACOS_AARCH64,
+            /// x86_64 SNP bootshim ELF.
+            SNP_BOOTSHIM_X64,
         }
     }
 

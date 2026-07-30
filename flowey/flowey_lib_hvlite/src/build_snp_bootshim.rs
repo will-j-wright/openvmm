@@ -15,6 +15,8 @@ pub struct SnpBootshimOutput {
     pub dbg: PathBuf,
 }
 
+impl Artifact for SnpBootshimOutput {}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SnpBootshimBuildProfile {
     Debug,

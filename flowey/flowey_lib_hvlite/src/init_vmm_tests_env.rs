@@ -49,6 +49,11 @@ flowey_request! {
         pub register_vmgstool: Option<ReadVar<crate::build_vmgstool::VmgstoolOutput>>,
         /// Register a vmgstool-dev binary
         pub register_vmgstool_dev: Option<ReadVar<crate::build_vmgstool::VmgstoolOutput>>,
+        /// Register a host-native igvmfilegen binary
+        pub register_igvmfilegen:
+            Option<ReadVar<crate::build_igvmfilegen::IgvmfilegenOutput>>,
+        /// Register the x86_64 SNP bootshim
+        pub register_snp_bootshim: Option<ReadVar<crate::build_snp_bootshim::SnpBootshimOutput>>,
         /// Register a Windows tpm_guest_tests binary
         pub register_tpm_guest_tests_windows: Option<ReadVar<TpmGuestTestsOutput>>,
         /// Register a Linux tpm_guest_tests binary
@@ -99,6 +104,8 @@ impl SimpleFlowNode for Node {
             register_tmk_vmm_linux_musl,
             register_vmgstool,
             register_vmgstool_dev,
+            register_igvmfilegen,
+            register_snp_bootshim,
             register_tpm_guest_tests_windows,
             register_tpm_guest_tests_linux,
             register_test_igvm_agent_rpc_server,
@@ -162,6 +169,8 @@ impl SimpleFlowNode for Node {
             let tmk_vmm_linux_musl = register_tmk_vmm_linux_musl.claim(ctx);
             let vmgstool = register_vmgstool.claim(ctx);
             let vmgstool_dev = register_vmgstool_dev.claim(ctx);
+            let igvmfilegen = register_igvmfilegen.claim(ctx);
+            let snp_bootshim = register_snp_bootshim.claim(ctx);
             let test_igvm_agent_rpc_server = register_test_igvm_agent_rpc_server.claim(ctx);
             let tpm_guest_tests_windows = register_tpm_guest_tests_windows.claim(ctx);
             let tpm_guest_tests_linux = register_tpm_guest_tests_linux.claim(ctx);
@@ -392,6 +401,27 @@ impl SimpleFlowNode for Node {
                             dst.make_executable()?;
                         }
                     }
+                }
+
+                if let Some(igvmfilegen) = igvmfilegen {
+                    match rt.read(igvmfilegen) {
+                        crate::build_igvmfilegen::IgvmfilegenOutput::WindowsBin { exe, .. } => {
+                            fs_err::copy(exe, test_content_dir.join("igvmfilegen.exe"))?;
+                        }
+                        crate::build_igvmfilegen::IgvmfilegenOutput::LinuxBin { bin, .. } => {
+                            let dst = test_content_dir.join("igvmfilegen");
+                            fs_err::copy(bin, &dst)?;
+                            dst.make_executable()?;
+                        }
+                    }
+                }
+
+                if let Some(snp_bootshim) = snp_bootshim {
+                    let crate::build_snp_bootshim::SnpBootshimOutput { bin, .. } =
+                        rt.read(snp_bootshim);
+                    let dst = test_content_dir.join("snp_bootshim");
+                    fs_err::copy(bin, &dst)?;
+                    dst.make_executable()?;
                 }
 
                 if let Some(tpm_guest_tests_windows) = tpm_guest_tests_windows {

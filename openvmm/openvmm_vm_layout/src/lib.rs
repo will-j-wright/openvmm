@@ -16,7 +16,15 @@
 //! VTL2 chipset MMIO. Callers express sizing intent; the resolver places
 //! everything and derives the effective MMIO gaps for [`MemoryLayout`].
 
-use super::vm_loaders::igvm::Vtl2MemoryLayoutRequest;
+#![forbid(unsafe_code)]
+
+mod processor;
+
+pub use processor::X2ApicModePlan;
+pub use processor::X86ProcessorTopologyPlan;
+#[cfg(target_arch = "x86_64")] // xtask-fmt allow-target-arch cpu-intrinsic
+pub use processor::build_x86_topology;
+
 use anyhow::Context;
 use anyhow::bail;
 use cxl_spec::spec::CXL_HOST_BRIDGE_COMPONENT_REGISTERS_SIZE_BYTES;
@@ -25,11 +33,16 @@ use memory_range::MemoryRange;
 use openvmm_defs::config::PcieIommuConfig;
 use openvmm_defs::config::PcieMmioRangeConfig;
 use openvmm_defs::config::PcieRootComplexConfig;
+use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Arc;
+use vm_topology::cxl::CfmwsWindowRestrictions;
 use vm_topology::layout::LayoutBuilder;
 use vm_topology::layout::Placement;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::memory::MemoryRangeWithNode;
+use vm_topology::pcie::PcieHostBridge;
+use vm_topology::pcie::PcieHostBridgeCxlInfo;
 
 const PAGE_SIZE: u64 = 4096;
 const TWO_MB: u64 = 2 * 1024 * 1024;
@@ -50,9 +63,355 @@ const PCIE_ECAM_BYTES_PER_BUS: u64 = 32 * 8 * 4096;
 /// value, independent of any individual root complex's configuration.
 const PCIE_ECAM_MIN_ADDRESS: u64 = 256 * 1024 * 1024;
 
+/// Information needed to allocate a VTL2 memory range in the VM memory layout.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Vtl2MemoryLayoutRequest {
+    /// The number of bytes to reserve for VTL2.
+    pub size: u64,
+    /// The required relocation alignment.
+    pub alignment: u64,
+}
+
+/// Serializable high-level inputs to the OpenVMM address-space allocator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmLayoutPlan {
+    /// Per-NUMA-node RAM sizes, in vnode order.
+    pub node_mem_sizes: Vec<u64>,
+    /// Chipset MMIO sizing.
+    pub layout: LayoutPlan,
+    /// PCIe root-complex layout requests.
+    pub pcie_root_complexes: Vec<PcieRootComplexPlan>,
+    /// Number of virtio-mmio slots.
+    pub virtio_mmio_count: u32,
+    /// Whether PCIe ECAM must be below 4 GiB.
+    pub pcie_ecam_below_4gb: bool,
+    /// Optional VTL2 private-memory allocation.
+    pub vtl2_layout: Option<Vtl2MemoryLayoutRequest>,
+    /// Lowest address at which ordinary RAM may be placed.
+    pub ram_start_address: u64,
+    /// VTL2 framebuffer allocation size.
+    pub vtl2_framebuffer_size: u64,
+    /// Address width used to validate the resolved layout.
+    pub physical_address_size: u8,
+}
+
+/// Serializable chipset MMIO sizing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LayoutPlan {
+    /// Chipset low-MMIO size.
+    pub chipset_low_mmio_size: u32,
+    /// Chipset high-MMIO size.
+    pub chipset_high_mmio_size: u64,
+    /// VTL2-private chipset MMIO size.
+    pub vtl2_chipset_mmio_size: u64,
+}
+
+/// Serializable PCIe MMIO request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PcieMmioRangePlan {
+    /// Dynamically allocate a range of the requested size.
+    Dynamic {
+        /// Range size in bytes.
+        size: u64,
+    },
+    /// Use a fixed address range.
+    Fixed {
+        /// Inclusive start address.
+        start: u64,
+        /// Exclusive end address.
+        end: u64,
+    },
+}
+
+/// Serializable CXL root-complex layout request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootComplexCxlPlan {
+    /// HDM window size.
+    pub hdm_size: u64,
+    /// CFMWS HDM window restriction bits.
+    pub hdm_window_restrictions: u16,
+}
+
+/// IOMMU kind relevant to address-space layout.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PcieIommuPlan {
+    /// AMD IOMMU.
+    AmdVi,
+    /// Arm SMMUv3.
+    Smmu,
+    /// Intel VT-d.
+    IntelVtd,
+}
+
+/// Serializable PCIe root-complex layout request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PcieRootComplexPlan {
+    /// Stable root-complex index.
+    pub index: u32,
+    /// Root-complex name.
+    pub name: String,
+    /// PCI segment.
+    pub segment: u16,
+    /// First bus.
+    pub start_bus: u8,
+    /// Last bus.
+    pub end_bus: u8,
+    /// Low-MMIO request.
+    pub low_mmio: PcieMmioRangePlan,
+    /// High-MMIO request.
+    pub high_mmio: PcieMmioRangePlan,
+    /// Optional CXL request.
+    pub cxl: Option<RootComplexCxlPlan>,
+    /// Optional IOMMU kind.
+    pub iommu: Option<PcieIommuPlan>,
+    /// Optional NUMA node affinity.
+    pub vnode: Option<u32>,
+    /// Whether BAR locations must be preserved.
+    pub preserve_bars: bool,
+}
+
+impl VmLayoutPlan {
+    /// Derive all layout inputs from the final OpenVMM configuration.
+    pub fn from_config(
+        config: &openvmm_defs::config::Config,
+        physical_address_size: u8,
+        vtl2_layout: Option<Vtl2MemoryLayoutRequest>,
+    ) -> anyhow::Result<Self> {
+        let virtio_mmio_count = config
+            .virtio_devices
+            .iter()
+            .filter(|(bus, _)| matches!(bus, openvmm_defs::config::VirtioBus::Mmio))
+            .count();
+        let vtl2_framebuffer_size = if config.vtl2_gfx {
+            config
+                .framebuffer
+                .as_ref()
+                .context("no framebuffer configured")?
+                .len() as u64
+        } else {
+            0
+        };
+
+        Self::from_openvmm_config(
+            &config.numa,
+            &config.layout,
+            &config.pcie_root_complexes,
+            virtio_mmio_count,
+            config.hypervisor.with_isolation,
+            matches!(
+                config.load_mode,
+                openvmm_defs::config::LoadMode::Linux { .. }
+            ),
+            vtl2_layout,
+            vtl2_framebuffer_size,
+            physical_address_size,
+        )
+    }
+
+    /// Derive a plan from the stable OpenVMM layout-related configuration.
+    #[expect(clippy::too_many_arguments)]
+    pub fn from_openvmm_config(
+        numa: &openvmm_defs::config::NumaTopology,
+        layout: &vmm_core_defs::LayoutConfig,
+        pcie_root_complexes: &[PcieRootComplexConfig],
+        virtio_mmio_count: usize,
+        isolation: Option<openvmm_defs::config::IsolationType>,
+        linux_direct: bool,
+        vtl2_layout: Option<Vtl2MemoryLayoutRequest>,
+        vtl2_framebuffer_size: u64,
+        physical_address_size: u8,
+    ) -> anyhow::Result<Self> {
+        let node_mem_sizes = numa
+            .nodes
+            .iter()
+            .map(|node| node.mem.as_ref().map_or(0, |mem| mem.mem_size))
+            .collect();
+        let pcie_root_complexes = pcie_root_complexes
+            .iter()
+            .map(PcieRootComplexPlan::from)
+            .collect();
+        let virtio_mmio_count = virtio_mmio_count
+            .try_into()
+            .context("too many virtio-mmio devices")?;
+        let ram_start_address = if cfg!(guest_arch = "aarch64") && linux_direct {
+            GB
+        } else {
+            0
+        };
+
+        Ok(Self {
+            node_mem_sizes,
+            layout: LayoutPlan {
+                chipset_low_mmio_size: layout.chipset_low_mmio_size,
+                chipset_high_mmio_size: layout.chipset_high_mmio_size,
+                vtl2_chipset_mmio_size: layout.vtl2_chipset_mmio_size,
+            },
+            pcie_root_complexes,
+            virtio_mmio_count,
+            pcie_ecam_below_4gb: isolation == Some(openvmm_defs::config::IsolationType::Snp),
+            vtl2_layout,
+            ram_start_address,
+            vtl2_framebuffer_size,
+            physical_address_size,
+        })
+    }
+
+    /// Resolve this high-level plan into concrete guest physical ranges.
+    pub fn resolve(&self) -> anyhow::Result<ResolvedMemoryLayout> {
+        let pcie_root_complexes = self
+            .pcie_root_complexes
+            .iter()
+            .map(PcieRootComplexPlan::to_openvmm_config)
+            .collect::<Vec<_>>();
+        resolve_memory_layout(MemoryLayoutInput {
+            node_mem_sizes: &self.node_mem_sizes,
+            layout: vmm_core_defs::LayoutConfig {
+                chipset_low_mmio_size: self.layout.chipset_low_mmio_size,
+                chipset_high_mmio_size: self.layout.chipset_high_mmio_size,
+                vtl2_chipset_mmio_size: self.layout.vtl2_chipset_mmio_size,
+            },
+            pcie_root_complexes: &pcie_root_complexes,
+            virtio_mmio_count: self.virtio_mmio_count as usize,
+            pcie_ecam_below_4gb: self.pcie_ecam_below_4gb,
+            vtl2_layout: self.vtl2_layout,
+            ram_start_address: self.ram_start_address,
+            vtl2_framebuffer_size: self.vtl2_framebuffer_size,
+            physical_address_size: self.physical_address_size,
+        })
+    }
+
+    /// Build the firmware-visible host bridges for a resolved plan.
+    pub fn pcie_host_bridges(
+        &self,
+        ranges: &[ResolvedPcieRootComplexRanges],
+    ) -> anyhow::Result<Vec<PcieHostBridge>> {
+        anyhow::ensure!(
+            self.pcie_root_complexes.len() == ranges.len(),
+            "resolved PCIe root-complex count does not match the plan"
+        );
+
+        self.pcie_root_complexes
+            .iter()
+            .zip(ranges)
+            .map(|(root_complex, ranges)| {
+                let cxl = root_complex
+                    .cxl
+                    .map(|cxl| -> anyhow::Result<PcieHostBridgeCxlInfo> {
+                        Ok(PcieHostBridgeCxlInfo {
+                            chbcr_range: (!ranges.chbcr_range.is_empty())
+                                .then_some(ranges.chbcr_range)
+                                .context("missing CHBCR range for CXL root complex")?,
+                            hdm_range: (!ranges.hdm_range.is_empty())
+                                .then_some(ranges.hdm_range)
+                                .context("missing HDM range for CXL root complex")?,
+                            hdm_window_restrictions: CfmwsWindowRestrictions::try_from_bits(
+                                cxl.hdm_window_restrictions,
+                            )
+                            .context("invalid CFMWS HDM window restrictions")?,
+                        })
+                    })
+                    .transpose()?;
+
+                Ok(PcieHostBridge {
+                    index: root_complex.index,
+                    segment: root_complex.segment,
+                    start_bus: root_complex.start_bus,
+                    end_bus: root_complex.end_bus,
+                    ecam_range: ranges.ecam_range,
+                    low_mmio: ranges.low_mmio,
+                    high_mmio: ranges.high_mmio,
+                    cxl,
+                    vnode: root_complex.vnode,
+                    preserve_bars: root_complex.preserve_bars,
+                    preserve_boot_config: root_complex.preserve_bars,
+                })
+            })
+            .collect()
+    }
+}
+
+impl From<&PcieRootComplexConfig> for PcieRootComplexPlan {
+    fn from(config: &PcieRootComplexConfig) -> Self {
+        Self {
+            index: config.index,
+            name: config.name.clone(),
+            segment: config.segment,
+            start_bus: config.start_bus,
+            end_bus: config.end_bus,
+            low_mmio: PcieMmioRangePlan::from(&config.low_mmio),
+            high_mmio: PcieMmioRangePlan::from(&config.high_mmio),
+            cxl: config.cxl.as_ref().map(|cxl| RootComplexCxlPlan {
+                hdm_size: cxl.hdm_size,
+                hdm_window_restrictions: cxl.hdm_window_restrictions,
+            }),
+            iommu: config.iommu.as_ref().map(|iommu| match iommu {
+                PcieIommuConfig::AmdVi => PcieIommuPlan::AmdVi,
+                PcieIommuConfig::Smmu { .. } => PcieIommuPlan::Smmu,
+                PcieIommuConfig::IntelVtd => PcieIommuPlan::IntelVtd,
+            }),
+            vnode: config.vnode,
+            preserve_bars: config.preserve_bars,
+        }
+    }
+}
+
+impl From<&PcieMmioRangeConfig> for PcieMmioRangePlan {
+    fn from(config: &PcieMmioRangeConfig) -> Self {
+        match config {
+            PcieMmioRangeConfig::Dynamic { size } => Self::Dynamic { size: *size },
+            PcieMmioRangeConfig::Fixed(range) => Self::Fixed {
+                start: range.start(),
+                end: range.end(),
+            },
+        }
+    }
+}
+
+impl PcieRootComplexPlan {
+    fn to_openvmm_config(&self) -> PcieRootComplexConfig {
+        PcieRootComplexConfig {
+            index: self.index,
+            name: self.name.clone(),
+            segment: self.segment,
+            start_bus: self.start_bus,
+            end_bus: self.end_bus,
+            low_mmio: self.low_mmio.to_openvmm_config(),
+            high_mmio: self.high_mmio.to_openvmm_config(),
+            ports: Vec::new(),
+            cxl: self
+                .cxl
+                .map(|cxl| openvmm_defs::config::RootComplexCxlConfig {
+                    hdm_size: cxl.hdm_size,
+                    hdm_window_restrictions: cxl.hdm_window_restrictions,
+                }),
+            iommu: self.iommu.map(|iommu| match iommu {
+                PcieIommuPlan::AmdVi => PcieIommuConfig::AmdVi,
+                PcieIommuPlan::Smmu => PcieIommuConfig::Smmu {
+                    accel: false,
+                    oas: openvmm_defs::config::SmmuOas::Auto,
+                },
+                PcieIommuPlan::IntelVtd => PcieIommuConfig::IntelVtd,
+            }),
+            vnode: self.vnode,
+            preserve_bars: self.preserve_bars,
+        }
+    }
+}
+
+impl PcieMmioRangePlan {
+    fn to_openvmm_config(self) -> PcieMmioRangeConfig {
+        match self {
+            Self::Dynamic { size } => PcieMmioRangeConfig::Dynamic { size },
+            Self::Fixed { start, end } => PcieMmioRangeConfig::Fixed(MemoryRange::new(start..end)),
+        }
+    }
+}
+
 /// Resolved chipset MMIO ranges produced by the memory layout engine.
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct ChipsetMmioRanges {
+pub struct ChipsetMmioRanges {
     /// Chipset low MMIO range (below 4 GB) for VMOD/PCI0 _CRS. Always at
     /// least the architectural reserved zone (LAPIC, IOAPIC, TPM, ...).
     pub low: MemoryRange,
@@ -64,9 +423,12 @@ pub(crate) struct ChipsetMmioRanges {
     pub vtl2: MemoryRange,
 }
 
+/// Concrete ranges produced by resolving a [`VmLayoutPlan`].
 #[derive(Debug)]
-pub(super) struct ResolvedMemoryLayout {
+pub struct ResolvedMemoryLayout {
+    /// Guest RAM and MMIO layout.
     pub memory_layout: MemoryLayout,
+    /// Resolved ranges for each PCIe root complex.
     pub pcie_root_complex_ranges: Vec<ResolvedPcieRootComplexRanges>,
     /// Contiguous MMIO region for all virtio-mmio device slots. Each slot is
     /// 4 KiB, indexed from the start of the region. `EMPTY` when no
@@ -89,31 +451,35 @@ pub(super) struct ResolvedMemoryLayout {
 /// "only one kind" invariant structural rather than relying on three separate
 /// fields that callers must remember are mutually exclusive.
 #[derive(Debug, Default)]
-pub(super) enum ResolvedIommuRanges {
+pub enum ResolvedIommuRanges {
     /// No IOMMU is configured.
     #[default]
     None,
     /// Arm SMMUv3 instances, one `SMMU_SIZE`-byte range each.
-    #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
     Smmu(Vec<MemoryRange>),
     /// AMD IOMMU instances, one 16 KiB range each.
-    #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     AmdVi(Vec<MemoryRange>),
     /// Intel VT-d units, one 4 KiB range each.
-    #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     IntelVtd(Vec<MemoryRange>),
 }
 
+/// Concrete ranges assigned to one PCIe root complex.
 #[derive(Debug)]
-pub(super) struct ResolvedPcieRootComplexRanges {
+pub struct ResolvedPcieRootComplexRanges {
+    /// ECAM range.
     pub ecam_range: MemoryRange,
+    /// Low-MMIO aperture.
     pub low_mmio: MemoryRange,
+    /// High-MMIO aperture.
     pub high_mmio: MemoryRange,
+    /// CXL CHBCR aperture.
     pub chbcr_range: MemoryRange,
+    /// CXL HDM aperture.
     pub hdm_range: MemoryRange,
 }
 
-pub(super) struct MemoryLayoutInput<'a> {
+/// Borrowed inputs to the low-level address-space allocator.
+pub struct MemoryLayoutInput<'a> {
     /// Per-NUMA-node RAM sizes. Every VM has at least one node (a
     /// single-node VM is `&[total_size]`). Entries may be zero for
     /// memory-less nodes (e.g. device-only NUMA nodes). The request
@@ -152,9 +518,8 @@ const ARCH_RESERVED_X86_64: MemoryRange = MemoryRange::new(0xFE00_0000..0x1_0000
 /// Architectural reserved zone for aarch64: GIC, PL011, battery.
 const ARCH_RESERVED_AARCH64: MemoryRange = MemoryRange::new(0xEF00_0000..0x1_0000_0000);
 
-pub(super) fn resolve_memory_layout(
-    input: MemoryLayoutInput<'_>,
-) -> anyhow::Result<ResolvedMemoryLayout> {
+/// Resolve borrowed address-space inputs into concrete ranges.
+pub fn resolve_memory_layout(input: MemoryLayoutInput<'_>) -> anyhow::Result<ResolvedMemoryLayout> {
     validate_node_mem_sizes(input.node_mem_sizes)?;
 
     let mut ram_ranges_by_node = vec![Vec::new(); input.node_mem_sizes.len()];
@@ -528,7 +893,14 @@ pub(super) fn resolve_memory_layout(
     // layout engine is host-width independent, which keeps the layout a pure
     // function of VM configuration and avoids host differences changing guest
     // physical addresses.
-    let address_space_limit = 1u64 << input.physical_address_size;
+    let address_space_limit = 1u64
+        .checked_shl(input.physical_address_size.into())
+        .with_context(|| {
+            format!(
+                "invalid physical address width {} (must be less than 64)",
+                input.physical_address_size
+            )
+        })?;
     let layout_top = placed_ranges.last().map(|r| r.range.end()).unwrap_or(0);
     if layout_top > address_space_limit {
         bail!(
@@ -772,6 +1144,70 @@ mod tests {
         assert_eq!(
             actual.memory_layout.probe_address(ranges.high_mmio.start()),
             Some(AddressType::PciMmio)
+        );
+    }
+
+    #[test]
+    fn one_root_plan_produces_matching_host_bridge() {
+        let root_complexes = [pcie_root_complex(
+            PcieMmioRangeConfig::Dynamic { size: 64 * MB },
+            PcieMmioRangeConfig::Dynamic { size: GB },
+        )];
+        let plan = VmLayoutPlan::from_openvmm_config(
+            &openvmm_defs::config::NumaTopology {
+                nodes: vec![openvmm_defs::config::NumaNode {
+                    mem: Some(openvmm_defs::config::MemoryConfig {
+                        mem_size: 160 * MB,
+                        prefetch_memory: false,
+                        private_memory: false,
+                        transparent_hugepages: false,
+                        hugepages: false,
+                        hugepage_size: None,
+                        host_numa_node: None,
+                    }),
+                    vps: openvmm_defs::config::VpAssignment::FromTopology,
+                }],
+                distances: Vec::new(),
+            },
+            &DEFAULT_LAYOUT,
+            &root_complexes,
+            0,
+            Some(openvmm_defs::config::IsolationType::Snp),
+            false,
+            None,
+            0,
+            48,
+        )
+        .unwrap();
+
+        let resolved = plan.resolve().unwrap();
+        let bridges = plan
+            .pcie_host_bridges(&resolved.pcie_root_complex_ranges)
+            .unwrap();
+        let [bridge] = bridges.as_slice() else {
+            panic!("expected one host bridge");
+        };
+        let ranges = &resolved.pcie_root_complex_ranges[0];
+
+        assert_eq!(resolved.memory_layout.ram_size(), 160 * MB);
+        assert_eq!(bridge.ecam_range, ranges.ecam_range);
+        assert_eq!(bridge.low_mmio, ranges.low_mmio);
+        assert_eq!(bridge.high_mmio, ranges.high_mmio);
+        assert_eq!(bridge.start_bus, 0);
+        assert_eq!(bridge.end_bus, 0);
+        assert!(bridge.ecam_range.end() <= 4 * GB);
+    }
+
+    #[test]
+    fn rejects_unrepresentable_physical_address_width() {
+        let mut config = input(&[2 * GB], None);
+        config.physical_address_size = 64;
+
+        assert!(
+            resolve_memory_layout(config)
+                .unwrap_err()
+                .to_string()
+                .contains("must be less than 64")
         );
     }
 

@@ -14,11 +14,6 @@ use crate::emuplat;
 use crate::partition::BindHvliteVp;
 use crate::partition::HvlitePartition;
 use crate::vmgs_non_volatile_store::HvLiteVmgsNonVolatileStore;
-use crate::worker::memory_layout::ChipsetMmioRanges;
-use crate::worker::memory_layout::MemoryLayoutInput;
-use crate::worker::memory_layout::ResolvedIommuRanges;
-use crate::worker::memory_layout::ResolvedPcieRootComplexRanges;
-use crate::worker::memory_layout::resolve_memory_layout;
 use crate::worker::rom::RomBuilder;
 use acpi::dsdt;
 use anyhow::Context;
@@ -90,6 +85,12 @@ use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
 use openvmm_pcat_locator::RomFileLocation;
+use openvmm_vm_layout::ChipsetMmioRanges;
+use openvmm_vm_layout::ResolvedIommuRanges;
+use openvmm_vm_layout::ResolvedPcieRootComplexRanges;
+use openvmm_vm_layout::VmLayoutPlan;
+#[cfg(guest_arch = "x86_64")]
+use openvmm_vm_layout::build_x86_topology;
 use pal_async::DefaultDriver;
 use pal_async::DefaultPool;
 use pal_async::local::block_with_io;
@@ -124,11 +125,10 @@ use vm_resource::kind::KeyboardInputHandleKind;
 use vm_resource::kind::MouseInputHandleKind;
 use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
-use vm_topology::cxl::CfmwsWindowRestrictions;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::pcie::PcieHostBridge;
-use vm_topology::pcie::PcieHostBridgeCxlInfo;
 use vm_topology::processor::ProcessorTopology;
+#[cfg(guest_arch = "aarch64")]
 use vm_topology::processor::TopologyBuilder;
 use vm_topology::processor::aarch64::Aarch64Topology;
 use vm_topology::processor::aarch64::GicVersion;
@@ -461,6 +461,7 @@ pub(crate) struct InitializedVm {
     #[cfg(guest_arch = "aarch64")]
     shared_gpa_bit: Option<u64>,
     cfg: Manifest,
+    layout_plan: VmLayoutPlan,
     mem_layout: MemoryLayout,
     resolved_pcie_root_complex_ranges: Vec<ResolvedPcieRootComplexRanges>,
     virtio_mmio_region: MemoryRange,
@@ -494,43 +495,6 @@ impl ExtractTopologyConfig for ProcessorTopology<X86Topology> {
             })),
         }
     }
-}
-
-#[cfg(guest_arch = "x86_64")]
-struct X86TopologyResult {
-    processor_topology: ProcessorTopology<X86Topology>,
-}
-
-#[cfg(guest_arch = "x86_64")]
-fn build_x86_topology(config: &ProcessorTopologyConfig) -> anyhow::Result<X86TopologyResult> {
-    use vm_topology::processor::x86::X2ApicState;
-
-    let arch = match &config.arch {
-        None => Default::default(),
-        Some(ArchTopologyConfig::X86(arch)) => arch.clone(),
-        _ => anyhow::bail!("invalid architecture config"),
-    };
-    let mut builder = TopologyBuilder::from_host_topology()?;
-    builder.apic_id_offset(arch.apic_id_offset);
-    if let Some(smt) = config.enable_smt {
-        builder.smt_enabled(smt);
-    }
-    if let Some(count) = config.vps_per_socket {
-        builder.vps_per_socket(count);
-    }
-    let x2apic = match arch.x2apic {
-        X2ApicConfig::Auto => {
-            // FUTURE: query the hypervisor for a recommendation.
-            X2ApicState::Supported
-        }
-        X2ApicConfig::Supported => X2ApicState::Supported,
-        X2ApicConfig::Unsupported => X2ApicState::Unsupported,
-        X2ApicConfig::Enabled => X2ApicState::Enabled,
-    };
-    builder.x2apic(x2apic);
-    Ok(X86TopologyResult {
-        processor_topology: builder.build(config.proc_count)?,
-    })
 }
 
 impl ExtractTopologyConfig for ProcessorTopology<Aarch64Topology> {
@@ -975,13 +939,6 @@ impl InitializedVm {
         H: virt::Hypervisor<Partition = P>,
         P: 'static + HvlitePartition,
     {
-        let node_mem_sizes: Vec<u64> = cfg
-            .numa
-            .nodes
-            .iter()
-            .map(|n| n.mem.as_ref().map_or(0, |m| m.mem_size))
-            .collect();
-
         let vmtime_keeper = VmTimeKeeper::new(&driver_source.simple(), VmTime::from_100ns(0));
         let vmtime_source = vmtime_keeper
             .builder()
@@ -1051,10 +1008,7 @@ impl InitializedVm {
             (result.processor_topology, result.spi_layout)
         };
         #[cfg(not(guest_arch = "aarch64"))]
-        let mut processor_topology = {
-            let result = build_x86_topology(&cfg.processor_topology)?;
-            result.processor_topology
-        };
+        let mut processor_topology = build_x86_topology(&cfg.processor_topology)?;
 
         // Validate NUMA topology and resolve VP-to-vnode assignments.
         let vp_to_vnode = super::numa::resolve_numa_vp_assignment(
@@ -1130,26 +1084,6 @@ impl InitializedVm {
             .iter()
             .filter(|(bus, _)| matches!(bus, VirtioBus::Mmio))
             .count();
-
-        // On aarch64 Linux direct boot, start RAM at 1 GiB to avoid the low GPA
-        // region (128 MiB–129 MiB) that iommufd reserves for the host MSI
-        // doorbell in IOVA space. Without this gap, iommufd identity-mapped DMA
-        // for passthrough devices fails because it cannot allocate IOVAs in
-        // that range.
-        //
-        // FUTURE: this needs to be present for UEFI as well, but UEFI cannot
-        // only boot from low memory. Either:
-        //  1. Fix Linux to allow configuring the reserved IOVA range.
-        //  2. Fix UEFI to allow booting from >0.
-        //  3. Install a little bit of low memory, enough for UEFI to get to DXE
-        //     (which can run anywhere.)
-        let ram_start_address =
-            if cfg!(guest_arch = "aarch64") && matches!(cfg.load_mode, LoadMode::Linux { .. }) {
-                1024 * 1024 * 1024 // 1 GiB
-            } else {
-                0
-            };
-
         let vtl2_framebuffer_size = if cfg.vtl2_gfx {
             cfg.framebuffer
                 .as_ref()
@@ -1158,19 +1092,21 @@ impl InitializedVm {
         } else {
             0
         };
-        let resolved_layout = resolve_memory_layout(MemoryLayoutInput {
-            node_mem_sizes: &node_mem_sizes,
-            layout: cfg.layout.clone(),
-            pcie_root_complexes: &cfg.pcie_root_complexes,
+        let layout_plan = VmLayoutPlan::from_openvmm_config(
+            &cfg.numa,
+            &cfg.layout,
+            &cfg.pcie_root_complexes,
             virtio_mmio_count,
-            pcie_ecam_below_4gb: cfg.hypervisor.with_isolation
-                == Some(openvmm_defs::config::IsolationType::Snp),
+            cfg.hypervisor.with_isolation,
+            matches!(cfg.load_mode, LoadMode::Linux { .. }),
             vtl2_layout,
-            ram_start_address,
             vtl2_framebuffer_size,
             physical_address_size,
-        })
-        .context("invalid memory configuration")?;
+        )
+        .context("deriving memory layout inputs")?;
+        let resolved_layout = layout_plan
+            .resolve()
+            .context("invalid memory configuration")?;
         let mem_layout = resolved_layout.memory_layout;
         let resolved_pcie_root_complex_ranges = resolved_layout.pcie_root_complex_ranges;
         let virtio_mmio_region = resolved_layout.virtio_mmio_region;
@@ -1530,6 +1466,7 @@ impl InitializedVm {
             #[cfg(guest_arch = "aarch64")]
             shared_gpa_bit,
             cfg,
+            layout_plan,
             mem_layout,
             resolved_pcie_root_complex_ranges,
             virtio_mmio_region,
@@ -1564,6 +1501,7 @@ impl InitializedVm {
             #[cfg(guest_arch = "aarch64")]
             shared_gpa_bit,
             cfg,
+            layout_plan,
             mem_layout,
             resolved_pcie_root_complex_ranges,
             virtio_mmio_region,
@@ -2184,13 +2122,15 @@ impl InitializedVm {
 
         let (mut pcie_host_bridges, pcie_root_complexes) = {
             pcie_topology::validate_pcie_root_complexes(&cfg.pcie_root_complexes)?;
-            let mut pcie_host_bridges = Vec::new();
+            let pcie_host_bridges = layout_plan
+                .pcie_host_bridges(&resolved_pcie_root_complex_ranges)
+                .context("building PCIe host bridges")?;
             let mut pcie_root_complexes = Vec::new();
 
             for (rc_idx, (rc, ranges)) in cfg
                 .pcie_root_complexes
                 .iter()
-                .zip(resolved_pcie_root_complex_ranges)
+                .zip(&resolved_pcie_root_complex_ranges)
                 .enumerate()
             {
                 let cxl_port_count = rc.ports.iter().filter(|rp_cfg| rp_cfg.cxl).count() as u64;
@@ -2308,37 +2248,6 @@ impl InitializedVm {
                     msi_conn,
                     segment: rc.segment,
                     rc_idx,
-                });
-
-                let cxl = cxl_config
-                    .map(|cxl| -> anyhow::Result<PcieHostBridgeCxlInfo> {
-                        Ok(PcieHostBridgeCxlInfo {
-                            chbcr_range: chbcr_range
-                                .context("missing CHBCR range for CXL root complex")?,
-                            hdm_range: hdm_range
-                                .context("missing HDM range for CXL root complex")?,
-                            hdm_window_restrictions: CfmwsWindowRestrictions::try_from_bits(
-                                cxl.hdm_window_restrictions,
-                            )
-                            .context("invalid CFMWS HDM window restrictions")?,
-                        })
-                    })
-                    .transpose()?;
-
-                pcie_host_bridges.push(PcieHostBridge {
-                    index: rc.index,
-                    segment: rc.segment,
-                    start_bus: rc.start_bus,
-                    end_bus: rc.end_bus,
-                    ecam_range: ranges.ecam_range,
-                    low_mmio: ranges.low_mmio,
-                    high_mmio: ranges.high_mmio,
-                    cxl,
-                    vnode: rc.vnode,
-                    preserve_bars: rc.preserve_bars,
-                    // A request to pin BARs (GPA = HPA) also requires the guest
-                    // to leave the firmware's boot configuration alone.
-                    preserve_boot_config: rc.preserve_bars,
                 });
 
                 pcie_root_complexes.push(root_complex.clone());
