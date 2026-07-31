@@ -598,6 +598,7 @@ impl PetriVmConfigOpenVmm {
                     None => None,
                     _ => anyhow::bail!("unsupported isolation type"),
                 },
+                snp_disable_cpuid_offload: false,
                 nested_virt: false,
             },
             vmbus: if properties.no_vmbus {
