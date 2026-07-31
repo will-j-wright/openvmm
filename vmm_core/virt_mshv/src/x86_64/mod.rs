@@ -283,6 +283,47 @@ fn snp_host_access_flags(visibility: u32) -> Option<u8> {
     }
 }
 
+pub(crate) fn acquire_snp_host_access(
+    partition: &MshvPartitionInner,
+    addr: u64,
+    size: u64,
+) -> anyhow::Result<()> {
+    // TODO: The current prototype implementation does not coordinate
+    // acquisition with guest visibility changes. In particular, there is no
+    // per-page state preventing a fault on another thread from acquiring
+    // access while a GPA attribute intercept is revoking it. A complete
+    // implementation must serialize acquisition with revocation and block or
+    // fail this request if the guest is making the page private.
+    anyhow::ensure!(
+        addr.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            && size.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            && size != 0,
+        "host-access range must be page aligned and nonempty"
+    );
+    let page_count = size / hvdef::HV_PAGE_SIZE;
+    let flags = (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE)
+        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE)
+        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE);
+    let mut buf = HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
+        flags,
+        rsvd: [0; 7],
+        page_count,
+    });
+    let gpas = (0..page_count)
+        .map(|page| addr + page * hvdef::HV_PAGE_SIZE)
+        .collect::<Vec<_>>();
+    buf.extend_tail_from_slice(&gpas);
+    // SAFETY: The custom header matches `mshv_modify_gpa_host_access`,
+    // followed by `page_count` contiguous GPA values.
+    let args = unsafe {
+        &*buf
+            .as_ptr()
+            .cast::<mshv_bindings::mshv_modify_gpa_host_access>()
+    };
+    partition.vmfd.modify_gpa_host_access(args)?;
+    Ok(())
+}
+
 fn parse_snp_gpa_range(
     range: mshv_bindings::hv_gpa_page_range,
 ) -> Result<(u64, u64), VpHaltReason> {
@@ -1951,8 +1992,15 @@ impl MshvProcessor<'_> {
         let flags = snp_host_access_flags(info.__bindgen_anon_1.host_visibility())
             .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
 
-        // TODO: Before revoking host access, block new GuestMemory accesses
-        // to these pages and drain concurrent accesses and locked ranges.
+        // TODO: The current prototype implementation assumes that no
+        // virtstack component is using these pages. Before revoking host
+        // access, mark the ranges as revoking so that new GuestMemory faults
+        // cannot reacquire them, then drain active GuestMemory accesses,
+        // acquisitions already in progress, locked ranges, and device/DMA
+        // users. Only after the release ioctl succeeds should the ranges be
+        // marked private and the VP resumed, allowing the pending guest
+        // visibility hypercall to be re-executed. If the accesses cannot be
+        // drained, deny the intercept instead of reporting success.
         let mut gpas = Vec::with_capacity(BATCH_PAGES);
         for range in &ranges[..range_count] {
             let (start_pfn, page_count) = parse_snp_gpa_range(*range)?;

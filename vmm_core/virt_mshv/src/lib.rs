@@ -894,6 +894,18 @@ impl virt::PartitionMemoryMapper for MshvPartition {
 
 // TODO: figure out a better abstraction that also works for KVM and WHP.
 impl virt::PartitionMemoryMap for MshvPartitionInner {
+    fn acquire_host_access(&self, addr: u64, size: u64, _write: bool) -> anyhow::Result<()> {
+        // The current prototype implementation only provides the acquisition
+        // half of the host-visibility lifecycle. The MSHV GPA attribute
+        // intercept path performs revocation, but the two paths do not yet
+        // share state that serializes their transitions.
+        #[cfg(guest_arch = "x86_64")]
+        if self.isolation == virt::IsolationType::Snp {
+            return arch::acquire_snp_host_access(self, addr, size);
+        }
+        anyhow::bail!("acquiring host access is not supported")
+    }
+
     unsafe fn map_range(
         &self,
         data: *mut u8,
