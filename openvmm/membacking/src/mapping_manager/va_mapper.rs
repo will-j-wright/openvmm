@@ -109,6 +109,16 @@ struct MapperInner {
     /// is eventually updated after `SetEager` is processed.
     eager: AtomicBool,
     req_send: mesh::Sender<MappingRequest>,
+    host_access: Mutex<Option<HostAccess>>,
+}
+
+#[derive(Clone)]
+struct HostAccess(Arc<dyn virt::PartitionMemoryMap>);
+
+impl std::fmt::Debug for HostAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostAccess")
+    }
 }
 
 /// A pending lazy mapping request.
@@ -482,6 +492,7 @@ impl VaMapper {
             waiters: Mutex::new(Some(Vec::new())),
             eager: AtomicBool::new(eager),
             req_send,
+            host_access: Mutex::new(None),
         });
 
         // Spawn the mapper thread *before* the AddMapper RPC. The manager
@@ -539,6 +550,10 @@ impl VaMapper {
     /// Returns the base pointer of the VA reservation.
     pub fn as_ptr(&self) -> *mut u8 {
         self.inner.mapping.as_ptr().cast()
+    }
+
+    pub(crate) fn set_host_access(&self, host_access: Option<Arc<dyn virt::PartitionMemoryMap>>) {
+        *self.inner.host_access.lock() = host_access.map(HostAccess);
     }
 
     /// Returns the length of the VA reservation in bytes.
@@ -634,6 +649,29 @@ unsafe impl GuestMemoryAccess for VaMapper {
         }
 
         if self.inner.eager.load(Ordering::Relaxed) {
+            if let Some(host_access) = self.inner.host_access.lock().clone() {
+                let start = address & !(hvdef::HV_PAGE_SIZE - 1);
+                let end = address
+                    .checked_add(len as u64)
+                    .and_then(|end| end.checked_add(hvdef::HV_PAGE_SIZE - 1))
+                    .map(|end| end & !(hvdef::HV_PAGE_SIZE - 1));
+                let Some(end) = end else {
+                    return PageFaultAction::Fail(PageFaultError::new(
+                        guestmem::GuestMemoryErrorKind::OutOfRange,
+                        std::io::Error::other("host-access range overflow"),
+                    ));
+                };
+                match host_access.0.acquire_host_access(start, end - start, write) {
+                    Ok(()) => return PageFaultAction::Retry,
+                    Err(err) => {
+                        return PageFaultAction::Fail(PageFaultError::new(
+                            guestmem::GuestMemoryErrorKind::Other,
+                            std::io::Error::other(err.to_string()),
+                        ));
+                    }
+                }
+            }
+
             // Eager mapper: file-backed mappings are established proactively.
             // If we get a page fault, the mapping was never set up or was
             // torn down.

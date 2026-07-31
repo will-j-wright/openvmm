@@ -91,6 +91,14 @@ pub struct MappingManagerClient {
 static MAPPER_CACHE: ObjectCache<VaMapper> = ObjectCache::new();
 
 impl MappingManagerClient {
+    pub async fn set_host_access(
+        &self,
+        host_access: Option<Arc<dyn virt::PartitionMemoryMap>>,
+    ) -> Result<(), VaMapperError> {
+        self.new_mapper(false).await?.set_host_access(host_access);
+        Ok(())
+    }
+
     /// Returns a VA mapper for this guest memory.
     ///
     /// When `eager` is true, the mapper receives all existing mappings
