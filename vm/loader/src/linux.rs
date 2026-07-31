@@ -373,6 +373,7 @@ const ACI_SEV_INFO_BASE: u64 = 0x803000;
 const ACI_SETUP_DATA_BASE: u64 = 0x804000;
 const ACI_METADATA_END: u64 = ACI_SETUP_DATA_BASE + HV_PAGE_SIZE;
 const ACI_MEMORY_MAP_OFFSET: usize = 0x18;
+const ACI_CC_SETUP_DATA_PACKED_SIZE: usize = size_of::<defs::setup_data>() + size_of::<u32>();
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -471,6 +472,7 @@ fn import_snp_boot_pages(
         range.start() + 2 * HV_PAGE_SIZE,
         range.start() + 3 * HV_PAGE_SIZE,
         range.start() + 4 * HV_PAGE_SIZE,
+        (size_of::<defs::cc_setup_data>() - size_of::<defs::setup_data>()) as u32,
     )
 }
 
@@ -481,6 +483,7 @@ fn import_snp_boot_pages_at(
     cc_blob_address: u64,
     cc_setup_data_address: u64,
     vmsa_address: u64,
+    cc_setup_data_len: u32,
 ) -> Result<u64, Error> {
     importer
         .import_pages(
@@ -544,7 +547,7 @@ fn import_snp_boot_pages_at(
         header: defs::setup_data {
             next: 0,
             ty: defs::SETUP_CC_BLOB,
-            len: (size_of::<defs::cc_setup_data>() - size_of::<defs::setup_data>()) as u32,
+            len: cc_setup_data_len,
         },
         cc_blob_address,
         _padding: [0; 3],
@@ -923,6 +926,7 @@ fn import_config(
             ACI_SEV_INFO_BASE,
             ACI_SETUP_DATA_BASE,
             ACI_VMSA_BASE,
+            (HV_PAGE_SIZE as usize - ACI_CC_SETUP_DATA_PACKED_SIZE) as u32,
         )?
         .into();
         import_aci_parameter_page(importer, aci_config.vp_count, mem_layout)?;
@@ -1877,6 +1881,16 @@ mod tests {
         assert_eq!(
             importer.page_base("linux-snp-cpuid"),
             Some(ACI_CPUID_BASE / HV_PAGE_SIZE)
+        );
+        let setup_data = importer
+            .imports
+            .iter()
+            .find(|record| record.tag == "linux-snp-cc-setup-data")
+            .unwrap();
+        let setup_data = defs::cc_setup_data::read_from_bytes(&setup_data.data).unwrap();
+        assert_eq!(
+            setup_data.header.len,
+            (HV_PAGE_SIZE as usize - ACI_CC_SETUP_DATA_PACKED_SIZE) as u32
         );
         let params = importer
             .imports
