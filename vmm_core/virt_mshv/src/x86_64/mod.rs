@@ -69,6 +69,19 @@ use zerocopy::IntoBytes;
 
 const SNP_IMPORT_CHUNK_PAGES: usize = 256;
 
+const SNP_HYPERV_CPUID_FUNCTIONS: [u32; 10] = [
+    hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION,
+    hvdef::HV_CPUID_FUNCTION_HV_INTERFACE,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_VERSION,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_FEATURES,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_ENLIGHTENMENT_INFORMATION,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_IMPLEMENTATION_LIMITS,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_HARDWARE_FEATURES,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_NESTED_FEATURES,
+    hvdef::HV_CPUID_FUNCTION_MS_HV_ISOLATION_CONFIGURATION,
+    hvdef::VIRTUALIZATION_STACK_CPUID_PROPERTIES,
+];
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum SnpLaunchState {
     NotStarted,
@@ -329,8 +342,8 @@ fn parse_snp_gpa_range(
     Ok((start_pfn, page_count))
 }
 
-fn sanitize_snp_cpuid(function: u32, index: u32, values: &mut [u32; 4]) {
-    if function == x86defs::cpuid::CpuidFunction::VersionAndFeatures.0 {
+fn sanitize_snp_cpuid(function: u32, index: u32, expose_hypervisor: bool, values: &mut [u32; 4]) {
+    if function == x86defs::cpuid::CpuidFunction::VersionAndFeatures.0 && !expose_hypervisor {
         values[2] &= !(1 << 31);
     }
     if function == x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0 && index == 1 {
@@ -343,7 +356,31 @@ fn sanitize_snp_cpuid(function: u32, index: u32, values: &mut [u32; 4]) {
     }
 }
 
-fn snp_hv_cpuid_overrides(native_max_leaf: u32) -> [virt::CpuidLeaf; 3] {
+fn add_snp_hyperv_cpuid_leaves(page: &mut x86defs::snp::HvPspCpuidPage) -> Result<(), usize> {
+    let mut count = page.count as usize;
+    if count > x86defs::snp::HV_PSP_CPUID_LEAF_COUNT_MAX {
+        return Err(count);
+    }
+
+    for function in SNP_HYPERV_CPUID_FUNCTIONS {
+        if page.cpuid_leaf_info[..count]
+            .iter()
+            .any(|leaf| leaf.eax_in == function && leaf.ecx_in == 0)
+        {
+            continue;
+        }
+        if count == x86defs::snp::HV_PSP_CPUID_LEAF_COUNT_MAX {
+            return Err(count + 1);
+        }
+
+        page.cpuid_leaf_info[count].eax_in = function;
+        count += 1;
+    }
+    page.count = count as u32;
+    Ok(())
+}
+
+fn snp_hv_cpuid_overrides(native_max_leaf: u32) -> [virt::CpuidLeaf; 4] {
     const HV_ISOLATION_TYPE_SNP: u32 = 2;
     let privileges = hvdef::HvPartitionPrivilege::new()
         .with_start_virtual_processor(true)
@@ -372,6 +409,12 @@ fn snp_hv_cpuid_overrides(native_max_leaf: u32) -> [virt::CpuidLeaf; 3] {
             ],
         )
         .masked([u32::MAX, 0, 0, 0]),
+        // Make the Hyper-V vendor leaves discoverable through CPUID.
+        virt::CpuidLeaf::new(
+            x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
+            [0, 0, 1 << 31, 0],
+        )
+        .masked([0, 0, 1 << 31, 0]),
         // Tell the guest that this is an isolated Hyper-V partition.
         virt::CpuidLeaf::new(
             hvdef::HV_CPUID_FUNCTION_MS_HV_FEATURES,
@@ -508,24 +551,20 @@ fn partition_create_args(
         pt_flags |= 1 << mshv_bindings::MSHV_PT_BIT_SMT_ENABLED_GUEST;
     }
 
-    if snp {
-        mshv_bindings::mshv_create_partition_v2 {
-            pt_flags,
-            pt_isolation: mshv_bindings::MSHV_PT_ISOLATION_SNP as u64,
-            ..Default::default()
-        }
-    } else {
-        mshv_bindings::mshv_create_partition_v2 {
-            pt_flags: pt_flags | 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
-            pt_isolation: mshv_bindings::MSHV_PT_ISOLATION_NONE as u64,
-            pt_num_cpu_fbanks: mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16,
-            pt_cpu_fbanks: [
-                !u64::from(supported_processor_features()),
-                !u64::from(supported_processor_features1()),
-            ],
-            pt_disabled_xsave: !u64::from(supported_xsave_features()),
-            ..Default::default()
-        }
+    mshv_bindings::mshv_create_partition_v2 {
+        pt_flags: pt_flags | 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
+        pt_isolation: if snp {
+            mshv_bindings::MSHV_PT_ISOLATION_SNP as u64
+        } else {
+            mshv_bindings::MSHV_PT_ISOLATION_NONE as u64
+        },
+        pt_num_cpu_fbanks: mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16,
+        pt_cpu_fbanks: [
+            !u64::from(supported_processor_features()),
+            !u64::from(supported_processor_features1()),
+        ],
+        pt_disabled_xsave: !u64::from(supported_xsave_features()),
+        ..Default::default()
     }
 }
 
@@ -661,7 +700,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         let mut cpuid = config.cpuid.to_vec();
-        if self.config.isolation == virt::IsolationType::Snp && self.config.snp_aci_hyperv {
+        if self.config.isolation == virt::IsolationType::Snp && self.config.hv_config.is_some() {
             let native_max_leaf = self
                 .bsp
                 .get_cpuid_values(hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION, 0, 0, 0)
@@ -736,6 +775,8 @@ impl ProtoPartition for MshvProtoPartition<'_> {
                     self.caps_from_properties()?
                 }
             };
+            caps.hv1 = self.config.hv_config.is_some();
+            caps.hv1_reference_tsc_page = self.config.hv_config.is_some();
             caps.xsaves_state_bv_broken = true;
             caps.can_freeze_time = true;
             caps
@@ -802,6 +843,8 @@ mod tests {
         let args = partition_create_args(true, false, false);
         let pt_isolation = args.pt_isolation;
         let pt_num_cpu_fbanks = args.pt_num_cpu_fbanks;
+        let pt_cpu_fbanks = args.pt_cpu_fbanks;
+        let pt_disabled_xsave = args.pt_disabled_xsave;
 
         assert_eq!(pt_isolation, mshv_bindings::MSHV_PT_ISOLATION_SNP as u64);
         assert_ne!(args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_LAPIC, 0);
@@ -810,11 +853,22 @@ mod tests {
             0
         );
         assert_ne!(args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_X2APIC, 0);
-        assert_eq!(
+        assert_ne!(
             args.pt_flags & 1 << mshv_bindings::MSHV_PT_BIT_CPU_AND_XSAVE_FEATURES,
             0
         );
-        assert_eq!(pt_num_cpu_fbanks, 0);
+        assert_eq!(
+            pt_num_cpu_fbanks,
+            mshv_bindings::MSHV_NUM_CPU_FEATURES_BANKS as u16
+        );
+        assert_eq!(
+            pt_cpu_fbanks,
+            [
+                !u64::from(supported_processor_features()),
+                !u64::from(supported_processor_features1()),
+            ]
+        );
+        assert_eq!(pt_disabled_xsave, !u64::from(supported_xsave_features()));
     }
 
     #[test]
@@ -822,11 +876,32 @@ mod tests {
         let leaves = snp_hv_cpuid_overrides(0x40000010);
         assert_eq!(leaves[0].result[0], 0x40000010);
         let privileges = hvdef::HvPartitionPrivilege::from(
-            u64::from(leaves[1].result[0]) | (u64::from(leaves[1].result[1]) << 32),
+            u64::from(leaves[2].result[0]) | (u64::from(leaves[2].result[1]) << 32),
         );
+        assert_ne!(leaves[1].result[2] & 1 << 31, 0);
         assert!(privileges.start_virtual_processor());
         assert!(privileges.isolation());
-        assert_eq!(leaves[2].result, [0, 2, 0, 0]);
+        assert_eq!(leaves[3].result, [0, 2, 0, 0]);
+    }
+
+    #[test]
+    fn adds_hyperv_leaves_to_snp_cpuid_page() {
+        let mut page = x86defs::snp::HvPspCpuidPage::new_zeroed();
+        page.count = 1;
+        page.cpuid_leaf_info[0].eax_in = hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION;
+
+        add_snp_hyperv_cpuid_leaves(&mut page).unwrap();
+
+        assert_eq!(page.count as usize, SNP_HYPERV_CPUID_FUNCTIONS.len());
+        for function in SNP_HYPERV_CPUID_FUNCTIONS {
+            assert_eq!(
+                page.cpuid_leaf_info[..page.count as usize]
+                    .iter()
+                    .filter(|leaf| leaf.eax_in == function && leaf.ecx_in == 0)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -1128,14 +1203,25 @@ mod tests {
         sanitize_snp_cpuid(
             x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
             0,
+            false,
             &mut values,
         );
         assert_eq!(values[2], 0);
+
+        let mut values = [0, 0, 1 << 31, 0];
+        sanitize_snp_cpuid(
+            x86defs::cpuid::CpuidFunction::VersionAndFeatures.0,
+            0,
+            true,
+            &mut values,
+        );
+        assert_eq!(values[2], 1 << 31);
 
         let mut values = [0xb, 0x240, 0x1800, 1];
         sanitize_snp_cpuid(
             x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0,
             1,
+            false,
             &mut values,
         );
         assert_eq!(values, [0xb, 0x240, 0, 0]);
@@ -1262,13 +1348,23 @@ impl MshvPartitionInner {
         if count > x86defs::snp::HV_PSP_CPUID_LEAF_COUNT_MAX {
             return Err(ErrorInner::TooManySnpCpuidEntries(count).into());
         }
+        if self.caps.hv1 {
+            // TODO: Determine whether MSHV can service these Hyper-V leaves
+            // without copying them into the measured SNP CPUID page.
+            // Linux services all CPUID instructions from the measured SNP
+            // table once one is installed. Missing Hyper-V leaves therefore
+            // read as zero instead of falling back to MSHV, preventing Linux
+            // from recognizing the Hyper-V interface and its APIC contract.
+            add_snp_hyperv_cpuid_leaves(&mut page).map_err(ErrorInner::TooManySnpCpuidEntries)?;
+        }
+        let count = page.count as usize;
 
         for leaf in &mut page.cpuid_leaf_info[..count] {
             let mut values = self
                 .bsp_vcpufd
                 .get_cpuid_values(leaf.eax_in, leaf.ecx_in, leaf.xfem_in, leaf.xss_in)
                 .map_err(|e| ErrorInner::SnpCpuid(e.into()))?;
-            sanitize_snp_cpuid(leaf.eax_in, leaf.ecx_in, &mut values);
+            sanitize_snp_cpuid(leaf.eax_in, leaf.ecx_in, self.caps.hv1, &mut values);
             leaf.eax_out = values[0];
             leaf.ebx_out = values[1];
             leaf.ecx_out = values[2];
