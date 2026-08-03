@@ -131,6 +131,16 @@ fn build_zero_page(
                 ACI_INITIAL_E820_END - ACI_VMSA_REGION_BASE,
                 defs::E820_RESERVED,
             ),
+            // The measured SNP metadata is loader-owned and must never enter
+            // Linux's page allocator. The setup_data node is the exception:
+            // expose it as RAM so Linux can discover it through the boot
+            // protocol and reserve it during e820__reserve_setup_data().
+            (
+                ACI_CPUID_BASE,
+                ACI_SETUP_DATA_BASE - ACI_CPUID_BASE,
+                defs::E820_RESERVED,
+            ),
+            (ACI_SETUP_DATA_BASE, HV_PAGE_SIZE, defs::E820_RAM),
             (
                 u64::from(hdr.pref_address),
                 aci_layout
@@ -1617,6 +1627,8 @@ mod tests {
             (0xa0000, 0x60000, defs::E820_RESERVED),
             (0x100000, 0x100000, defs::E820_ACPI),
             (0x200000, 0x100000, defs::E820_RESERVED),
+            (0x800000, 0x4000, defs::E820_RESERVED),
+            (0x804000, 0x1000, defs::E820_RAM),
             (0x1a00000, 0x2800000, defs::E820_RAM),
         ];
         assert_eq!(result.boot_params.e820_entries as usize, expected.len());
