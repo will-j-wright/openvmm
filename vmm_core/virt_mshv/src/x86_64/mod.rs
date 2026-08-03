@@ -90,6 +90,25 @@ pub(crate) enum SnpLaunchState {
     Failed,
 }
 
+#[test]
+fn can_disable_snp_cpuid_offloads() {
+    let enabled = snp_vmgexit_offloads(false);
+    let disabled = snp_vmgexit_offloads(true);
+
+    // SAFETY: These generated C unions contain the bitfield member used by
+    // get_default_vmgexit_offload_features() and snp_vmgexit_offloads().
+    unsafe {
+        assert_eq!(enabled.__bindgen_anon_1.nae_cpuid(), 1);
+        assert_eq!(enabled.__bindgen_anon_1.msr_cpuid(), 1);
+        assert_eq!(disabled.__bindgen_anon_1.nae_cpuid(), 0);
+        assert_eq!(disabled.__bindgen_anon_1.msr_cpuid(), 0);
+        assert_eq!(
+            disabled.__bindgen_anon_1.nae_rdmsr(),
+            enabled.__bindgen_anon_1.nae_rdmsr()
+        );
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 struct ImportIsolatedPagesHeader {
@@ -108,6 +127,8 @@ struct ModifyGpaHostAccessHeader {
 
 const GHCB_RAX_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, rax) / size_of::<u64>());
+const GHCB_RBX_VALID_BIT: u64 =
+    1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, rbx) / size_of::<u64>() - 64);
 const GHCB_RCX_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, rcx) / size_of::<u64>() - 64);
 const GHCB_RDX_VALID_BIT: u64 =
@@ -122,6 +143,11 @@ const GHCB_SW_EXIT_INFO2_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, sw_exit_info2) / size_of::<u64>() - 64);
 const GHCB_SW_SCRATCH_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, sw_scratch) / size_of::<u64>() - 64);
+const GHCB_XCR0_VALID_BIT: u64 =
+    1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, xcr0) / size_of::<u64>() - 64);
+const GHCB_XSS_VALID_BIT: u64 =
+    1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, xss) / size_of::<u64>());
+const SVM_EXITCODE_CPUID: u64 = 0x72;
 const GHCB_SHARED_BUFFER_OFFSET: u64 =
     std::mem::offset_of!(x86defs::snp::GhcbPage, shared_buffer) as u64;
 const SVM_NAE_SNP_AP_CREATE: u32 = 1;
@@ -502,7 +528,7 @@ impl virt::Hypervisor for LinuxMshv {
 
         if snp {
             let snp_policy = mshv_bindings::snp::get_default_snp_guest_policy();
-            let vmgexit_offloads = mshv_bindings::snp::get_default_vmgexit_offload_features();
+            let vmgexit_offloads = snp_vmgexit_offloads(config.snp_disable_cpuid_offload);
             // SAFETY: These generated C unions always contain a valid u64 view.
             let (snp_policy, vmgexit_offloads) =
                 unsafe { (snp_policy.as_uint64, vmgexit_offloads.as_uint64) };
@@ -593,6 +619,19 @@ fn snp_synthetic_features() -> hvdef::HvPartitionSyntheticProcessorFeatures {
         .with_tb_flush_hypercalls(true)
         .with_synthetic_cluster_ipi(true)
         .with_direct_synthetic_timers(true)
+}
+
+fn snp_vmgexit_offloads(disable_cpuid: bool) -> mshv_bindings::hv_sev_vmgexit_offload {
+    let mut offloads = mshv_bindings::snp::get_default_vmgexit_offload_features();
+    if disable_cpuid {
+        // SAFETY: The generated accessors correspond to fields in the active
+        // bitfield member of this C union.
+        unsafe {
+            offloads.__bindgen_anon_1.set_nae_cpuid(0);
+            offloads.__bindgen_anon_1.set_msr_cpuid(0);
+        }
+    }
+    offloads
 }
 
 impl MshvProtoPartition<'_> {
@@ -1349,12 +1388,34 @@ impl MshvPartitionInner {
             return Err(ErrorInner::TooManySnpCpuidEntries(count).into());
         }
         if self.caps.hv1 {
-            // TODO: Determine whether MSHV can service these Hyper-V leaves
-            // without copying them into the measured SNP CPUID page.
-            // Linux services all CPUID instructions from the measured SNP
-            // table once one is installed. Missing Hyper-V leaves therefore
-            // read as zero instead of falling back to MSHV, preventing Linux
-            // from recognizing the Hyper-V interface and its APIC contract.
+            // TODO: Determine the correct long-term strategy for exposing
+            // synthetic Hyper-V CPUID leaves to direct-boot SNP guests: include
+            // them in the measured CPUID page, rely on GHCB CPUID fallback, or
+            // support both based on the guest contract.
+            //
+            // The loader creates this page with the architectural x86 and AMD
+            // leaves needed by an SNP guest. Add the synthetic Hyper-V leaf
+            // requests here because their values depend on the MSHV partition
+            // configuration. The loop below queries MSHV for every requested
+            // leaf and writes the results into this page before it is imported
+            // through the SNP launch API. The PSP consequently measures these
+            // synthetic values along with the rest of the CPUID page.
+            //
+            // This is not inherently required by the SNP or GHCB protocols. A
+            // guest can treat a synthetic leaf absent from the measured table
+            // as unsupported by that table and retry it through the GHCB CPUID
+            // protocol. With CPUID VMGEXIT offloading enabled, the hypervisor
+            // can answer that request using the CPUID intercept results
+            // registered above. With offloading disabled, OpenVMM answers the
+            // forwarded MSR or page-protocol request.
+            //
+            // Some Linux versions instead treat an absent, out-of-range
+            // synthetic leaf as a successful all-zero result. In particular,
+            // returning zeros for 0x40000000 prevents Hyper-V vendor detection
+            // and therefore disables the entire Hyper-V guest interface. Keep
+            // appending the leaves for compatibility with those guests. A
+            // guest that returns -EOPNOTSUPP for missing synthetic leaves does
+            // not require this augmentation.
             add_snp_hyperv_cpuid_leaves(&mut page).map_err(ErrorInner::TooManySnpCpuidEntries)?;
         }
         let count = page.count as usize;
@@ -1974,6 +2035,24 @@ impl MshvProcessor<'_> {
                     | u64::from(features) << GHCB_INFO_BIT_WIDTH;
                 self.sev_set_reg(HvX64RegisterName::Ghcb, response)?;
             }
+            GHCB_INFO_CPUID_REQUEST => {
+                let function = (info.ghcb_msr >> 32) as u32;
+                let register = ((info.ghcb_msr >> 30) & 3) as usize;
+                let values = self
+                    .runner
+                    .vcpufd
+                    .get_cpuid_values(function, 0, 0, 0)
+                    .map_err(|err| {
+                        tracelimit::error_ratelimited!(
+                            error = &err as &dyn std::error::Error,
+                            function,
+                            "failed to service SNP MSR CPUID request"
+                        );
+                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                    })?;
+                let response = GHCB_INFO_CPUID_RESPONSE as u64 | u64::from(values[register]) << 32;
+                self.sev_set_reg(HvX64RegisterName::Ghcb, response)?;
+            }
             GHCB_INFO_SEV_INFO_REQUEST => {
                 let values = self
                     .runner
@@ -2070,6 +2149,53 @@ impl MshvProcessor<'_> {
         }
 
         match info.ghcb_page.standard.sw_exit_code {
+            SVM_EXITCODE_CPUID => {
+                let ghcb = self
+                    .runner
+                    .ghcb_page()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                if !ghcb_rax_is_valid(ghcb) || ghcb.save.valid_bitmap1 & GHCB_RCX_VALID_BIT == 0 {
+                    return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                }
+
+                let function = ghcb.save.rax as u32;
+                let index = ghcb.save.rcx as u32;
+                let xfem = if ghcb.save.valid_bitmap1 & GHCB_XCR0_VALID_BIT != 0 {
+                    ghcb.save.xcr0
+                } else {
+                    1
+                };
+                let xss = if ghcb.save.valid_bitmap0 & GHCB_XSS_VALID_BIT != 0 {
+                    ghcb.save.xss
+                } else {
+                    0
+                };
+                let values = self
+                    .runner
+                    .vcpufd
+                    .get_cpuid_values(function, index, xfem, xss)
+                    .map_err(|err| {
+                        tracelimit::error_ratelimited!(
+                            error = &err as &dyn std::error::Error,
+                            function,
+                            index,
+                            "failed to service SNP GHCB CPUID request"
+                        );
+                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                    })?;
+
+                let ghcb = self
+                    .runner
+                    .ghcb_page()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                set_ghcb_rax(ghcb, u64::from(values[0]));
+                ghcb.save.rbx = u64::from(values[1]);
+                ghcb.save.rcx = u64::from(values[2]);
+                ghcb.save.rdx = u64::from(values[3]);
+                ghcb.save.valid_bitmap1 |=
+                    GHCB_RBX_VALID_BIT | GHCB_RCX_VALID_BIT | GHCB_RDX_VALID_BIT;
+                ghcb.save.sw_exit_info1 = 0;
+            }
             exit_code if exit_code == u64::from(SVM_EXITCODE_IOIO_PROT) => {
                 let exit_info = u32::try_from(info.ghcb_page.standard.sw_exit_info1)
                     .map_err(|_| VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;

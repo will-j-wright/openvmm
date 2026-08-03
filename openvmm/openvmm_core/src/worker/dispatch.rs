@@ -1076,6 +1076,7 @@ impl InitializedVm {
                     .with_isolation
                     .map(|typ| typ.into())
                     .unwrap_or(virt::IsolationType::None),
+                snp_disable_cpuid_offload: cfg.hypervisor.snp_disable_cpuid_offload,
                 nested_virt: cfg.hypervisor.nested_virt,
             })
             .context("failed to create the prototype partition")?;
