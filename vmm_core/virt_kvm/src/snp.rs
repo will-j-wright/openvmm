@@ -641,6 +641,7 @@ mod tests {
             shared_gpa_boundary: 0,
             has_relocation: false,
             vp_contexts,
+            expected_vp_apic_ids: None,
             identity: None,
         })
     }

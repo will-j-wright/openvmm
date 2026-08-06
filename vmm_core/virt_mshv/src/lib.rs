@@ -745,9 +745,6 @@ enum ErrorInner {
     #[cfg(guest_arch = "x86_64")]
     #[error("SNP IGVM VMSA GPA {0:#x} is invalid")]
     InvalidSnpVmsaGpa(u64),
-    #[cfg(guest_arch = "x86_64")]
-    #[error("SNP IGVM VMSA overlaps configured guest RAM")]
-    SnpVmsaOverlapsRam,
     #[error("failed to stat /dev/mshv")]
     AvailableCheck(#[source] io::Error),
     #[cfg(guest_arch = "x86_64")]

@@ -134,9 +134,15 @@ fn prepare_snp_config(
     if config.has_relocation {
         return Err(ErrorInner::SnpIgvmRelocationUnsupported.into());
     }
-    if processor_topology.vp_count() != 1
-        || config.vp_contexts.len() != 1
-        || config.vp_contexts[0].vp_index != VpIndex::BSP
+    if config.vp_contexts.len() != 1 || config.vp_contexts[0].vp_index != VpIndex::BSP {
+        return Err(ErrorInner::InvalidSnpIgvmTopology.into());
+    }
+    if let Some(expected_apic_ids) = &config.expected_vp_apic_ids
+        && (expected_apic_ids.len() != processor_topology.vp_count() as usize
+            || processor_topology
+                .vps_arch()
+                .zip(expected_apic_ids)
+                .any(|(vp, &expected_apic_id)| vp.apic_id != expected_apic_id))
     {
         return Err(ErrorInner::InvalidSnpIgvmTopology.into());
     }
@@ -178,6 +184,36 @@ fn prepare_snp_config(
         sev_features: parsed_vmsa.sev_features.into_bits(),
         restricted_injection: parsed_vmsa.sev_features.restrict_injection(),
     }))
+}
+
+fn snp_vmsa_range(config: &MshvSnpConfig) -> MemoryRange {
+    MemoryRange::new(config.vmsa.gpa..config.vmsa.gpa + hvdef::HV_PAGE_SIZE)
+}
+
+fn snp_vmsa_is_in_ram(
+    config: &MshvSnpConfig,
+    mem_layout: &vm_topology::memory::MemoryLayout,
+) -> bool {
+    let vmsa_range = snp_vmsa_range(config);
+    mem_layout
+        .ram()
+        .iter()
+        .any(|range| range.range.contains(&vmsa_range))
+}
+
+fn validate_snp_igvm_topology(
+    config: &MshvSnpConfig,
+    mem_layout: &vm_topology::memory::MemoryLayout,
+    vp_count: u32,
+) -> Result<(), Error> {
+    if snp_vmsa_is_in_ram(config, mem_layout) {
+        if config.generic.expected_vp_apic_ids.is_none() && vp_count != 1 {
+            return Err(ErrorInner::InvalidSnpIgvmTopology.into());
+        }
+    } else if vp_count != 1 {
+        return Err(ErrorInner::InvalidSnpIgvmTopology.into());
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -844,16 +880,11 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             return Err(ErrorInner::IsolationConfigurationMissing.into());
         }
         if let Some(snp_config) = &self.snp_config {
-            let vmsa_range =
-                MemoryRange::new(snp_config.vmsa.gpa..snp_config.vmsa.gpa + hvdef::HV_PAGE_SIZE);
-            if config
-                .mem_layout
-                .ram()
-                .iter()
-                .any(|range| range.range.overlaps(&vmsa_range))
-            {
-                return Err(ErrorInner::SnpVmsaOverlapsRam.into());
-            }
+            validate_snp_igvm_topology(
+                snp_config,
+                config.mem_layout,
+                self.config.processor_topology.vp_count(),
+            )?;
         }
         let mut cpuid = config.cpuid.to_vec();
         if self.config.isolation == virt::IsolationType::Snp && self.config.hv_config.is_some() {
@@ -1024,6 +1055,7 @@ mod tests {
                 vp_index: VpIndex::BSP,
                 page: Arc::new(page),
             })],
+            expected_vp_apic_ids: None,
             identity: None,
         });
         (topology, config)
@@ -1087,10 +1119,48 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multi_vp_snp_igvm_config() {
-        let (topology, config) = test_snp_config(2, 0xffff_ffff_f000, false);
+    fn allows_single_vp_in_ram_snp_igvm_without_topology_contract() {
+        let layout =
+            vm_topology::memory::MemoryLayout::new(160 * 1024 * 1024, &[], &[], &[], None).unwrap();
+        let (topology, config) = test_snp_config(1, 0x201000, true);
+        let prepared = prepare_snp_config(config, &topology, 48).unwrap();
+
+        validate_snp_igvm_topology(&prepared, &layout, 1).unwrap();
+    }
+
+    #[test]
+    fn prepares_multi_vp_aci_snp_igvm_config() {
+        let (topology, mut config) = test_snp_config(2, 0x201000, true);
+        Arc::make_mut(&mut config).expected_vp_apic_ids =
+            Some(topology.vps_arch().map(|vp| vp.apic_id).collect());
+        let prepared = prepare_snp_config(config, &topology, 48).unwrap();
+        assert_eq!(prepared.vmsa.gpa, 0x201000);
+    }
+
+    #[test]
+    fn rejects_aci_snp_igvm_topology_mismatch() {
+        let (topology, mut config) = test_snp_config(2, 0x201000, true);
+        Arc::make_mut(&mut config).expected_vp_apic_ids = Some(vec![0, 7]);
         assert!(matches!(
             prepare_snp_config(config, &topology, 48),
+            Err(Error(ErrorInner::InvalidSnpIgvmTopology))
+        ));
+    }
+
+    #[test]
+    fn multi_vp_snp_igvm_requires_in_ram_bsp_vmsa() {
+        let layout =
+            vm_topology::memory::MemoryLayout::new(160 * 1024 * 1024, &[], &[], &[], None).unwrap();
+        let (topology, mut config) = test_snp_config(2, 0x201000, true);
+        Arc::make_mut(&mut config).expected_vp_apic_ids =
+            Some(topology.vps_arch().map(|vp| vp.apic_id).collect());
+        let prepared = prepare_snp_config(config, &topology, 48).unwrap();
+        validate_snp_igvm_topology(&prepared, &layout, 2).unwrap();
+
+        let (topology, config) = test_snp_config(2, 0xffff_ffff_f000, true);
+        let prepared = prepare_snp_config(config, &topology, 48).unwrap();
+        assert!(matches!(
+            validate_snp_igvm_topology(&prepared, &layout, 2),
             Err(Error(ErrorInner::InvalidSnpIgvmTopology))
         ));
     }
@@ -1114,6 +1184,7 @@ mod tests {
         let id_auth = parameters.id_auth_info;
         // Copy packed scalar fields before assertions to avoid unaligned
         // references generated by the assertion macros.
+        // SAFETY: This generated union contains the active policy scalar view.
         let id_block_policy = unsafe { id_block.policy.as_uint64 };
         let version = id_block.version;
         let guest_svn = id_block.guest_svn;
@@ -1570,6 +1641,12 @@ impl MshvPartitionInner {
         let Some(config) = &self.snp_config else {
             return Ok(());
         };
+        if snp_vmsa_is_in_ram(config, &self.mem_layout) {
+            self.gm
+                .write_at(config.vmsa.gpa, config.vmsa.page.as_ref())
+                .map_err(ErrorInner::SnpGuestMemory)?;
+            return Ok(());
+        }
         let Some(vmsa_bytes) = config.vmsa_memory.inner_buf() else {
             return Err(ErrorInner::InvalidSnpIgvmVmsa.into());
         };
@@ -1619,10 +1696,11 @@ impl MshvPartitionInner {
         pages: &[virt::InitialPageImport],
     ) -> Result<(), Error> {
         let (vmsa_gpa, sev_features) = if let Some(config) = &self.snp_config {
-            if pages
-                .iter()
-                .any(|page| page.import_type == virt::InitialPageImportType::VpContext)
-            {
+            let vmsa_range = snp_vmsa_range(config);
+            if pages.iter().any(|page| {
+                page.import_type == virt::InitialPageImportType::VpContext
+                    || page.range.overlaps(&vmsa_range)
+            }) {
                 return Err(ErrorInner::UnexpectedSnpVmsaImport.into());
             }
             (config.vmsa.gpa, config.sev_features)

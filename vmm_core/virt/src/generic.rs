@@ -291,6 +291,8 @@ pub struct SnpConfig {
     pub has_relocation: bool,
     /// Opaque virtual processor contexts in file order.
     pub vp_contexts: Vec<Arc<SnpVpContext>>,
+    /// Expected runtime APIC IDs indexed by VP index.
+    pub expected_vp_apic_ids: Option<Vec<u32>>,
     /// Optional launch identity and authentication data.
     pub identity: Option<SnpIdentity>,
 }

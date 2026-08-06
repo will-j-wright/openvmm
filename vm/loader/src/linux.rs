@@ -12,6 +12,7 @@ use crate::elf::load_static_elf;
 use crate::importer::Aarch64Register;
 use crate::importer::BootPageAcceptance;
 use crate::importer::GuestArch;
+use crate::importer::IgvmParameterType;
 use crate::importer::ImageLoad;
 use crate::importer::X86Register;
 use aarch64defs::Cpsr64;
@@ -24,6 +25,10 @@ use aarch64defs::TranslationGranule1;
 use bitfield_struct::bitfield;
 use hvdef::HV_PAGE_SIZE;
 use loader_defs::linux as defs;
+pub use loader_defs::linux::SNP_ACI_IGVM_CONFIG_MAGIC;
+pub use loader_defs::linux::SNP_ACI_IGVM_CONFIG_VERSION;
+pub use loader_defs::linux::SNP_ACI_IGVM_MAX_VPS;
+pub use loader_defs::linux::SnpAciIgvmConfig;
 use memory_range::MemoryRange;
 use page_table::IdentityMapSize;
 use page_table::x64::IdentityMapBuilder;
@@ -141,6 +146,7 @@ fn build_zero_page(
                 defs::E820_RESERVED,
             ),
             (ACI_SETUP_DATA_BASE, HV_PAGE_SIZE, defs::E820_RAM),
+            (ACI_IGVM_CONFIG_BASE, HV_PAGE_SIZE, defs::E820_RESERVED),
             (
                 u64::from(hdr.pref_address),
                 aci_layout
@@ -364,9 +370,14 @@ pub struct SnpBootConfig {
 
 /// Configuration for the ACI Hyper-V enlightened SNP direct-boot layout.
 #[derive(Debug, Clone, Copy)]
-pub struct AciHypervSnpBootConfig {
-    /// Number of virtual processors exposed to the guest.
-    pub vp_count: u32,
+pub enum AciHypervSnpBootConfig {
+    /// Write the runtime data directly while loading a kernel.
+    Direct {
+        /// Number of virtual processors exposed to the guest.
+        vp_count: u32,
+    },
+    /// Emit IGVM parameters for the runtime loader to populate.
+    Igvm,
 }
 
 const SNP_BOOT_PAGE_COUNT: u64 = 5;
@@ -381,8 +392,11 @@ const ACI_SECRETS_BASE: u64 = 0x801000;
 const ACI_PARAMETER_BASE: u64 = 0x802000;
 const ACI_SEV_INFO_BASE: u64 = 0x803000;
 const ACI_SETUP_DATA_BASE: u64 = 0x804000;
-const ACI_METADATA_END: u64 = ACI_SETUP_DATA_BASE + HV_PAGE_SIZE;
-const ACI_MEMORY_MAP_OFFSET: usize = 0x18;
+/// Measured ACI IGVM topology contract page.
+pub const ACI_IGVM_CONFIG_BASE: u64 = 0x805000;
+const ACI_METADATA_END: u64 = ACI_IGVM_CONFIG_BASE + HV_PAGE_SIZE;
+/// Byte offset of the IGVM-format memory map in the ACI parameter page.
+pub const ACI_MEMORY_MAP_OFFSET: usize = 0x18;
 const ACI_CC_SETUP_DATA_PACKED_SIZE: usize = size_of::<defs::setup_data>() + size_of::<u32>();
 
 #[repr(C)]
@@ -616,6 +630,26 @@ fn import_aci_parameter_page(
             "linux-aci-snp-parameters",
             BootPageAcceptance::ExclusiveUnmeasured,
             &page,
+        )
+        .map_err(Error::Importer)
+}
+
+fn import_aci_parameter_area(importer: &mut impl ImageLoad<X86Register>) -> Result<(), Error> {
+    let parameter_area = importer
+        .create_parameter_area(
+            ACI_PARAMETER_BASE / HV_PAGE_SIZE,
+            1,
+            "linux-aci-snp-parameters",
+        )
+        .map_err(Error::Importer)?;
+    importer
+        .import_parameter(parameter_area, 0, IgvmParameterType::VpCount)
+        .map_err(Error::Importer)?;
+    importer
+        .import_parameter(
+            parameter_area,
+            ACI_MEMORY_MAP_OFFSET as u32,
+            IgvmParameterType::MemoryMap,
         )
         .map_err(Error::Importer)
 }
@@ -936,7 +970,12 @@ fn import_config(
             (HV_PAGE_SIZE as usize - ACI_CC_SETUP_DATA_PACKED_SIZE) as u32,
         )?
         .into();
-        import_aci_parameter_page(importer, aci_config.vp_count, mem_layout)?;
+        match aci_config {
+            AciHypervSnpBootConfig::Direct { vp_count } => {
+                import_aci_parameter_page(importer, vp_count, mem_layout)?;
+            }
+            AciHypervSnpBootConfig::Igvm => import_aci_parameter_area(importer)?,
+        }
     } else if let Some(allocated_range) = additional_pages {
         boot_params.hdr.setup_data = import_snp_boot_pages(importer, allocated_range)?.into();
     }
@@ -1626,6 +1665,7 @@ mod tests {
             (0x200000, 0x100000, defs::E820_RESERVED),
             (0x800000, 0x4000, defs::E820_RESERVED),
             (0x804000, 0x1000, defs::E820_RAM),
+            (0x805000, 0x1000, defs::E820_RESERVED),
             (0x1a00000, 0x2800000, defs::E820_RAM),
         ];
         assert_eq!(result.boot_params.e820_entries as usize, expected.len());
@@ -1649,6 +1689,8 @@ mod tests {
         /// `(debug_tag, page_base, page_count)` for each imported region.
         pages: Vec<(String, u64, u64)>,
         imports: Vec<ImportRecord>,
+        parameter_areas: Vec<(u64, u32, String, Vec<u8>)>,
+        parameters: Vec<(ParameterAreaIndex, u32, IgvmParameterType)>,
         vp_context_page: Option<u64>,
     }
 
@@ -1681,30 +1723,39 @@ mod tests {
 
         fn create_parameter_area(
             &mut self,
-            _page_base: u64,
-            _page_count: u32,
-            _debug_tag: &str,
+            page_base: u64,
+            page_count: u32,
+            debug_tag: &str,
         ) -> anyhow::Result<ParameterAreaIndex> {
-            unimplemented!()
+            self.create_parameter_area_with_data(page_base, page_count, debug_tag, &[])
         }
 
         fn create_parameter_area_with_data(
             &mut self,
-            _page_base: u64,
-            _page_count: u32,
-            _debug_tag: &str,
-            _initial_data: &[u8],
+            page_base: u64,
+            page_count: u32,
+            debug_tag: &str,
+            initial_data: &[u8],
         ) -> anyhow::Result<ParameterAreaIndex> {
-            unimplemented!()
+            let index = ParameterAreaIndex(self.parameter_areas.len() as u32);
+            self.parameter_areas.push((
+                page_base,
+                page_count,
+                debug_tag.to_owned(),
+                initial_data.to_vec(),
+            ));
+            Ok(index)
         }
 
         fn import_parameter(
             &mut self,
-            _parameter_area: ParameterAreaIndex,
-            _byte_offset: u32,
-            _parameter_type: IgvmParameterType,
+            parameter_area: ParameterAreaIndex,
+            byte_offset: u32,
+            parameter_type: IgvmParameterType,
         ) -> anyhow::Result<()> {
-            unimplemented!()
+            self.parameters
+                .push((parameter_area, byte_offset, parameter_type));
+            Ok(())
         }
 
         fn import_pages(
@@ -1877,7 +1928,7 @@ mod tests {
             None,
             Some(SnpBootConfig {
                 c_bit: 51,
-                aci_hyperv: Some(AciHypervSnpBootConfig { vp_count: 4 }),
+                aci_hyperv: Some(AciHypervSnpBootConfig::Direct { vp_count: 4 }),
             }),
         )
         .unwrap();
@@ -1929,6 +1980,66 @@ mod tests {
         assert_eq!(
             &params.data[terminator_offset..terminator_offset + size_of::<AciMemoryMapEntry>()],
             &[0; size_of::<AciMemoryMapEntry>()]
+        );
+    }
+
+    #[test]
+    fn requests_aci_runtime_data_as_igvm_parameters() {
+        let acpi = AcpiTables {
+            rsdp: vec![0u8; 0x1000],
+            tables: vec![0u8; 0x1800],
+        };
+        let mut importer = RecordingImporter::default();
+        let mut load_info = test_load_info();
+        load_info.kernel = KernelInfo {
+            gpa: 0x1a00000,
+            size: 0x900000,
+            entrypoint: 0x1a00200,
+        };
+        load_info.bzimage_setup_header = Some(defs::setup_header {
+            pref_address: 0x1a00000.into(),
+            init_size: 0x2600000.into(),
+            ..FromZeros::new_zeroed()
+        });
+        load_info.aci_initial_import_ranges = vec![
+            MemoryRange::new(0..ACI_INITIAL_E820_END),
+            MemoryRange::new(0x1a00000..0x4000000),
+        ];
+
+        load_config_x86(
+            &mut importer,
+            &load_info,
+            &CString::new("").unwrap(),
+            &make_layout(8 * GB),
+            |_| acpi,
+            None,
+            Some(SnpBootConfig {
+                c_bit: 51,
+                aci_hyperv: Some(AciHypervSnpBootConfig::Igvm),
+            }),
+        )
+        .unwrap();
+
+        let [(page_base, page_count, tag, initial_data)] = importer.parameter_areas.as_slice()
+        else {
+            panic!("expected one ACI parameter area");
+        };
+        assert_eq!(*page_base, ACI_PARAMETER_BASE / HV_PAGE_SIZE);
+        assert_eq!(*page_count, 1);
+        assert_eq!(tag, "linux-aci-snp-parameters");
+        assert!(initial_data.is_empty());
+        assert_eq!(importer.parameters.len(), 2);
+        assert_eq!(importer.parameters[0].0.0, 0);
+        assert_eq!(importer.parameters[0].1, 0);
+        assert_eq!(importer.parameters[0].2, IgvmParameterType::VpCount);
+        assert_eq!(importer.parameters[1].0.0, 0);
+        assert_eq!(importer.parameters[1].1, ACI_MEMORY_MAP_OFFSET as u32);
+        assert_eq!(importer.parameters[1].2, IgvmParameterType::MemoryMap);
+        assert!(
+            importer
+                .imports
+                .iter()
+                .all(|record| record.tag != "linux-aci-snp-parameters")
         );
     }
 

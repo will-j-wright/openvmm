@@ -17,7 +17,7 @@
                 "snp_linux_direct": {
                     "linux": {
                         "use_initrd": true,
-                        "command_line": "console=ttyS0 earlyprintk=serial earlycon panic=-1"
+                        "command_line": "console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr"
                     },
                     "processor_topology": {
                         "proc_count": 1,
@@ -43,6 +43,7 @@
                         "vtl2_framebuffer_size": 0,
                         "physical_address_size": 48
                     },
+                    "boot_layout": "aci_hyperv",
                     "c_bit_position": 51
                 }
             }

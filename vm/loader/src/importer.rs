@@ -389,7 +389,7 @@ pub struct PageRegion {
     pub page_count: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgvmParameterType {
     VpCount,
     Srat,

@@ -164,7 +164,7 @@ pub fn load_linux_x86(
     let snp_boot = if cfg.isolation == Some(IsolationType::Snp) {
         Some(loader::linux::SnpBootConfig {
             c_bit: cfg.snp_c_bit.ok_or(Error::MissingSnpCBit)?,
-            aci_hyperv: aci_hyperv.then_some(loader::linux::AciHypervSnpBootConfig {
+            aci_hyperv: aci_hyperv.then_some(loader::linux::AciHypervSnpBootConfig::Direct {
                 vp_count: cfg.vp_count,
             }),
         })
