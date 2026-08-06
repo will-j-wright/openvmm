@@ -30,13 +30,24 @@ pub enum UefiConfigType {
 }
 
 /// The interrupt injection type that should be used for VMPL0 on SNP.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SnpInjectionType {
     /// Normal injection.
     Normal,
     /// Restricted injection.
     Restricted,
+}
+
+/// The guest boot ABI encoded by an SNP Linux-direct IGVM.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnpLinuxDirectBootLayout {
+    /// Shared KVM/MSHV layout with a sparse-RAM acceptance bootshim.
+    #[default]
+    Standard,
+    /// MSHV-specific ACI Hyper-V layout with guest-managed RAM acceptance.
+    AciHyperv,
 }
 
 /// Secure AVIC type.
@@ -134,6 +145,9 @@ pub enum Image {
         processor_topology: X86ProcessorTopologyPlan,
         /// Address-space layout shared with OpenVMM.
         vm_layout: VmLayoutPlan,
+        /// Guest boot ABI encoded in the IGVM.
+        #[serde(default)]
+        boot_layout: SnpLinuxDirectBootLayout,
         /// Explicit SNP encryption-bit position. When omitted, query host CPUID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         c_bit_position: Option<u8>,
@@ -167,10 +181,17 @@ impl Image {
             .chain(linux.iter().flat_map(|linux| linux.required_resources()))
             .collect(),
             Image::Linux(ref linux) => linux.required_resources(),
-            Image::SnpLinuxDirect { ref linux, .. } => linux
+            Image::SnpLinuxDirect {
+                ref linux,
+                boot_layout,
+                ..
+            } => linux
                 .required_resources()
                 .into_iter()
-                .chain([ResourceType::SnpBootshim])
+                .chain(
+                    (boot_layout == SnpLinuxDirectBootLayout::Standard)
+                        .then_some(ResourceType::SnpBootshim),
+                )
                 .collect(),
         }
     }
@@ -280,6 +301,78 @@ pub struct GuestConfig {
     /// The image to load into the guest.
     pub image: Image,
 }
+
+impl GuestConfig {
+    /// Validate image fields and isolation-dependent image requirements.
+    pub fn validate(&self) -> Result<(), GuestConfigValidationError> {
+        self.image
+            .validate()
+            .map_err(GuestConfigValidationError::Image)?;
+        if matches!(
+            &self.image,
+            Image::SnpLinuxDirect {
+                boot_layout: SnpLinuxDirectBootLayout::AciHyperv,
+                ..
+            }
+        ) {
+            if self.max_vtl != 0 {
+                return Err(GuestConfigValidationError::AciRequiresVtl0);
+            }
+            match &self.isolation_type {
+                ConfigIsolationType::Snp {
+                    shared_gpa_boundary_bits: None,
+                    injection_type: SnpInjectionType::Restricted,
+                    ..
+                } => {}
+                ConfigIsolationType::Snp {
+                    shared_gpa_boundary_bits: Some(_),
+                    ..
+                } => return Err(GuestConfigValidationError::AciSharedGpaBoundary),
+                ConfigIsolationType::Snp { .. } => {
+                    return Err(GuestConfigValidationError::AciRestrictedInjection);
+                }
+                _ => return Err(GuestConfigValidationError::AciRequiresSnp),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when guest and image configuration fields are inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestConfigValidationError {
+    /// The image configuration is invalid.
+    Image(ImageValidationError),
+    /// The ACI layout is SNP-specific.
+    AciRequiresSnp,
+    /// The ACI layout is a VTL0 guest image.
+    AciRequiresVtl0,
+    /// The ACI VMSA must encode restricted injection.
+    AciRestrictedInjection,
+    /// The ACI layout does not use a shared GPA boundary.
+    AciSharedGpaBoundary,
+}
+
+impl std::fmt::Display for GuestConfigValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image(err) => err.fmt(f),
+            Self::AciRequiresSnp => write!(f, "ACI Hyper-V boot layout requires SNP isolation"),
+            Self::AciRequiresVtl0 => write!(f, "ACI Hyper-V boot layout requires max_vtl 0"),
+            Self::AciRestrictedInjection => {
+                write!(f, "ACI Hyper-V boot layout requires restricted injection")
+            }
+            Self::AciSharedGpaBoundary => {
+                write!(
+                    f,
+                    "ACI Hyper-V boot layout does not support a shared GPA boundary"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuestConfigValidationError {}
 
 /// The architecture of the igvm file.
 #[derive(Serialize, Deserialize, Debug)]
@@ -439,6 +532,7 @@ mod test {
         processor_count: u32,
         memory_page_count: u64,
         c_bit_position: Option<u8>,
+        boot_layout: SnpLinuxDirectBootLayout,
     ) -> Image {
         Image::SnpLinuxDirect {
             linux: LinuxImage {
@@ -467,6 +561,7 @@ mod test {
                 vtl2_framebuffer_size: 0,
                 physical_address_size: 48,
             },
+            boot_layout,
             c_bit_position,
         }
     }
@@ -504,6 +599,7 @@ mod test {
                 linux,
                 processor_topology,
                 vm_layout,
+                boot_layout,
                 c_bit_position,
             } => {
                 assert!(linux.use_initrd);
@@ -513,6 +609,7 @@ mod test {
                 );
                 assert_eq!(processor_topology.proc_count, 1);
                 assert_eq!(vm_layout.node_mem_sizes, [40960 * IGVM_PAGE_SIZE_BYTES]);
+                assert_eq!(*boot_layout, SnpLinuxDirectBootLayout::Standard);
                 assert_eq!(*c_bit_position, Some(51));
                 guest.image.validate().unwrap();
             }
@@ -567,18 +664,70 @@ mod test {
             }
         ));
         let Image::SnpLinuxDirect {
-            processor_count, ..
+            processor_topology,
+            boot_layout,
+            ..
         } = &guest.image
         else {
             panic!("expected SNP Linux-direct image");
         };
-        assert_eq!(*processor_count, 1);
+        assert_eq!(processor_topology.proc_count, 1);
+        assert_eq!(*boot_layout, SnpLinuxDirectBootLayout::Standard);
         guest.image.validate().unwrap();
     }
 
     #[test]
+    fn parse_aci_snp_linux_direct_manifest() {
+        let config: Config =
+            serde_json::from_str(include_str!("../../manifests/snp-linux-direct-aci.json"))
+                .unwrap();
+        let [guest] = config.guest_configs.as_slice() else {
+            panic!("expected one guest config");
+        };
+        assert!(matches!(
+            &guest.isolation_type,
+            ConfigIsolationType::Snp {
+                injection_type: SnpInjectionType::Restricted,
+                ..
+            }
+        ));
+        let Image::SnpLinuxDirect {
+            processor_topology,
+            boot_layout,
+            ..
+        } = &guest.image
+        else {
+            panic!("expected SNP Linux-direct image");
+        };
+        assert_eq!(processor_topology.proc_count, 1);
+        assert_eq!(*boot_layout, SnpLinuxDirectBootLayout::AciHyperv);
+        guest.image.validate().unwrap();
+        guest.validate().unwrap();
+    }
+
+    #[test]
+    fn aci_snp_linux_direct_requires_restricted_injection() {
+        let mut config: Config =
+            serde_json::from_str(include_str!("../../manifests/snp-linux-direct-aci.json"))
+                .unwrap();
+        let [guest] = config.guest_configs.as_mut_slice() else {
+            panic!("expected one guest config");
+        };
+        let ConfigIsolationType::Snp { injection_type, .. } = &mut guest.isolation_type else {
+            panic!("expected SNP isolation");
+        };
+        *injection_type = SnpInjectionType::Normal;
+
+        assert_eq!(
+            guest.validate(),
+            Err(GuestConfigValidationError::AciRestrictedInjection)
+        );
+    }
+
+    #[test]
     fn snp_linux_direct_required_resources_with_initrd() {
-        let image = snp_linux_direct_image(true, 1, 40960, Some(51));
+        let image =
+            snp_linux_direct_image(true, 1, 40960, Some(51), SnpLinuxDirectBootLayout::Standard);
 
         assert_eq!(
             image.required_resources(),
@@ -592,7 +741,13 @@ mod test {
 
     #[test]
     fn snp_linux_direct_required_resources_without_initrd() {
-        let image = snp_linux_direct_image(false, 1, 40960, Some(51));
+        let image = snp_linux_direct_image(
+            false,
+            1,
+            40960,
+            Some(51),
+            SnpLinuxDirectBootLayout::Standard,
+        );
 
         assert_eq!(
             image.required_resources(),
@@ -601,8 +756,25 @@ mod test {
     }
 
     #[test]
+    fn aci_snp_linux_direct_does_not_require_bootshim() {
+        let image = snp_linux_direct_image(
+            true,
+            2,
+            40960,
+            Some(51),
+            SnpLinuxDirectBootLayout::AciHyperv,
+        );
+
+        assert_eq!(
+            image.required_resources(),
+            vec![ResourceType::LinuxKernel, ResourceType::LinuxInitrd]
+        );
+    }
+
+    #[test]
     fn snp_linux_direct_rejects_zero_memory() {
-        let image = snp_linux_direct_image(false, 1, 0, Some(51));
+        let image =
+            snp_linux_direct_image(false, 1, 0, Some(51), SnpLinuxDirectBootLayout::Standard);
 
         assert_eq!(
             image.validate(),
@@ -613,7 +785,13 @@ mod test {
     #[test]
     fn snp_linux_direct_rejects_oversized_memory() {
         let memory_page_count = u64::from(u32::MAX) / IGVM_PAGE_SIZE_BYTES + 1;
-        let image = snp_linux_direct_image(false, 1, memory_page_count, Some(51));
+        let image = snp_linux_direct_image(
+            false,
+            1,
+            memory_page_count,
+            Some(51),
+            SnpLinuxDirectBootLayout::Standard,
+        );
 
         assert_eq!(
             image.validate(),
@@ -624,7 +802,13 @@ mod test {
     #[test]
     fn snp_linux_direct_rejects_invalid_c_bit_positions() {
         for c_bit_position in [31, 52] {
-            let image = snp_linux_direct_image(false, 1, 40960, Some(c_bit_position));
+            let image = snp_linux_direct_image(
+                false,
+                1,
+                40960,
+                Some(c_bit_position),
+                SnpLinuxDirectBootLayout::Standard,
+            );
 
             assert_eq!(
                 image.validate(),
@@ -635,7 +819,13 @@ mod test {
 
     #[test]
     fn snp_linux_direct_rejects_zero_processors() {
-        let image = snp_linux_direct_image(false, 0, 40960, Some(51));
+        let image = snp_linux_direct_image(
+            false,
+            0,
+            40960,
+            Some(51),
+            SnpLinuxDirectBootLayout::Standard,
+        );
 
         assert_eq!(
             image.validate(),

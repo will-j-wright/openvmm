@@ -1137,9 +1137,6 @@ impl InitializedVm {
                     "KVM SNP guest_memfd currently only supports direct Linux or IGVM load mode"
                 );
             }
-            if cfg.hypervisor.with_hv {
-                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V enlightenments");
-            }
             if cfg.hypervisor.with_vtl2.is_some() {
                 anyhow::bail!("KVM SNP guest_memfd does not support VTL2");
             }
@@ -3114,6 +3111,7 @@ impl LoadedVmInner {
                     isolation: self.hypervisor_cfg.with_isolation,
                     snp_c_bit: self.partition.caps().snp_c_bit,
                     snp_restricted_injection,
+                    vp_count: self.processor_topology.vp_count(),
                 };
                 super::vm_loaders::linux::load_linux_x86(
                     &kernel_config,
@@ -3161,6 +3159,7 @@ impl LoadedVmInner {
                     isolation: self.hypervisor_cfg.with_isolation,
                     snp_c_bit: None,
                     snp_restricted_injection: false,
+                    vp_count: self.processor_topology.vp_count(),
                 };
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {

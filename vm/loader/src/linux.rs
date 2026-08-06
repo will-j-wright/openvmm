@@ -12,6 +12,7 @@ use crate::elf::load_static_elf;
 use crate::importer::Aarch64Register;
 use crate::importer::BootPageAcceptance;
 use crate::importer::GuestArch;
+use crate::importer::IgvmParameterType;
 use crate::importer::ImageLoad;
 use crate::importer::X86Register;
 use aarch64defs::Cpsr64;
@@ -24,6 +25,10 @@ use aarch64defs::TranslationGranule1;
 use bitfield_struct::bitfield;
 use hvdef::HV_PAGE_SIZE;
 use loader_defs::linux as defs;
+pub use loader_defs::linux::SNP_ACI_IGVM_CONFIG_MAGIC;
+pub use loader_defs::linux::SNP_ACI_IGVM_CONFIG_VERSION;
+pub use loader_defs::linux::SNP_ACI_IGVM_MAX_VPS;
+pub use loader_defs::linux::SnpAciIgvmConfig;
 use memory_range::MemoryRange;
 use page_table::IdentityMapSize;
 use page_table::x64::IdentityMapBuilder;
@@ -51,6 +56,11 @@ struct ZeroPageBuildResult {
     additional_pages: Option<MemoryRange>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AciHypervSnpLayout {
+    initial_image_end: u64,
+}
+
 /// Construct a zero page from the following parameters.
 fn build_zero_page(
     mem_layout: &MemoryLayout,
@@ -61,6 +71,7 @@ fn build_zero_page(
     initrd_base: u32,
     initrd_size: u32,
     bzimage_header: Option<&defs::setup_header>,
+    aci_layout: Option<AciHypervSnpLayout>,
 ) -> Result<ZeroPageBuildResult, Error> {
     // Loader type 0xff = unregistered bootloader, used for both ELF and
     // bzImage paths since OpenVMM does not have a registered Linux
@@ -97,6 +108,71 @@ fn build_zero_page(
     let range = ram.next().expect("at least one ram range");
     assert_eq!(range.range.start(), 0);
     assert!(range.range.end() >= 0x100000);
+
+    if let Some(aci_layout) = aci_layout {
+        let first_ram = mem_layout
+            .ram()
+            .first()
+            .ok_or(Error::AciInitialImageOutsideRam(
+                aci_layout.initial_image_end,
+            ))?
+            .range;
+        if first_ram.start() != 0 || aci_layout.initial_image_end > first_ram.end() {
+            return Err(Error::AciInitialImageOutsideRam(
+                aci_layout.initial_image_end,
+            ));
+        }
+
+        let e820_cap = p.e820_map.len();
+        // Keep the high initial-image entry last. ACI's
+        // `hv_sev_init_mem_and_cpu()` uses the final e820 entry end as the
+        // boundary between host-imported memory and RAM it must pvalidate.
+        let entries = [
+            (0, 0xa0000, defs::E820_RAM),
+            (0xa0000, 0x60000, defs::E820_RESERVED),
+            (ACI_ACPI_TABLES_BASE, ACI_ACPI_WINDOW_SIZE, defs::E820_ACPI),
+            (
+                ACI_VMSA_REGION_BASE,
+                ACI_INITIAL_E820_END - ACI_VMSA_REGION_BASE,
+                defs::E820_RESERVED,
+            ),
+            // The measured SNP metadata is loader-owned and must never enter
+            // Linux's page allocator. The setup_data node is the exception:
+            // expose it as RAM so Linux can discover it through the boot
+            // protocol and reserve it during e820__reserve_setup_data().
+            (
+                ACI_CPUID_BASE,
+                ACI_SETUP_DATA_BASE - ACI_CPUID_BASE,
+                defs::E820_RESERVED,
+            ),
+            (ACI_SETUP_DATA_BASE, HV_PAGE_SIZE, defs::E820_RAM),
+            (ACI_IGVM_CONFIG_BASE, HV_PAGE_SIZE, defs::E820_RESERVED),
+            (
+                u64::from(hdr.pref_address),
+                aci_layout
+                    .initial_image_end
+                    .checked_sub(u64::from(hdr.pref_address))
+                    .ok_or(Error::AciInitialImageOutsideRam(
+                        aci_layout.initial_image_end,
+                    ))?,
+                defs::E820_RAM,
+            ),
+        ];
+        for (index, (addr, size, typ)) in entries.into_iter().enumerate() {
+            *p.e820_map
+                .get_mut(index)
+                .ok_or(Error::TooManyMemoryRanges(e820_cap))? = defs::e820entry {
+                addr: addr.into(),
+                size: size.into(),
+                typ: typ.into(),
+            };
+        }
+        p.e820_entries = entries.len() as u8;
+        return Ok(ZeroPageBuildResult {
+            boot_params: p,
+            additional_pages: None,
+        });
+    }
 
     // x86 low-memory layout for direct boot:
     //   [0, acpi_base)          RAM       boot metadata: GDT, zero page, cmdline,
@@ -221,6 +297,20 @@ pub enum Error {
     TooManyMemoryRanges(usize),
     #[error("acpi tables are empty")]
     EmptyAcpiTables,
+    #[error("ACI Hyper-V SNP direct boot requires a bzImage kernel")]
+    AciRequiresBzImage,
+    #[error("ACI Hyper-V SNP kernel preferred address {0:#x} overlaps fixed metadata")]
+    AciKernelMetadataOverlap(u64),
+    #[error("ACI Hyper-V SNP initial image end {0:#x} is outside the first RAM range")]
+    AciInitialImageOutsideRam(u64),
+    #[error("ACI Hyper-V SNP ACPI tables require {0:#x} bytes, exceeding the 1 MiB window")]
+    AciAcpiTooLarge(u64),
+    #[error("ACI Hyper-V SNP memory map has too many entries for its parameter page")]
+    AciMemoryMapTooLarge,
+    #[error("ACI Hyper-V SNP load information is incomplete")]
+    AciMissingLoadInfo,
+    #[error("ACI Hyper-V SNP initial image range overflows")]
+    AciInitialImageOverflow,
 }
 
 /// ACPI tables to place in guest memory: a one-page RSDP plus the tables it
@@ -274,9 +364,55 @@ const KERNEL_BASE: u64 = 0x100000;
 pub struct SnpBootConfig {
     /// The page-table bit that marks private memory.
     pub c_bit: u8,
+    /// Use the ACI Hyper-V enlightened SNP direct-boot layout.
+    pub aci_hyperv: Option<AciHypervSnpBootConfig>,
+}
+
+/// Configuration for the ACI Hyper-V enlightened SNP direct-boot layout.
+#[derive(Debug, Clone, Copy)]
+pub enum AciHypervSnpBootConfig {
+    /// Write the runtime data directly while loading a kernel.
+    Direct {
+        /// Number of virtual processors exposed to the guest.
+        vp_count: u32,
+    },
+    /// Emit IGVM parameters for the runtime loader to populate.
+    Igvm,
 }
 
 const SNP_BOOT_PAGE_COUNT: u64 = 5;
+const ACI_INITIAL_E820_END: u64 = 0x300000;
+const ACI_VMSA_REGION_BASE: u64 = 0x200000;
+const ACI_VMSA_BASE: u64 = 0x201000;
+const ACI_ACPI_TABLES_BASE: u64 = 0x100000;
+const ACI_ACPI_WINDOW_SIZE: u64 = ACI_VMSA_REGION_BASE - ACI_ACPI_TABLES_BASE;
+const ACI_ACPI_NOMINAL_RSDP_BASE: u64 = ACI_ACPI_TABLES_BASE - HV_PAGE_SIZE;
+const ACI_CPUID_BASE: u64 = 0x800000;
+const ACI_SECRETS_BASE: u64 = 0x801000;
+const ACI_PARAMETER_BASE: u64 = 0x802000;
+const ACI_SEV_INFO_BASE: u64 = 0x803000;
+const ACI_SETUP_DATA_BASE: u64 = 0x804000;
+/// Measured ACI IGVM topology contract page.
+pub const ACI_IGVM_CONFIG_BASE: u64 = 0x805000;
+const ACI_METADATA_END: u64 = ACI_IGVM_CONFIG_BASE + HV_PAGE_SIZE;
+/// Byte offset of the IGVM-format memory map in the ACI parameter page.
+pub const ACI_MEMORY_MAP_OFFSET: usize = 0x18;
+const ACI_CC_SETUP_DATA_PACKED_SIZE: usize = size_of::<defs::setup_data>() + size_of::<u32>();
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct AciMemoryMapEntry {
+    starting_gpn: u64,
+    numpages: u64,
+    typ: u16,
+    flags: u16,
+    reserved: u32,
+}
+
+const _: () = {
+    assert!(size_of::<AciMemoryMapEntry>() == 0x18);
+    assert!(ACI_ACPI_TABLES_BASE + ACI_ACPI_WINDOW_SIZE == ACI_VMSA_REGION_BASE);
+};
 
 /// The GPA of the SMBIOS structure table: immediately above the ACPI tables in
 /// the low reserved area. Only the `_SM3_` anchor stays in the F-segment; the
@@ -344,6 +480,8 @@ pub struct LoadInfo {
     /// This must be placed into the zero page so the kernel's startup code
     /// can read its own configuration.
     pub bzimage_setup_header: Option<defs::setup_header>,
+    /// Ranges that must be imported for the ACI Hyper-V SNP initial image.
+    pub aci_initial_import_ranges: Vec<MemoryRange>,
 }
 
 fn import_snp_boot_pages(
@@ -351,12 +489,26 @@ fn import_snp_boot_pages(
     range: MemoryRange,
 ) -> Result<u64, Error> {
     assert_eq!(range.len(), SNP_BOOT_PAGE_COUNT * HV_PAGE_SIZE);
-    let secrets_address = range.start();
-    let cpuid_address = range.start() + HV_PAGE_SIZE;
-    let cc_blob_address = range.start() + 2 * HV_PAGE_SIZE;
-    let cc_setup_data_address = range.start() + 3 * HV_PAGE_SIZE;
-    let vmsa_address = range.start() + 4 * HV_PAGE_SIZE;
+    import_snp_boot_pages_at(
+        importer,
+        range.start(),
+        range.start() + HV_PAGE_SIZE,
+        range.start() + 2 * HV_PAGE_SIZE,
+        range.start() + 3 * HV_PAGE_SIZE,
+        range.start() + 4 * HV_PAGE_SIZE,
+        (size_of::<defs::cc_setup_data>() - size_of::<defs::setup_data>()) as u32,
+    )
+}
 
+fn import_snp_boot_pages_at(
+    importer: &mut impl ImageLoad<X86Register>,
+    secrets_address: u64,
+    cpuid_address: u64,
+    cc_blob_address: u64,
+    cc_setup_data_address: u64,
+    vmsa_address: u64,
+    cc_setup_data_len: u32,
+) -> Result<u64, Error> {
     importer
         .import_pages(
             secrets_address / HV_PAGE_SIZE,
@@ -419,7 +571,7 @@ fn import_snp_boot_pages(
         header: defs::setup_data {
             next: 0,
             ty: defs::SETUP_CC_BLOB,
-            len: (size_of::<defs::cc_setup_data>() - size_of::<defs::setup_data>()) as u32,
+            len: cc_setup_data_len,
         },
         cc_blob_address,
         _padding: [0; 3],
@@ -439,6 +591,70 @@ fn import_snp_boot_pages(
         .map_err(Error::Importer)?;
 
     Ok(cc_setup_data_address)
+}
+
+fn import_aci_parameter_page(
+    importer: &mut impl ImageLoad<X86Register>,
+    vp_count: u32,
+    mem_layout: &MemoryLayout,
+) -> Result<(), Error> {
+    let mut page = [0u8; HV_PAGE_SIZE as usize];
+    page[..size_of::<u32>()].copy_from_slice(&vp_count.to_le_bytes());
+
+    let entry_size = size_of::<AciMemoryMapEntry>();
+    let entries = mem_layout
+        .ram()
+        .iter()
+        .filter(|range| !range.range.is_empty());
+    let entry_count = entries.clone().count();
+    let required = ACI_MEMORY_MAP_OFFSET
+        .checked_add((entry_count + 1).saturating_mul(entry_size))
+        .ok_or(Error::AciMemoryMapTooLarge)?;
+    if required > page.len() {
+        return Err(Error::AciMemoryMapTooLarge);
+    }
+
+    for (index, range) in entries.enumerate() {
+        let entry = AciMemoryMapEntry {
+            starting_gpn: range.range.start() / HV_PAGE_SIZE,
+            numpages: range.range.len() / HV_PAGE_SIZE,
+            typ: 0,
+            flags: 0,
+            reserved: 0,
+        };
+        let offset = ACI_MEMORY_MAP_OFFSET + index * entry_size;
+        page[offset..offset + entry_size].copy_from_slice(entry.as_bytes());
+    }
+
+    importer
+        .import_pages(
+            ACI_PARAMETER_BASE / HV_PAGE_SIZE,
+            1,
+            "linux-aci-snp-parameters",
+            BootPageAcceptance::ExclusiveUnmeasured,
+            &page,
+        )
+        .map_err(Error::Importer)
+}
+
+fn import_aci_parameter_area(importer: &mut impl ImageLoad<X86Register>) -> Result<(), Error> {
+    let parameter_area = importer
+        .create_parameter_area(
+            ACI_PARAMETER_BASE / HV_PAGE_SIZE,
+            1,
+            "linux-aci-snp-parameters",
+        )
+        .map_err(Error::Importer)?;
+    importer
+        .import_parameter(parameter_area, 0, IgvmParameterType::VpCount)
+        .map_err(Error::Importer)?;
+    importer
+        .import_parameter(
+            parameter_area,
+            ACI_MEMORY_MAP_OFFSET as u32,
+            IgvmParameterType::MemoryMap,
+        )
+        .map_err(Error::Importer)
 }
 
 /// Check if an address is aligned to a page.
@@ -551,6 +767,7 @@ where
         initrd: initrd_info,
         dtb: None,
         bzimage_setup_header: None,
+        aci_initial_import_ranges: Vec::new(),
     })
 }
 
@@ -614,6 +831,7 @@ fn load_bzimage(
         initrd: initrd_info,
         dtb: None,
         bzimage_setup_header: Some(info.setup_header),
+        aci_initial_import_ranges: Vec::new(),
     })
 }
 
@@ -632,6 +850,26 @@ fn import_config(
     smbios: Option<&crate::smbios::BuiltSmbios>,
     snp_boot: Option<SnpBootConfig>,
 ) -> Result<(), Error> {
+    let aci_config = snp_boot.and_then(|config| config.aci_hyperv);
+    if aci_config.is_some() && load_info.bzimage_setup_header.is_none() {
+        return Err(Error::AciRequiresBzImage);
+    }
+    let aci_initial_image_end = match aci_config {
+        Some(_) => Some(
+            load_info
+                .aci_initial_import_ranges
+                .last()
+                .ok_or(Error::AciMissingLoadInfo)?
+                .end(),
+        ),
+        None => None,
+    };
+    let acpi_tables_base = if aci_config.is_some() {
+        ACI_ACPI_TABLES_BASE
+    } else {
+        ACPI_TABLES_BASE
+    };
+
     // Only import the cmdline if it actually contains something.
     // TODO: This should use the IGVM parameter instead?
     let raw_cmdline = cmdline.as_bytes_with_nul();
@@ -682,6 +920,11 @@ fn import_config(
     if acpi.tables.is_empty() {
         return Err(Error::EmptyAcpiTables);
     }
+    if aci_config.is_some()
+        && align_up_to_page_size(acpi.tables.len() as u64) > ACI_ACPI_WINDOW_SIZE
+    {
+        return Err(Error::AciAcpiTooLarge(acpi.tables.len() as u64));
+    }
     let acpi_tables_size_pages = align_up_to_page_size(acpi.tables.len() as u64) / HV_PAGE_SIZE;
     importer
         .import_pages(
@@ -694,7 +937,7 @@ fn import_config(
         .map_err(Error::Importer)?;
     importer
         .import_pages(
-            ACPI_TABLES_BASE / HV_PAGE_SIZE,
+            acpi_tables_base / HV_PAGE_SIZE,
             acpi_tables_size_pages,
             "linux-acpi-tables",
             BootPageAcceptance::Exclusive,
@@ -702,7 +945,9 @@ fn import_config(
         )
         .map_err(Error::Importer)?;
 
-    let requested_page_count = snp_boot.map_or(0, |_| SNP_BOOT_PAGE_COUNT);
+    let requested_page_count = snp_boot.map_or(0, |config| {
+        u64::from(config.aci_hyperv.is_none()) * SNP_BOOT_PAGE_COUNT
+    });
     let ZeroPageBuildResult {
         mut boot_params,
         additional_pages,
@@ -715,8 +960,26 @@ fn import_config(
         load_info.initrd.as_ref().map(|info| info.gpa).unwrap_or(0) as u32,
         load_info.initrd.as_ref().map(|info| info.size).unwrap_or(0) as u32,
         load_info.bzimage_setup_header.as_ref(),
+        aci_initial_image_end.map(|initial_image_end| AciHypervSnpLayout { initial_image_end }),
     )?;
-    if let Some(allocated_range) = additional_pages {
+    if let Some(aci_config) = aci_config {
+        boot_params.hdr.setup_data = import_snp_boot_pages_at(
+            importer,
+            ACI_SECRETS_BASE,
+            ACI_CPUID_BASE,
+            ACI_SEV_INFO_BASE,
+            ACI_SETUP_DATA_BASE,
+            ACI_VMSA_BASE,
+            (HV_PAGE_SIZE as usize - ACI_CC_SETUP_DATA_PACKED_SIZE) as u32,
+        )?
+        .into();
+        match aci_config {
+            AciHypervSnpBootConfig::Direct { vp_count } => {
+                import_aci_parameter_page(importer, vp_count, mem_layout)?;
+            }
+            AciHypervSnpBootConfig::Igvm => import_aci_parameter_area(importer)?,
+        }
+    } else if let Some(allocated_range) = additional_pages {
         boot_params.hdr.setup_data = import_snp_boot_pages(importer, allocated_range)?.into();
     }
     importer
@@ -757,7 +1020,9 @@ fn import_config(
     import_reg(X86Register::MtrrFix64k00000(0x0606060606060606))?;
     import_reg(X86Register::MtrrFix16k80000(0x0606060606060606))?;
 
-    if let Some(smbios) = smbios {
+    if aci_config.is_none()
+        && let Some(smbios) = smbios
+    {
         // The `_SM3_` entry point (anchor) goes in the F-segment for the
         // kernel's DMI scan; its 64-bit pointer targets the structure table in
         // the low reserved area just above the ACPI tables.
@@ -812,16 +1077,21 @@ pub fn load_config_x86(
     smbios: Option<crate::smbios::SmbiosTables<'_>>,
     snp_boot: Option<SnpBootConfig>,
 ) -> Result<(), Error> {
+    let aci_hyperv = snp_boot.is_some_and(|config| config.aci_hyperv.is_some());
     // The builder lays out a nominal RSDP page at LOW_METADATA_END followed by
     // the tables it points to; we keep only the tables (placed at
     // ACPI_TABLES_BASE) and re-home the RSDP to the fixed scan location.
-    let acpi_tables = build_acpi(LOW_METADATA_END);
+    let acpi_tables = build_acpi(if aci_hyperv {
+        ACI_ACPI_NOMINAL_RSDP_BASE
+    } else {
+        LOW_METADATA_END
+    });
 
     // Build the SMBIOS tables (if an identity was supplied) with the structure
     // table addressed at its low-area home: the `_SM3_` anchor's 64-bit pointer
     // references it there while the anchor itself lands in the F-segment for the
     // kernel's DMI scan. See `smbios_struct_table_base` / `import_config`.
-    let smbios = smbios.map(|tables| {
+    let smbios = (!aci_hyperv).then_some(smbios).flatten().map(|tables| {
         crate::smbios::build(&tables, smbios_struct_table_base(acpi_tables.tables.len()))
     });
 
@@ -855,7 +1125,66 @@ pub fn load_x86<F>(
 where
     F: Read + Seek,
 {
-    let load_info = load_kernel_and_initrd_x64(importer, kernel_image, KERNEL_BASE, initrd)?;
+    let aci_hyperv = snp_boot.and_then(|config| config.aci_hyperv);
+    let kernel_base = if aci_hyperv.is_some() {
+        let info = crate::bzimage::parse_bzimage(kernel_image).map_err(|err| match err {
+            crate::bzimage::Error::NotBzImage => Error::AciRequiresBzImage,
+            err => Error::BzImage(err),
+        })?;
+        kernel_image
+            .seek(SeekFrom::Start(0))
+            .map_err(|err| Error::BzImage(crate::bzimage::Error::Io(err)))?;
+        let preferred: u64 = info.setup_header.pref_address.into();
+        if preferred < ACI_METADATA_END {
+            return Err(Error::AciKernelMetadataOverlap(preferred));
+        }
+        preferred
+    } else {
+        KERNEL_BASE
+    };
+
+    let mut load_info = load_kernel_and_initrd_x64(importer, kernel_image, kernel_base, initrd)?;
+    if aci_hyperv.is_some() {
+        let header = load_info
+            .bzimage_setup_header
+            .as_ref()
+            .ok_or(Error::AciRequiresBzImage)?;
+        let startup_end = u64::from(header.pref_address)
+            .checked_add(u64::from(header.init_size))
+            .ok_or(Error::AciInitialImageOverflow)?;
+        let kernel_end = load_info
+            .kernel
+            .gpa
+            .checked_add(load_info.kernel.size)
+            .ok_or(Error::AciInitialImageOverflow)?;
+        let initrd_end = load_info
+            .initrd
+            .as_ref()
+            .map(|info| {
+                info.gpa
+                    .checked_add(info.size)
+                    .ok_or(Error::AciInitialImageOverflow)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let unaligned_end = startup_end.max(kernel_end).max(initrd_end);
+        let initial_image_end = unaligned_end
+            .checked_add(HV_PAGE_SIZE - 1)
+            .ok_or(Error::AciInitialImageOverflow)?
+            & !(HV_PAGE_SIZE - 1);
+        let first_ram = mem_layout
+            .ram()
+            .first()
+            .ok_or(Error::AciInitialImageOutsideRam(initial_image_end))?
+            .range;
+        if first_ram.start() != 0 || initial_image_end > first_ram.end() {
+            return Err(Error::AciInitialImageOutsideRam(initial_image_end));
+        }
+        load_info.aci_initial_import_ranges = vec![
+            MemoryRange::new(0..ACI_INITIAL_E820_END),
+            MemoryRange::new(kernel_base..initial_image_end),
+        ];
+    }
     load_config_x86(
         importer, &load_info, cmdline, mem_layout, build_acpi, smbios, snp_boot,
     )?;
@@ -1063,6 +1392,7 @@ where
         initrd: initrd_info,
         dtb,
         bzimage_setup_header: None,
+        aci_initial_import_ranges: Vec::new(),
     })
 }
 
@@ -1197,6 +1527,7 @@ mod tests {
             0,
             0,
             None,
+            None,
         )
         .unwrap()
         .boot_params;
@@ -1234,6 +1565,7 @@ mod tests {
             0,
             0,
             None,
+            None,
         )
         .unwrap()
         .boot_params;
@@ -1269,6 +1601,7 @@ mod tests {
             0,
             0,
             None,
+            None,
         )
         .unwrap()
         .boot_params;
@@ -1298,11 +1631,57 @@ mod tests {
             0,
             0,
             None,
+            None,
         );
         match result {
             Err(Error::LowTablesTooLarge(..)) => {}
             other => panic!("expected LowTablesTooLarge, got {:?}", other.err()),
         }
+    }
+
+    #[test]
+    fn aci_zero_page_uses_fixed_layout() {
+        let header = defs::setup_header {
+            pref_address: 0x1a00000.into(),
+            init_size: 0x2600000.into(),
+            ..FromZeros::new_zeroed()
+        };
+        let initial_image_end = 0x4200000;
+        let result = build_zero_page(
+            &make_layout(256 * MB),
+            0x2000,
+            0,
+            0,
+            &CString::new("").unwrap(),
+            0x4000000,
+            0x100000,
+            Some(&header),
+            Some(AciHypervSnpLayout { initial_image_end }),
+        )
+        .unwrap();
+
+        assert!(result.additional_pages.is_none());
+        let expected = [
+            (0, 0xa0000, defs::E820_RAM),
+            (0xa0000, 0x60000, defs::E820_RESERVED),
+            (0x100000, 0x100000, defs::E820_ACPI),
+            (0x200000, 0x100000, defs::E820_RESERVED),
+            (0x800000, 0x4000, defs::E820_RESERVED),
+            (0x804000, 0x1000, defs::E820_RAM),
+            (0x805000, 0x1000, defs::E820_RESERVED),
+            (0x1a00000, 0x2800000, defs::E820_RAM),
+        ];
+        assert_eq!(result.boot_params.e820_entries as usize, expected.len());
+        for (entry, (addr, size, typ)) in result.boot_params.e820_map.iter().zip(expected) {
+            assert_eq!(u64::from(entry.addr), addr);
+            assert_eq!(u64::from(entry.size), size);
+            assert_eq!(u32::from(entry.typ), typ);
+        }
+        let last = &result.boot_params.e820_map[expected.len() - 1];
+        assert_eq!(
+            u64::from(last.addr) + u64::from(last.size),
+            initial_image_end
+        );
     }
 
     /// An importer that records `import_pages` placements and accepts registers,
@@ -1313,6 +1692,8 @@ mod tests {
         /// `(debug_tag, page_base, page_count)` for each imported region.
         pages: Vec<(String, u64, u64)>,
         imports: Vec<ImportRecord>,
+        parameter_areas: Vec<(u64, u32, String, Vec<u8>)>,
+        parameters: Vec<(ParameterAreaIndex, u32, IgvmParameterType)>,
         vp_context_page: Option<u64>,
     }
 
@@ -1345,30 +1726,39 @@ mod tests {
 
         fn create_parameter_area(
             &mut self,
-            _page_base: u64,
-            _page_count: u32,
-            _debug_tag: &str,
+            page_base: u64,
+            page_count: u32,
+            debug_tag: &str,
         ) -> anyhow::Result<ParameterAreaIndex> {
-            unimplemented!()
+            self.create_parameter_area_with_data(page_base, page_count, debug_tag, &[])
         }
 
         fn create_parameter_area_with_data(
             &mut self,
-            _page_base: u64,
-            _page_count: u32,
-            _debug_tag: &str,
-            _initial_data: &[u8],
+            page_base: u64,
+            page_count: u32,
+            debug_tag: &str,
+            initial_data: &[u8],
         ) -> anyhow::Result<ParameterAreaIndex> {
-            unimplemented!()
+            let index = ParameterAreaIndex(self.parameter_areas.len() as u32);
+            self.parameter_areas.push((
+                page_base,
+                page_count,
+                debug_tag.to_owned(),
+                initial_data.to_vec(),
+            ));
+            Ok(index)
         }
 
         fn import_parameter(
             &mut self,
-            _parameter_area: ParameterAreaIndex,
-            _byte_offset: u32,
-            _parameter_type: IgvmParameterType,
+            parameter_area: ParameterAreaIndex,
+            byte_offset: u32,
+            parameter_type: IgvmParameterType,
         ) -> anyhow::Result<()> {
-            unimplemented!()
+            self.parameters
+                .push((parameter_area, byte_offset, parameter_type));
+            Ok(())
         }
 
         fn import_pages(
@@ -1448,6 +1838,7 @@ mod tests {
             initrd: None,
             dtb: None,
             bzimage_setup_header: None,
+            aci_initial_import_ranges: Vec::new(),
         }
     }
 
@@ -1509,6 +1900,153 @@ mod tests {
     }
 
     #[test]
+    fn imports_aci_snp_fixed_pages_and_parameters() {
+        let acpi = AcpiTables {
+            rsdp: vec![0u8; 0x1000],
+            tables: vec![0u8; 0x1800],
+        };
+        let mut importer = RecordingImporter::default();
+        let mut load_info = test_load_info();
+        load_info.kernel = KernelInfo {
+            gpa: 0x1a00000,
+            size: 0x900000,
+            entrypoint: 0x1a00200,
+        };
+        load_info.bzimage_setup_header = Some(defs::setup_header {
+            pref_address: 0x1a00000.into(),
+            init_size: 0x2600000.into(),
+            ..FromZeros::new_zeroed()
+        });
+        load_info.aci_initial_import_ranges = vec![
+            MemoryRange::new(0..ACI_INITIAL_E820_END),
+            MemoryRange::new(0x1a00000..0x4000000),
+        ];
+
+        load_config_x86(
+            &mut importer,
+            &load_info,
+            &CString::new("").unwrap(),
+            &make_layout(8 * GB),
+            |_| acpi,
+            None,
+            Some(SnpBootConfig {
+                c_bit: 51,
+                aci_hyperv: Some(AciHypervSnpBootConfig::Direct { vp_count: 4 }),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            importer.page_base("linux-acpi-tables"),
+            Some(ACI_ACPI_TABLES_BASE / HV_PAGE_SIZE)
+        );
+        assert_eq!(importer.vp_context_page, Some(ACI_VMSA_BASE / HV_PAGE_SIZE));
+        assert_eq!(
+            importer.page_base("linux-snp-cpuid"),
+            Some(ACI_CPUID_BASE / HV_PAGE_SIZE)
+        );
+        let setup_data = importer
+            .imports
+            .iter()
+            .find(|record| record.tag == "linux-snp-cc-setup-data")
+            .unwrap();
+        let setup_data = defs::cc_setup_data::read_from_bytes(&setup_data.data).unwrap();
+        assert_eq!(
+            setup_data.header.len,
+            (HV_PAGE_SIZE as usize - ACI_CC_SETUP_DATA_PACKED_SIZE) as u32
+        );
+        let params = importer
+            .imports
+            .iter()
+            .find(|record| record.tag == "linux-aci-snp-parameters")
+            .unwrap();
+        assert_eq!(params.acceptance, BootPageAcceptance::ExclusiveUnmeasured);
+        assert_eq!(&params.data[..4], &4u32.to_le_bytes());
+
+        let first = AciMemoryMapEntry::read_from_bytes(
+            &params.data
+                [ACI_MEMORY_MAP_OFFSET..ACI_MEMORY_MAP_OFFSET + size_of::<AciMemoryMapEntry>()],
+        )
+        .unwrap();
+        assert_eq!(first.starting_gpn, 0);
+        assert_ne!(first.numpages, 0);
+
+        let second_offset = ACI_MEMORY_MAP_OFFSET + size_of::<AciMemoryMapEntry>();
+        let second = AciMemoryMapEntry::read_from_bytes(
+            &params.data[second_offset..second_offset + size_of::<AciMemoryMapEntry>()],
+        )
+        .unwrap();
+        assert_eq!(second.starting_gpn, 4 * GB / HV_PAGE_SIZE);
+        assert_ne!(second.numpages, 0);
+
+        let terminator_offset = second_offset + size_of::<AciMemoryMapEntry>();
+        assert_eq!(
+            &params.data[terminator_offset..terminator_offset + size_of::<AciMemoryMapEntry>()],
+            &[0; size_of::<AciMemoryMapEntry>()]
+        );
+    }
+
+    #[test]
+    fn requests_aci_runtime_data_as_igvm_parameters() {
+        let acpi = AcpiTables {
+            rsdp: vec![0u8; 0x1000],
+            tables: vec![0u8; 0x1800],
+        };
+        let mut importer = RecordingImporter::default();
+        let mut load_info = test_load_info();
+        load_info.kernel = KernelInfo {
+            gpa: 0x1a00000,
+            size: 0x900000,
+            entrypoint: 0x1a00200,
+        };
+        load_info.bzimage_setup_header = Some(defs::setup_header {
+            pref_address: 0x1a00000.into(),
+            init_size: 0x2600000.into(),
+            ..FromZeros::new_zeroed()
+        });
+        load_info.aci_initial_import_ranges = vec![
+            MemoryRange::new(0..ACI_INITIAL_E820_END),
+            MemoryRange::new(0x1a00000..0x4000000),
+        ];
+
+        load_config_x86(
+            &mut importer,
+            &load_info,
+            &CString::new("").unwrap(),
+            &make_layout(8 * GB),
+            |_| acpi,
+            None,
+            Some(SnpBootConfig {
+                c_bit: 51,
+                aci_hyperv: Some(AciHypervSnpBootConfig::Igvm),
+            }),
+        )
+        .unwrap();
+
+        let [(page_base, page_count, tag, initial_data)] = importer.parameter_areas.as_slice()
+        else {
+            panic!("expected one ACI parameter area");
+        };
+        assert_eq!(*page_base, ACI_PARAMETER_BASE / HV_PAGE_SIZE);
+        assert_eq!(*page_count, 1);
+        assert_eq!(tag, "linux-aci-snp-parameters");
+        assert!(initial_data.is_empty());
+        assert_eq!(importer.parameters.len(), 2);
+        assert_eq!(importer.parameters[0].0.0, 0);
+        assert_eq!(importer.parameters[0].1, 0);
+        assert_eq!(importer.parameters[0].2, IgvmParameterType::VpCount);
+        assert_eq!(importer.parameters[1].0.0, 0);
+        assert_eq!(importer.parameters[1].1, ACI_MEMORY_MAP_OFFSET as u32);
+        assert_eq!(importer.parameters[1].2, IgvmParameterType::MemoryMap);
+        assert!(
+            importer
+                .imports
+                .iter()
+                .all(|record| record.tag != "linux-aci-snp-parameters")
+        );
+    }
+
+    #[test]
     fn import_config_rejects_oversized_command_line() {
         let acpi = AcpiTables {
             rsdp: vec![0u8; 0x1000],
@@ -1546,7 +2084,10 @@ mod tests {
             &make_layout(256 * MB),
             &acpi,
             None,
-            Some(SnpBootConfig { c_bit: C_BIT }),
+            Some(SnpBootConfig {
+                c_bit: C_BIT,
+                aci_hyperv: None,
+            }),
         )
         .unwrap();
 
@@ -1601,6 +2142,7 @@ mod tests {
             &CString::new("").unwrap(),
             0,
             0,
+            None,
             None,
         )
         .unwrap();
@@ -1704,6 +2246,7 @@ mod tests {
                 &CString::new("").unwrap(),
                 0,
                 0,
+                None,
                 None,
             ),
             Err(Error::LowTablesTooLarge(..))

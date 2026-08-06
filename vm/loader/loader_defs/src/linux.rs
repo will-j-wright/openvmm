@@ -330,3 +330,21 @@ const_assert_eq!(
     align_of::<SnpBootShimParams>(),
     hvdef::HV_PAGE_SIZE as usize
 );
+
+pub const SNP_ACI_IGVM_CONFIG_MAGIC: u64 = u64::from_le_bytes(*b"SNPACI\0\0");
+pub const SNP_ACI_IGVM_CONFIG_VERSION: u32 = 1;
+pub const SNP_ACI_IGVM_MAX_VPS: usize = 255;
+const SNP_ACI_IGVM_CONFIG_HEADER_SIZE: usize = 16 + SNP_ACI_IGVM_MAX_VPS * size_of::<u32>();
+
+#[repr(C, align(4096))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct SnpAciIgvmConfig {
+    pub magic: u64,
+    pub version: u32,
+    pub vp_count: u32,
+    pub apic_ids: [u32; SNP_ACI_IGVM_MAX_VPS],
+    pub reserved: [u8; hvdef::HV_PAGE_SIZE as usize - SNP_ACI_IGVM_CONFIG_HEADER_SIZE],
+}
+
+const_assert_eq!(size_of::<SnpAciIgvmConfig>(), hvdef::HV_PAGE_SIZE as usize);
+const_assert_eq!(align_of::<SnpAciIgvmConfig>(), hvdef::HV_PAGE_SIZE as usize);

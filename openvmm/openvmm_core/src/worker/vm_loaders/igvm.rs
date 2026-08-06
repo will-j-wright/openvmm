@@ -25,6 +25,10 @@ use loader::importer::ImageLoad;
 use loader::importer::StartupMemoryType;
 use loader::importer::TableRegister;
 use loader::importer::X86Register;
+use loader::linux::SNP_ACI_IGVM_CONFIG_MAGIC;
+use loader::linux::SNP_ACI_IGVM_CONFIG_VERSION;
+use loader::linux::SNP_ACI_IGVM_MAX_VPS;
+use loader::linux::SnpAciIgvmConfig;
 use memory_range::MemoryRange;
 use memory_range::subtract_ranges;
 use openvmm_defs::config::SerialInformation;
@@ -33,6 +37,7 @@ use openvmm_vm_layout::ChipsetMmioRanges;
 use openvmm_vm_layout::Vtl2MemoryLayoutRequest;
 use range_map_vec::RangeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Read;
 use std::io::Seek;
 use std::sync::Arc;
@@ -45,6 +50,7 @@ use vm_topology::processor::ArchTopology;
 use vm_topology::processor::ProcessorTopology;
 use vm_topology::processor::aarch64::Aarch64Topology;
 use vm_topology::processor::x86::X86Topology;
+use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 #[derive(Debug, Error)]
@@ -95,6 +101,8 @@ pub enum Error {
     NoSnpSupport,
     #[error("SNP IGVM file does not contain a guest policy")]
     MissingSnpGuestPolicy,
+    #[error("SNP IGVM file contains an invalid ACI topology contract")]
+    InvalidSnpAciTopology,
     #[error("vp context for lower VTL not supported")]
     LowerVtlContext,
     #[error("missing required memory range {0}")]
@@ -215,9 +223,43 @@ pub fn isolation_config(
     });
 
     let mut vp_contexts = Vec::new();
+    let mut expected_vp_apic_ids = None;
     let mut identity = None;
     for directive in igvm_file.directives() {
         match directive {
+            IgvmDirectiveHeader::PageData {
+                gpa,
+                flags,
+                data_type,
+                data,
+                ..
+            } if *gpa == loader::linux::ACI_IGVM_CONFIG_BASE
+                && *data_type == IgvmPageDataType::NORMAL
+                && !flags.shared()
+                && !flags.unmeasured()
+                && data.starts_with(&SNP_ACI_IGVM_CONFIG_MAGIC.to_ne_bytes()) =>
+            {
+                if expected_vp_apic_ids.is_some() {
+                    return Err(Error::InvalidSnpAciTopology);
+                }
+                let config = SnpAciIgvmConfig::read_from_bytes(data)
+                    .map_err(|_| Error::InvalidSnpAciTopology)?;
+                let vp_count =
+                    usize::try_from(config.vp_count).map_err(|_| Error::InvalidSnpAciTopology)?;
+                if config.magic != SNP_ACI_IGVM_CONFIG_MAGIC
+                    || config.version != SNP_ACI_IGVM_CONFIG_VERSION
+                    || vp_count == 0
+                    || vp_count > SNP_ACI_IGVM_MAX_VPS
+                    || config.reserved.iter().any(|&value| value != 0)
+                {
+                    return Err(Error::InvalidSnpAciTopology);
+                }
+                let apic_ids = config.apic_ids[..vp_count].to_vec();
+                if apic_ids.iter().copied().collect::<HashSet<_>>().len() != vp_count {
+                    return Err(Error::InvalidSnpAciTopology);
+                }
+                expected_vp_apic_ids = Some(apic_ids);
+            }
             IgvmDirectiveHeader::SnpVpContext {
                 gpa,
                 vp_index,
@@ -287,6 +329,7 @@ pub fn isolation_config(
             shared_gpa_boundary: platform.shared_gpa_boundary,
             has_relocation,
             vp_contexts,
+            expected_vp_apic_ids,
             identity,
         },
     ))))

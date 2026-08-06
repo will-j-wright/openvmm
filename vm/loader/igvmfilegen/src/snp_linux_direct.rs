@@ -15,6 +15,8 @@ use igvm::IgvmSerializer;
 use igvm::snp_defs::SevFeatures;
 use igvm::snp_defs::SevSelector;
 use igvm::snp_defs::SevVmsa;
+use igvm_defs::IGVM_VHS_PARAMETER;
+use igvm_defs::IGVM_VHS_PARAMETER_INSERT;
 use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
 use igvm_defs::IgvmPageDataFlags;
 use igvm_defs::IgvmPageDataType;
@@ -24,6 +26,7 @@ use igvmfilegen_config::LinuxImage;
 use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SnpInjectionType;
+use igvmfilegen_config::SnpLinuxDirectBootLayout;
 use loader::importer::BootPageAcceptance;
 use loader::importer::IgvmParameterType;
 use loader::importer::ImageLoad;
@@ -36,11 +39,16 @@ use loader::importer::TableRegister;
 use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
+use loader_defs::linux::SNP_ACI_IGVM_CONFIG_MAGIC;
+use loader_defs::linux::SNP_ACI_IGVM_CONFIG_VERSION;
+use loader_defs::linux::SNP_ACI_IGVM_MAX_VPS;
 use loader_defs::linux::SNP_BOOT_SHIM_MAX_RANGES;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
+use loader_defs::linux::SnpAciIgvmConfig;
 use loader_defs::linux::SnpBootShimParams;
 use loader_defs::linux::SnpBootShimRange;
+use memory_range::MemoryRange;
 use openvmm_vm_layout::VmLayoutPlan;
 use openvmm_vm_layout::X86ProcessorTopologyPlan;
 use std::collections::BTreeMap;
@@ -74,6 +82,7 @@ pub struct BuildParams<'a> {
     pub linux: &'a LinuxImage,
     pub processor_topology: &'a X86ProcessorTopologyPlan,
     pub vm_layout: &'a VmLayoutPlan,
+    pub boot_layout: SnpLinuxDirectBootLayout,
     pub c_bit_position: Option<u8>,
     pub policy: SnpPolicy,
     pub injection_type: &'a SnpInjectionType,
@@ -121,34 +130,74 @@ struct ImportedPage {
 }
 
 #[derive(Debug)]
+struct IgvmParameterArea {
+    page_base: u64,
+    page_count: u32,
+    initial_data: Vec<u8>,
+    parameters: Vec<(u32, IgvmParameterType)>,
+    tag: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VmsaDirectiveConfig {
+    gpa: u64,
+    context_count: u32,
+}
+
+#[derive(Debug)]
+enum ExpectedBootLayout {
+    Standard {
+        shim_entry: u64,
+        params_gpa: u64,
+        params: Box<SnpBootShimParams>,
+    },
+    AciHyperv {
+        linux_entry: u64,
+        linux_zero_page: u64,
+        vmsa_gpa: u64,
+        parameter_gpa: u64,
+        expected_apic_ids: Vec<u32>,
+    },
+}
+
+#[derive(Debug)]
 struct TestIgvmImporter {
     pages: BTreeMap<u64, ImportedPage>,
+    parameter_areas: Vec<IgvmParameterArea>,
+    reserved_pages: BTreeSet<u64>,
     registers: Vec<X86Register>,
     ram_page_count: u64,
     c_bit_mask: u64,
+    use_loader_vmsa_gpa: bool,
+    vp_context_page: Option<u64>,
 }
 
 impl TestIgvmImporter {
-    fn new(ram_page_count: u64, c_bit_position: u8) -> Self {
+    fn new(ram_page_count: u64, c_bit_position: u8, boot_layout: SnpLinuxDirectBootLayout) -> Self {
         Self {
             pages: BTreeMap::new(),
+            parameter_areas: Vec::new(),
+            reserved_pages: BTreeSet::new(),
             registers: Vec::new(),
             ram_page_count,
             c_bit_mask: 1u64 << c_bit_position,
+            use_loader_vmsa_gpa: boot_layout == SnpLinuxDirectBootLayout::AciHyperv,
+            vp_context_page: None,
         }
     }
 
     fn finish(
         self,
-        processor_count: u32,
         injection_type: &SnpInjectionType,
         bootshim_ranges: &[SnpBootShimRange],
+        vmsa_config: VmsaDirectiveConfig,
     ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, SevVmsa, String)> {
         let vmsa = build_vmsa(&self.registers, self.c_bit_mask, injection_type)?;
         let (mut directives, map) = build_sparse_ram_directives(
             &self.pages,
+            &self.parameter_areas,
             &vmsa,
-            processor_count,
+            vmsa_config,
             self.ram_page_count,
             bootshim_ranges,
         )?;
@@ -171,7 +220,14 @@ impl TestIgvmImporter {
     }
 
     fn next_available_gpa(&self) -> anyhow::Result<u64> {
-        self.pages.last_key_value().map_or(Ok(0), |(&page, _)| {
+        let last_page = self
+            .pages
+            .last_key_value()
+            .map(|(&page, _)| page)
+            .into_iter()
+            .chain(self.reserved_pages.last().copied())
+            .max();
+        last_page.map_or(Ok(0), |page| {
             page.checked_add(1)
                 .and_then(|page| page.checked_mul(PAGE_SIZE))
                 .context("next imported address overflow")
@@ -237,6 +293,39 @@ impl TestIgvmImporter {
         }
         Ok(ranges)
     }
+
+    fn complete_initial_ranges(&mut self, ranges: &[MemoryRange]) -> anyhow::Result<()> {
+        for range in ranges {
+            ensure!(
+                range.start().is_multiple_of(PAGE_SIZE) && range.end().is_multiple_of(PAGE_SIZE),
+                "ACI initial import range is not page aligned"
+            );
+            for page in range.start() / PAGE_SIZE..range.end() / PAGE_SIZE {
+                if self.pages.contains_key(&page) || self.reserved_pages.contains(&page) {
+                    continue;
+                }
+                self.pages.insert(
+                    page,
+                    ImportedPage {
+                        acceptance: BootPageAcceptance::Exclusive,
+                        data: Vec::new(),
+                        tag: "aci-initial-image",
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn vmsa_gpa(&self) -> anyhow::Result<u64> {
+        if self.use_loader_vmsa_gpa {
+            self.vp_context_page
+                .and_then(|page| page.checked_mul(PAGE_SIZE))
+                .context("ACI loader did not provide a valid VP context page")
+        } else {
+            Ok(KVM_VMSA_GPA)
+        }
+    }
 }
 
 impl ImageLoad<X86Register> for TestIgvmImporter {
@@ -250,30 +339,67 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
 
     fn create_parameter_area(
         &mut self,
-        _page_base: u64,
-        _page_count: u32,
-        _debug_tag: &str,
+        page_base: u64,
+        page_count: u32,
+        debug_tag: &str,
     ) -> anyhow::Result<ParameterAreaIndex> {
-        bail!("IGVM parameter areas are not supported by this fixed image")
+        self.create_parameter_area_with_data(page_base, page_count, debug_tag, &[])
     }
 
     fn create_parameter_area_with_data(
         &mut self,
-        _page_base: u64,
-        _page_count: u32,
-        _debug_tag: &str,
-        _initial_data: &[u8],
+        page_base: u64,
+        page_count: u32,
+        debug_tag: &str,
+        initial_data: &[u8],
     ) -> anyhow::Result<ParameterAreaIndex> {
-        bail!("IGVM parameter areas are not supported by this fixed image")
+        ensure!(page_count != 0, "cannot create an empty parameter area");
+        let page_end = page_base
+            .checked_add(u64::from(page_count))
+            .context("parameter area range overflow")?;
+        ensure!(
+            page_end <= self.ram_page_count,
+            "{debug_tag} lies outside the configured RAM layout"
+        );
+        let byte_count = u64::from(page_count) * PAGE_SIZE;
+        ensure!(
+            initial_data.is_empty() || initial_data.len() as u64 == byte_count,
+            "{debug_tag} initial data must be empty or fill the parameter area"
+        );
+        for page in page_base..page_end {
+            ensure!(
+                !self.pages.contains_key(&page) && self.reserved_pages.insert(page),
+                "{debug_tag} overlaps an existing import at GPA {:#x}",
+                page * PAGE_SIZE
+            );
+        }
+        let index = self
+            .parameter_areas
+            .len()
+            .try_into()
+            .context("too many IGVM parameter areas")?;
+        self.parameter_areas.push(IgvmParameterArea {
+            page_base,
+            page_count,
+            initial_data: initial_data.to_vec(),
+            parameters: Vec::new(),
+            tag: debug_tag.to_owned(),
+        });
+        Ok(ParameterAreaIndex(index))
     }
 
     fn import_parameter(
         &mut self,
-        _parameter_area: ParameterAreaIndex,
-        _byte_offset: u32,
-        _parameter_type: IgvmParameterType,
+        parameter_area: ParameterAreaIndex,
+        byte_offset: u32,
+        parameter_type: IgvmParameterType,
     ) -> anyhow::Result<()> {
-        bail!("IGVM parameters are not supported by this fixed image")
+        let area = self
+            .parameter_areas
+            .get_mut(parameter_area.0 as usize)
+            .context("invalid IGVM parameter area index")?;
+        area.parameters.push((byte_offset, parameter_type));
+        Ok(())
     }
 
     fn import_pages(
@@ -311,6 +437,11 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
                 Vec::new()
             };
             let page_number = page_base + page_offset;
+            ensure!(
+                !self.reserved_pages.contains(&page_number),
+                "{debug_tag} overlaps a reserved page at GPA {:#x}",
+                page_number * PAGE_SIZE
+            );
             let previous = self.pages.insert(
                 page_number,
                 ImportedPage {
@@ -361,9 +492,16 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
             page_base < self.ram_page_count,
             "Linux-selected VP context page lies outside RAM"
         );
-        // The runtime loader needs a guest-RAM VMSA page, but this fixed IGVM
-        // emits its VMSAs separately as SnpVpContext directives. The selected
-        // page remains ordinary RAM and is accepted with the unimported range.
+        if self.use_loader_vmsa_gpa {
+            ensure!(
+                self.vp_context_page.replace(page_base).is_none(),
+                "Linux-selected VP context page was already configured"
+            );
+            ensure!(
+                !self.pages.contains_key(&page_base) && self.reserved_pages.insert(page_base),
+                "Linux-selected VP context page overlaps an existing import"
+            );
+        }
         Ok(())
     }
 
@@ -399,6 +537,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         linux,
         processor_topology,
         vm_layout,
+        boot_layout,
         c_bit_position,
         policy,
         injection_type,
@@ -472,7 +611,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         None
     };
 
-    let mut importer = TestIgvmImporter::new(memory_page_count, c_bit_position);
+    let mut importer = TestIgvmImporter::new(memory_page_count, c_bit_position, boot_layout);
     let load_info = loader::linux::load_x86(
         &mut importer,
         &mut kernel,
@@ -493,6 +632,8 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         None,
         Some(loader::linux::SnpBootConfig {
             c_bit: c_bit_position,
+            aci_hyperv: (boot_layout == SnpLinuxDirectBootLayout::AciHyperv)
+                .then_some(loader::linux::AciHypervSnpBootConfig::Igvm),
         }),
     )
     .context("loading direct-Linux image")?;
@@ -507,57 +648,123 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
             _ => None,
         })?;
 
-    let kernel_runtime_end = load_info
-        .kernel
-        .gpa
-        .checked_add(
-            load_info
-                .bzimage_setup_header
-                .as_ref()
-                .map_or(load_info.kernel.size, |header| u64::from(header.init_size)),
-        )
-        .context("Linux runtime image end overflow")?;
-    let shim_base = align_up_to_page(importer.next_available_gpa()?.max(kernel_runtime_end))?;
-    let bootshim_path = resources
-        .get(ResourceType::SnpBootshim)
-        .context("SNP bootshim resource is missing")?;
-    let mut bootshim = fs_err::File::open(bootshim_path)
-        .with_context(|| format!("opening SNP bootshim {}", bootshim_path.display()))?;
-    let shim_load_info = loader::elf::load_static_elf(
-        &mut importer,
-        &mut bootshim,
-        0,
-        shim_base,
-        false,
-        BootPageAcceptance::Exclusive,
-        "snp-bootshim",
-    )
-    .context("loading SNP bootshim")?;
-    let params_gpa = align_up_to_page(shim_load_info.next_available_address)?;
-    let params_page = params_gpa / PAGE_SIZE;
-    ensure!(
-        params_page < memory_page_count,
-        "SNP bootshim parameter page lies outside configured RAM"
-    );
+    let (bootshim_ranges, vmsa_config, expected_boot_layout) = match boot_layout {
+        SnpLinuxDirectBootLayout::Standard => {
+            let kernel_runtime_end = load_info
+                .kernel
+                .gpa
+                .checked_add(
+                    load_info
+                        .bzimage_setup_header
+                        .as_ref()
+                        .map_or(load_info.kernel.size, |header| u64::from(header.init_size)),
+                )
+                .context("Linux runtime image end overflow")?;
+            let shim_base =
+                align_up_to_page(importer.next_available_gpa()?.max(kernel_runtime_end))?;
+            let bootshim_path = resources
+                .get(ResourceType::SnpBootshim)
+                .context("SNP bootshim resource is missing")?;
+            let mut bootshim = fs_err::File::open(bootshim_path)
+                .with_context(|| format!("opening SNP bootshim {}", bootshim_path.display()))?;
+            let shim_load_info = loader::elf::load_static_elf(
+                &mut importer,
+                &mut bootshim,
+                0,
+                shim_base,
+                false,
+                BootPageAcceptance::Exclusive,
+                "snp-bootshim",
+            )
+            .context("loading SNP bootshim")?;
+            let params_gpa = align_up_to_page(shim_load_info.next_available_address)?;
+            let params_page = params_gpa / PAGE_SIZE;
+            ensure!(
+                params_page < memory_page_count,
+                "SNP bootshim parameter page lies outside configured RAM"
+            );
 
-    let bootshim_ranges = importer.unimported_ranges([params_page])?;
-    let bootshim_params =
-        build_bootshim_params(linux_entry, linux_zero_page, memory_size, &bootshim_ranges)?;
-    importer
-        .import_pages(
-            params_page,
-            1,
-            "snp-bootshim-params",
-            BootPageAcceptance::Exclusive,
-            bootshim_params.as_bytes(),
-        )
-        .context("importing SNP bootshim parameters")?;
-    importer.replace_register(X86Register::Rip(shim_load_info.entrypoint))?;
-    importer.replace_register(X86Register::Rsi(params_gpa))?;
+            let bootshim_ranges = importer.unimported_ranges([params_page])?;
+            let bootshim_params =
+                build_bootshim_params(linux_entry, linux_zero_page, memory_size, &bootshim_ranges)?;
+            importer
+                .import_pages(
+                    params_page,
+                    1,
+                    "snp-bootshim-params",
+                    BootPageAcceptance::Exclusive,
+                    bootshim_params.as_bytes(),
+                )
+                .context("importing SNP bootshim parameters")?;
+            importer.replace_register(X86Register::Rip(shim_load_info.entrypoint))?;
+            importer.replace_register(X86Register::Rsi(params_gpa))?;
 
+            (
+                bootshim_ranges,
+                VmsaDirectiveConfig {
+                    gpa: KVM_VMSA_GPA,
+                    context_count: processor_count,
+                },
+                ExpectedBootLayout::Standard {
+                    shim_entry: shim_load_info.entrypoint,
+                    params_gpa,
+                    params: Box::new(bootshim_params),
+                },
+            )
+        }
+        SnpLinuxDirectBootLayout::AciHyperv => {
+            ensure!(
+                !load_info.aci_initial_import_ranges.is_empty(),
+                "ACI loader did not report initial import ranges"
+            );
+            ensure!(
+                processor_count as usize <= SNP_ACI_IGVM_MAX_VPS,
+                "ACI IGVM supports at most {SNP_ACI_IGVM_MAX_VPS} VPs"
+            );
+            let mut topology_config = SnpAciIgvmConfig::new_zeroed();
+            topology_config.magic = SNP_ACI_IGVM_CONFIG_MAGIC;
+            topology_config.version = SNP_ACI_IGVM_CONFIG_VERSION;
+            topology_config.vp_count = processor_count;
+            let expected_apic_ids = processor_topology
+                .vps_arch()
+                .map(|vp| vp.apic_id)
+                .collect::<Vec<_>>();
+            for vp in processor_topology.vps_arch() {
+                topology_config.apic_ids[vp.base.vp_index.index() as usize] = vp.apic_id;
+            }
+            importer
+                .import_pages(
+                    loader::linux::ACI_IGVM_CONFIG_BASE / PAGE_SIZE,
+                    1,
+                    "linux-aci-igvm-config",
+                    BootPageAcceptance::Exclusive,
+                    topology_config.as_bytes(),
+                )
+                .context("importing ACI IGVM topology config")?;
+            importer.complete_initial_ranges(&load_info.aci_initial_import_ranges)?;
+            let vmsa_gpa = importer.vmsa_gpa()?;
+            let [parameter_area] = importer.parameter_areas.as_slice() else {
+                bail!("ACI loader did not create exactly one IGVM parameter area");
+            };
+            (
+                Vec::new(),
+                VmsaDirectiveConfig {
+                    gpa: vmsa_gpa,
+                    context_count: 1,
+                },
+                ExpectedBootLayout::AciHyperv {
+                    linux_entry,
+                    linux_zero_page,
+                    vmsa_gpa,
+                    parameter_gpa: parameter_area.page_base * PAGE_SIZE,
+                    expected_apic_ids,
+                },
+            )
+        }
+    };
     let explicit_pages = importer.pages.keys().copied().collect::<BTreeSet<_>>();
     let (directives, _vmsa, map) =
-        importer.finish(processor_count, injection_type, &bootshim_ranges)?;
+        importer.finish(injection_type, &bootshim_ranges, vmsa_config)?;
     let policy: u64 = policy.into();
     let platform_headers = vec![IgvmPlatformHeader::SupportedPlatform(
         IGVM_VHS_SUPPORTED_PLATFORM {
@@ -602,9 +809,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         processor_count,
         memory_page_count,
         1u64 << c_bit_position,
-        shim_load_info.entrypoint,
-        params_gpa,
-        &bootshim_params,
+        &expected_boot_layout,
         &explicit_pages,
     )?;
 
@@ -714,9 +919,7 @@ fn validate_generated_igvm(
     processor_count: u32,
     ram_page_count: u64,
     c_bit_mask: u64,
-    expected_shim_entry: u64,
-    expected_params_gpa: u64,
-    expected_params: &SnpBootShimParams,
+    expected_boot_layout: &ExpectedBootLayout,
     expected_explicit_pages: &BTreeSet<u64>,
 ) -> anyhow::Result<()> {
     ensure!(igvm.platforms().len() == 1, "expected one platform header");
@@ -745,6 +948,25 @@ fn validate_generated_igvm(
     let mut cpuid_count = 0;
     let mut saw_vmsa = false;
     let mut serialized_params = None;
+    let mut parameter_area_count = 0;
+    let mut vp_count_parameter_count = 0;
+    let mut memory_map_parameter_count = 0;
+    let mut parameter_insert_count = 0;
+    let mut serialized_topology = None;
+    let (expected_vmsa_gpa, expected_vmsa_count, expected_entry, expected_rsi) =
+        match expected_boot_layout {
+            ExpectedBootLayout::Standard {
+                shim_entry,
+                params_gpa,
+                ..
+            } => (KVM_VMSA_GPA, processor_count, *shim_entry, *params_gpa),
+            ExpectedBootLayout::AciHyperv {
+                linux_entry,
+                linux_zero_page,
+                vmsa_gpa,
+                ..
+            } => (*vmsa_gpa, 1, *linux_entry, *linux_zero_page),
+        };
 
     for directive in igvm.directives() {
         match directive {
@@ -781,16 +1003,25 @@ fn validate_generated_igvm(
                         "unexpected PageData type {data_type:?}"
                     );
                 }
-                if *gpa == expected_params_gpa {
+                if matches!(
+                    expected_boot_layout,
+                    ExpectedBootLayout::Standard { params_gpa, .. } if *gpa == *params_gpa
+                ) {
                     let mut params_page = [0; PAGE_SIZE as usize];
                     params_page[..data.len()].copy_from_slice(data);
                     let params = SnpBootShimParams::read_from_bytes(&params_page)
                         .map_err(|_| anyhow::anyhow!("invalid SNP bootshim parameter page"))?;
-                    ensure!(
-                        &params == expected_params,
-                        "serialized SNP bootshim parameters changed"
-                    );
                     serialized_params = Some(params);
+                }
+                if *gpa == loader::linux::ACI_IGVM_CONFIG_BASE {
+                    ensure!(
+                        matches!(expected_boot_layout, ExpectedBootLayout::AciHyperv { .. }),
+                        "standard layout unexpectedly contains an ACI topology contract"
+                    );
+                    serialized_topology = Some(
+                        SnpAciIgvmConfig::read_from_bytes(data)
+                            .map_err(|_| anyhow::anyhow!("invalid ACI topology contract page"))?,
+                    );
                 }
             }
             IgvmDirectiveHeader::SnpVpContext {
@@ -799,7 +1030,7 @@ fn validate_generated_igvm(
                 vmsa,
                 ..
             } => {
-                ensure!(*gpa == KVM_VMSA_GPA, "VMSA is not at KVM's fixed GPA");
+                ensure!(*gpa == expected_vmsa_gpa, "VMSA is not at the expected GPA");
                 ensure!(
                     u32::from(*vp_index) == next_vmsa_index,
                     "VMSA VP contexts are not ordered by VP index"
@@ -811,12 +1042,12 @@ fn validate_generated_igvm(
                     "VMSA CR3 does not contain the configured C-bit"
                 );
                 ensure!(
-                    vmsa.rip == expected_shim_entry,
-                    "VMSA does not enter the SNP bootshim"
+                    vmsa.rip == expected_entry,
+                    "VMSA does not enter the expected boot target"
                 );
                 ensure!(
-                    vmsa.rsi == expected_params_gpa,
-                    "VMSA does not point RSI at the SNP bootshim parameters"
+                    vmsa.rsi == expected_rsi,
+                    "VMSA does not point RSI at the expected boot parameters"
                 );
                 ensure!(
                     vmsa.cr0 & x86defs::X64_CR0_ET != 0,
@@ -842,6 +1073,52 @@ fn validate_generated_igvm(
                 next_vmsa_index += 1;
                 saw_vmsa = true;
             }
+            IgvmDirectiveHeader::ParameterArea {
+                number_of_bytes,
+                parameter_area_index,
+                initial_data,
+            } => {
+                ensure!(
+                    matches!(expected_boot_layout, ExpectedBootLayout::AciHyperv { .. }),
+                    "standard layout unexpectedly contains a parameter area"
+                );
+                ensure!(
+                    *number_of_bytes == PAGE_SIZE
+                        && *parameter_area_index == 0
+                        && initial_data.is_empty(),
+                    "unexpected ACI parameter area"
+                );
+                parameter_area_count += 1;
+            }
+            IgvmDirectiveHeader::VpCount(info) => {
+                ensure!(
+                    matches!(expected_boot_layout, ExpectedBootLayout::AciHyperv { .. })
+                        && info.parameter_area_index == 0
+                        && info.byte_offset == 0,
+                    "unexpected ACI VP-count parameter"
+                );
+                vp_count_parameter_count += 1;
+            }
+            IgvmDirectiveHeader::MemoryMap(info) => {
+                ensure!(
+                    matches!(expected_boot_layout, ExpectedBootLayout::AciHyperv { .. })
+                        && info.parameter_area_index == 0
+                        && info.byte_offset == loader::linux::ACI_MEMORY_MAP_OFFSET as u32,
+                    "unexpected ACI memory-map parameter"
+                );
+                memory_map_parameter_count += 1;
+            }
+            IgvmDirectiveHeader::ParameterInsert(info) => {
+                let ExpectedBootLayout::AciHyperv { parameter_gpa, .. } = expected_boot_layout
+                else {
+                    bail!("standard layout unexpectedly contains a parameter insert");
+                };
+                ensure!(
+                    info.gpa == *parameter_gpa && info.parameter_area_index == 0,
+                    "unexpected ACI parameter insertion"
+                );
+                parameter_insert_count += 1;
+            }
             IgvmDirectiveHeader::RequiredMemory {
                 gpa,
                 number_of_bytes,
@@ -864,43 +1141,87 @@ fn validate_generated_igvm(
         &covered_pages == expected_explicit_pages,
         "serialized IGVM explicit page set changed"
     );
-    let serialized_params = serialized_params.context("SNP bootshim parameter page is missing")?;
-    let range_count = usize::try_from(serialized_params.range_count)
-        .context("SNP bootshim range count does not fit in usize")?;
-    let ranges = serialized_params
-        .ranges
-        .get(..range_count)
-        .context("SNP bootshim range count exceeds the parameter-page capacity")?;
-    let mut complete_ram = covered_pages.clone();
-    let mut previous_end = 0;
-    for range in ranges {
-        ensure!(range.page_count != 0, "empty SNP bootshim acceptance range");
-        let end = range
-            .start_gpn
-            .checked_add(range.page_count)
-            .context("SNP bootshim acceptance range overflow")?;
-        ensure!(
-            range.start_gpn >= previous_end && end <= ram_page_count,
-            "invalid SNP bootshim acceptance range"
-        );
-        for page in range.start_gpn..end {
+    match expected_boot_layout {
+        ExpectedBootLayout::Standard { params, .. } => {
+            let serialized_params =
+                serialized_params.context("SNP bootshim parameter page is missing")?;
             ensure!(
-                complete_ram.insert(page),
-                "SNP bootshim acceptance range overlaps an explicit page"
+                &serialized_params == params.as_ref(),
+                "serialized SNP bootshim parameters changed"
+            );
+            let range_count = usize::try_from(serialized_params.range_count)
+                .context("SNP bootshim range count does not fit in usize")?;
+            let ranges = serialized_params
+                .ranges
+                .get(..range_count)
+                .context("SNP bootshim range count exceeds the parameter-page capacity")?;
+            let mut complete_ram = covered_pages.clone();
+            let mut previous_end = 0;
+            for range in ranges {
+                ensure!(range.page_count != 0, "empty SNP bootshim acceptance range");
+                let end = range
+                    .start_gpn
+                    .checked_add(range.page_count)
+                    .context("SNP bootshim acceptance range overflow")?;
+                ensure!(
+                    range.start_gpn >= previous_end && end <= ram_page_count,
+                    "invalid SNP bootshim acceptance range"
+                );
+                for page in range.start_gpn..end {
+                    ensure!(
+                        complete_ram.insert(page),
+                        "SNP bootshim acceptance range overlaps an explicit page"
+                    );
+                }
+                previous_end = end;
+            }
+            ensure!(
+                complete_ram.len() == ram_page_count as usize
+                    && complete_ram.first() == Some(&0)
+                    && complete_ram.last() == Some(&(ram_page_count - 1)),
+                "explicit and bootshim-accepted ranges do not cover all required RAM"
+            );
+            ensure!(
+                parameter_area_count == 0
+                    && vp_count_parameter_count == 0
+                    && memory_map_parameter_count == 0
+                    && parameter_insert_count == 0,
+                "standard layout unexpectedly contains IGVM parameters"
             );
         }
-        previous_end = end;
+        ExpectedBootLayout::AciHyperv {
+            expected_apic_ids, ..
+        } => {
+            ensure!(
+                serialized_params.is_none(),
+                "ACI layout unexpectedly contains bootshim parameters"
+            );
+            ensure!(
+                parameter_area_count == 1
+                    && vp_count_parameter_count == 1
+                    && memory_map_parameter_count == 1
+                    && parameter_insert_count == 1,
+                "ACI layout does not contain the expected runtime parameters"
+            );
+            let topology = serialized_topology.context("ACI topology contract page is missing")?;
+            ensure!(
+                topology.magic == SNP_ACI_IGVM_CONFIG_MAGIC
+                    && topology.version == SNP_ACI_IGVM_CONFIG_VERSION
+                    && topology.vp_count as usize == expected_apic_ids.len()
+                    && topology.apic_ids[..expected_apic_ids.len()] == *expected_apic_ids
+                    && topology.reserved.iter().all(|&value| value == 0),
+                "serialized ACI topology contract changed"
+            );
+            ensure!(
+                covered_pages.len() < ram_page_count as usize,
+                "ACI layout unexpectedly imports all guest RAM"
+            );
+        }
     }
-    ensure!(
-        complete_ram.len() == ram_page_count as usize
-            && complete_ram.first() == Some(&0)
-            && complete_ram.last() == Some(&(ram_page_count - 1)),
-        "explicit and bootshim-accepted ranges do not cover all required RAM"
-    );
     ensure!(required_memory_count == 1, "expected one RequiredMemory");
     ensure!(
-        next_vmsa_index == processor_count,
-        "expected one SNP VMSA per processor"
+        next_vmsa_index == expected_vmsa_count,
+        "unexpected SNP VMSA context count"
     );
     ensure!(secrets_count == 1, "expected one SNP secrets page");
     ensure!(cpuid_count == 1, "expected one SNP CPUID page");
@@ -1062,23 +1383,28 @@ struct MapEntry {
 
 fn build_sparse_ram_directives(
     imported: &BTreeMap<u64, ImportedPage>,
+    parameter_areas: &[IgvmParameterArea],
     vmsa: &SevVmsa,
-    processor_count: u32,
+    vmsa_config: VmsaDirectiveConfig,
     ram_page_count: u64,
     bootshim_ranges: &[SnpBootShimRange],
 ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, String)> {
-    let mut directives = Vec::with_capacity(imported.len() + processor_count as usize);
+    let mut directives = Vec::new();
+    let mut memory_directives = BTreeMap::new();
     let mut map_entries = Vec::new();
 
     for (&page, imported) in imported {
         let (data_type, flags, kind) = page_data_shape(imported.acceptance)?;
-        directives.push(IgvmDirectiveHeader::PageData {
-            gpa: page * PAGE_SIZE,
-            compatibility_mask: COMPATIBILITY_MASK,
-            flags,
-            data_type,
-            data: imported.data.clone(),
-        });
+        memory_directives.insert(
+            page,
+            IgvmDirectiveHeader::PageData {
+                gpa: page * PAGE_SIZE,
+                compatibility_mask: COMPATIBILITY_MASK,
+                flags,
+                data_type,
+                data: imported.data.clone(),
+            },
+        );
         map_entries.push(MapEntry {
             start_page: page,
             page_count: 1,
@@ -1086,6 +1412,48 @@ fn build_sparse_ram_directives(
             kind,
         });
     }
+    for (index, area) in parameter_areas.iter().enumerate() {
+        let parameter_area_index = index
+            .try_into()
+            .context("IGVM parameter area index does not fit in u32")?;
+        directives.push(IgvmDirectiveHeader::ParameterArea {
+            number_of_bytes: u64::from(area.page_count) * PAGE_SIZE,
+            parameter_area_index,
+            initial_data: area.initial_data.clone(),
+        });
+        for &(byte_offset, parameter_type) in &area.parameters {
+            let info = IGVM_VHS_PARAMETER {
+                parameter_area_index,
+                byte_offset,
+            };
+            directives.push(match parameter_type {
+                IgvmParameterType::VpCount => IgvmDirectiveHeader::VpCount(info),
+                IgvmParameterType::MemoryMap => IgvmDirectiveHeader::MemoryMap(info),
+                unsupported => bail!("unsupported ACI IGVM parameter type {unsupported:?}"),
+            });
+        }
+        ensure!(
+            memory_directives
+                .insert(
+                    area.page_base,
+                    IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+                        gpa: area.page_base * PAGE_SIZE,
+                        compatibility_mask: COMPATIBILITY_MASK,
+                        parameter_area_index,
+                    }),
+                )
+                .is_none(),
+            "parameter area overlaps an existing directive at GPA {:#x}",
+            area.page_base * PAGE_SIZE
+        );
+        map_entries.push(MapEntry {
+            start_page: area.page_base,
+            page_count: u64::from(area.page_count),
+            tag: area.tag.clone(),
+            kind: "PARAMETER",
+        });
+    }
+    directives.extend(memory_directives.into_values());
     for range in bootshim_ranges {
         map_entries.push(MapEntry {
             start_page: range.start_gpn,
@@ -1094,9 +1462,9 @@ fn build_sparse_ram_directives(
             kind: "PVALIDATE",
         });
     }
-    for vp_index in 0..processor_count {
+    for vp_index in 0..vmsa_config.context_count {
         directives.push(IgvmDirectiveHeader::SnpVpContext {
-            gpa: KVM_VMSA_GPA,
+            gpa: vmsa_config.gpa,
             compatibility_mask: COMPATIBILITY_MASK,
             vp_index: vp_index
                 .try_into()
@@ -1104,7 +1472,7 @@ fn build_sparse_ram_directives(
             vmsa: Box::new(*vmsa),
         });
         map_entries.push(MapEntry {
-            start_page: KVM_VMSA_GPA / PAGE_SIZE,
+            start_page: vmsa_config.gpa / PAGE_SIZE,
             page_count: 1,
             tag: format!("snp-vmsa-vp{vp_index}"),
             kind: "VMSA",
@@ -1115,13 +1483,17 @@ fn build_sparse_ram_directives(
         imported.keys().all(|page| *page < ram_page_count),
         "an imported page lies outside RAM"
     );
+    let parameter_page_count = parameter_areas
+        .iter()
+        .map(|area| u64::from(area.page_count))
+        .sum::<u64>();
     let bootshim_page_count = bootshim_ranges.iter().map(|range| range.page_count).sum();
     Ok((
         directives,
         format_map(
             map_entries,
             ram_page_count,
-            imported.len() as u64,
+            imported.len() as u64 + parameter_page_count,
             bootshim_page_count,
         ),
     ))
@@ -1458,8 +1830,18 @@ mod tests {
                 page_count: 2,
             },
         ];
-        let (directives, map) =
-            build_sparse_ram_directives(&imported, &vmsa, 1, 4, &accepted_ranges).unwrap();
+        let (directives, map) = build_sparse_ram_directives(
+            &imported,
+            &[],
+            &vmsa,
+            VmsaDirectiveConfig {
+                gpa: KVM_VMSA_GPA,
+                context_count: 1,
+            },
+            4,
+            &accepted_ranges,
+        )
+        .unwrap();
         assert_eq!(directives.len(), 2);
         assert!(matches!(
             directives[0],
@@ -1494,8 +1876,18 @@ mod tests {
             start_gpn: 0,
             page_count: 1,
         }];
-        let (directives, _) =
-            build_sparse_ram_directives(&BTreeMap::new(), &vmsa, 4, 1, &accepted_ranges).unwrap();
+        let (directives, _) = build_sparse_ram_directives(
+            &BTreeMap::new(),
+            &[],
+            &vmsa,
+            VmsaDirectiveConfig {
+                gpa: KVM_VMSA_GPA,
+                context_count: 4,
+            },
+            1,
+            &accepted_ranges,
+        )
+        .unwrap();
         let vp_indexes = directives
             .iter()
             .filter_map(|directive| match directive {
@@ -1516,8 +1908,109 @@ mod tests {
     }
 
     #[test]
+    fn aci_layout_emits_runtime_parameters_and_one_bsp_vmsa() {
+        let vmsa = build_vmsa(
+            &[
+                X86Register::Rip(0x1a00200),
+                X86Register::Rsi(0x2000),
+                X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
+            ],
+            TEST_C_BIT_MASK,
+            &SnpInjectionType::Restricted,
+        )
+        .unwrap();
+        let parameter_areas = [IgvmParameterArea {
+            page_base: 0x802,
+            page_count: 1,
+            initial_data: Vec::new(),
+            parameters: vec![
+                (0, IgvmParameterType::VpCount),
+                (
+                    loader::linux::ACI_MEMORY_MAP_OFFSET as u32,
+                    IgvmParameterType::MemoryMap,
+                ),
+            ],
+            tag: "linux-aci-snp-parameters".to_owned(),
+        }];
+
+        let (directives, map) = build_sparse_ram_directives(
+            &BTreeMap::new(),
+            &parameter_areas,
+            &vmsa,
+            VmsaDirectiveConfig {
+                gpa: 0x201000,
+                context_count: 1,
+            },
+            0x1000,
+            &[],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            directives[0],
+            IgvmDirectiveHeader::ParameterArea {
+                number_of_bytes: PAGE_SIZE,
+                parameter_area_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            directives[1],
+            IgvmDirectiveHeader::VpCount(IGVM_VHS_PARAMETER {
+                parameter_area_index: 0,
+                byte_offset: 0,
+            })
+        ));
+        assert!(matches!(
+            directives[2],
+            IgvmDirectiveHeader::MemoryMap(IGVM_VHS_PARAMETER {
+                parameter_area_index: 0,
+                byte_offset,
+            }) if byte_offset == loader::linux::ACI_MEMORY_MAP_OFFSET as u32
+        ));
+        assert!(matches!(
+            directives[3],
+            IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+                gpa: 0x802000,
+                parameter_area_index: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            directives[4],
+            IgvmDirectiveHeader::SnpVpContext {
+                gpa: 0x201000,
+                vp_index: 0,
+                ..
+            }
+        ));
+        assert!(map.contains("linux-aci-snp-parameters [PARAMETER]"));
+        assert!(!map.contains("PVALIDATE"));
+    }
+
+    #[test]
+    fn aci_initial_ranges_exclude_runtime_and_vmsa_pages() {
+        let mut importer = TestIgvmImporter::new(0x1000, 51, SnpLinuxDirectBootLayout::AciHyperv);
+        importer.set_vp_context_page(0x201).unwrap();
+        let parameter_area = importer
+            .create_parameter_area(0x802, 1, "linux-aci-snp-parameters")
+            .unwrap();
+        importer
+            .import_parameter(parameter_area, 0, IgvmParameterType::VpCount)
+            .unwrap();
+        importer
+            .complete_initial_ranges(&[MemoryRange::new(0x200000..0x203000)])
+            .unwrap();
+
+        assert!(importer.pages.contains_key(&0x200));
+        assert!(!importer.pages.contains_key(&0x201));
+        assert!(importer.pages.contains_key(&0x202));
+        assert!(!importer.pages.contains_key(&0x802));
+    }
+
+    #[test]
     fn computes_coalesced_unimported_ranges() {
-        let mut importer = TestIgvmImporter::new(10, 51);
+        let mut importer = TestIgvmImporter::new(10, 51, SnpLinuxDirectBootLayout::Standard);
         importer
             .import_pages(1, 2, "first", BootPageAcceptance::Exclusive, &[1])
             .unwrap();
@@ -1550,7 +2043,7 @@ mod tests {
 
     #[test]
     fn rejects_additional_import_outside_ram() {
-        let importer = TestIgvmImporter::new(4, 51);
+        let importer = TestIgvmImporter::new(4, 51, SnpLinuxDirectBootLayout::Standard);
         assert!(
             importer
                 .unimported_ranges([4])
@@ -1579,7 +2072,7 @@ mod tests {
 
     #[test]
     fn rewrites_vmsa_to_enter_bootshim() {
-        let mut importer = TestIgvmImporter::new(16, 51);
+        let mut importer = TestIgvmImporter::new(16, 51, SnpLinuxDirectBootLayout::Standard);
         importer
             .import_vp_register(X86Register::Rip(0x100000))
             .unwrap();

@@ -23,6 +23,7 @@ use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SecureAvicType;
 use igvmfilegen_config::SnpInjectionType;
+use igvmfilegen_config::SnpLinuxDirectBootLayout;
 use mesh_process::Mesh;
 use mesh_process::ProcessConfig;
 use mesh_worker::WorkerHost;
@@ -201,6 +202,7 @@ impl PetriVmConfigOpenVmm {
                         },
                         processor_topology,
                         vm_layout,
+                        boot_layout: SnpLinuxDirectBootLayout::Standard,
                         c_bit_position: None,
                     },
                 }],

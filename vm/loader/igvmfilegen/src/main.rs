@@ -562,8 +562,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
         if config.max_vtl != 2 && config.max_vtl != 0 {
             bail!("max_vtl must be 2 or 0");
         }
-
-        config.image.validate().context("invalid image config")?;
+        config.validate().context("invalid guest config")?;
 
         let loader_isolation_type = match &config.isolation_type {
             ConfigIsolationType::None => LoaderIsolationType::None,
@@ -663,6 +662,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 linux,
                 processor_topology,
                 vm_layout,
+                boot_layout,
                 c_bit_position,
             } => {
                 if config.max_vtl != 0 {
@@ -684,11 +684,11 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 if !matches!(secure_avic, SecureAvicType::Disabled) {
                     bail!("snp_linux_direct requires secure AVIC to be disabled");
                 }
-
                 R::build_snp_linux_direct(snp_linux_direct::BuildParams {
                     linux,
                     processor_topology,
                     vm_layout,
+                    boot_layout: *boot_layout,
                     c_bit_position: *c_bit_position,
                     policy: SnpPolicy::from(*policy).with_debug(*enable_debug as u8),
                     injection_type,

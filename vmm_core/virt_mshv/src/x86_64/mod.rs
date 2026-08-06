@@ -81,6 +81,7 @@ use snp::set_ghcb_gp;
 use snp::snp_cpuid_overrides;
 use snp::snp_hv_cpuid_overrides;
 use snp::snp_start_vp_vmsa_gpa;
+use snp::validate_snp_igvm_topology;
 
 impl virt::Hypervisor for LinuxMshv {
     type ProtoPartition<'a> = MshvProtoPartition<'a>;
@@ -381,16 +382,11 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             return Err(ErrorInner::IsolationConfigurationMissing.into());
         }
         if let Some(snp_config) = &self.snp_config {
-            let vmsa_range =
-                MemoryRange::new(snp_config.vmsa.gpa..snp_config.vmsa.gpa + hvdef::HV_PAGE_SIZE);
-            if config
-                .mem_layout
-                .ram()
-                .iter()
-                .any(|range| range.range.overlaps(&vmsa_range))
-            {
-                return Err(ErrorInner::SnpVmsaOverlapsRam.into());
-            }
+            validate_snp_igvm_topology(
+                snp_config,
+                config.mem_layout,
+                self.config.processor_topology.vp_count(),
+            )?;
         }
         let mut cpuid = config.cpuid.to_vec();
         if self.config.isolation == virt::IsolationType::Snp {

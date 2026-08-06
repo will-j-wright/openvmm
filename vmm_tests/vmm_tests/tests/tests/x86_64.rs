@@ -24,6 +24,7 @@ use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SecureAvicType;
 use igvmfilegen_config::SnpInjectionType;
+use igvmfilegen_config::SnpLinuxDirectBootLayout;
 use mesh::CellUpdater;
 use net_backend_resources::mac_address::MacAddress;
 use net_backend_resources::null::NullHandle;
@@ -142,6 +143,7 @@ fn generate_snp_linux_direct_igvm(
                     vtl2_framebuffer_size: 0,
                     physical_address_size: 48,
                 },
+                boot_layout: SnpLinuxDirectBootLayout::Standard,
                 // The no-hardware test must run on hosts without SNP CPUID support.
                 c_bit_position: Some(51),
             },
