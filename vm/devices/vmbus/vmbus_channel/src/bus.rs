@@ -15,6 +15,8 @@ use std::fmt::Display;
 use std::time::Duration;
 use vmbus_core::protocol;
 use vmbus_core::protocol::GpadlId;
+use vmbus_core::protocol::PipeFlags;
+use vmbus_core::protocol::PipeUserDefinedData;
 use vmbus_core::protocol::UserDefinedData;
 use vmcore::interrupt::Interrupt;
 
@@ -323,6 +325,10 @@ pub enum ChannelType {
     Pipe {
         /// If true, the pipe uses message mode. Otherwise, it uses byte mode.
         message_mode: bool,
+        /// Provider-defined offer data.
+        user_defined: PipeUserDefinedData,
+        /// Pipe capabilities.
+        pipe_flags: PipeFlags,
     },
     /// A channel representing a Hyper-V socket.
     HvSocket {
