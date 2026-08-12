@@ -18,6 +18,7 @@ use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmProcessorBinder;
 use crate::KvmRunVpError;
+use crate::SnpError;
 use crate::SnpLaunchState;
 use crate::gsi::GsiRouting;
 use crate::gsi::KvmIrqFdState;
@@ -381,7 +382,7 @@ impl virt::Hypervisor for Kvm {
                     .read(true)
                     .write(true)
                     .open("/dev/sev")
-                    .map_err(KvmError::OpenSev)?,
+                    .map_err(SnpError::OpenSev)?,
             ),
             virt::IsolationType::None => None,
             virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
@@ -472,14 +473,14 @@ impl ProtoPartition for KvmProtoPartition<'_> {
                         .vps()
                         .any(|vp| config.vp(vp.vp_index).is_none())
                 {
-                    return Err(KvmError::InvalidSnpIgvmTopology);
+                    return Err(SnpError::InvalidIgvmTopology.into());
                 }
                 if let Some(vp) = config
                     .vps
                     .iter()
                     .find(|vp| vp.context.gpa != crate::snp::KVM_SNP_VMSA_GPA)
                 {
-                    return Err(KvmError::InvalidSnpVmsaGpa(vp.context.gpa));
+                    return Err(SnpError::InvalidVmsaGpa(vp.context.gpa).into());
                 }
                 Some(config)
             }

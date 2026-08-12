@@ -16,6 +16,9 @@ mod memory;
 mod snp;
 
 pub use arch::Kvm;
+pub use memory::MemoryError;
+#[cfg(guest_arch = "x86_64")]
+pub use snp::SnpError;
 
 use guestmem::GuestMemory;
 use inspect::Inspect;
@@ -40,7 +43,6 @@ use arch::KvmVpInner;
 #[cfg(guest_arch = "x86_64")]
 use snp::SnpLaunchState;
 use std::sync::atomic::Ordering;
-use virt::InitialPageImportType;
 use virt::VpIndex;
 use vmcore::vmtime::VmTimeAccess;
 
@@ -52,20 +54,13 @@ pub enum KvmError {
     Vtl2NotSupported,
     #[error("isolation is not supported on this hypervisor")]
     IsolationNotSupported,
-    #[error("failed to open /dev/sev")]
-    OpenSev(#[source] std::io::Error),
-    #[error("unsupported SNP launch page import type: {0:?}")]
-    UnsupportedSnpPageImportType(InitialPageImportType),
-    #[error("missing SNP VMSA import")]
-    MissingSnpVmsa,
-    #[error("multiple SNP VMSA imports")]
-    MultipleSnpVmsa,
-    #[error("invalid SNP VMSA")]
-    InvalidSnpVmsa(#[source] virt::x86::snp::SnpVmsaError),
-    #[error("failed to access SNP VMSA memory")]
-    SnpVmsaMemory(#[source] guestmem::GuestMemoryError),
     #[error("kvm error")]
     Kvm(#[from] kvm::Error),
+    #[error(transparent)]
+    Memory(#[from] MemoryError),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    Snp(#[from] SnpError),
     #[error("failed to stat /dev/kvm")]
     AvailableCheck(#[source] std::io::Error),
     #[error(transparent)]
@@ -74,70 +69,10 @@ pub enum KvmError {
     InvalidState(&'static str),
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
-    #[error("cannot resize KVM guest_memfd memory slot")]
-    CannotResizeGuestMemfdSlot,
-    #[error("private memory range is not contained in guest_memfd private memory")]
-    InvalidPrivateMemoryRange,
-    #[error("SNP launch range is not page aligned")]
-    UnalignedSnpLaunchRange,
-    #[error("SNP launch range is not contained in guestmemfd private memory")]
-    InvalidSnpLaunchRange,
-    #[error("too many CPUID entries for SNP launch page: {0}")]
-    TooManySnpCpuidEntries(usize),
-    #[error("invalid KVM_HC_MAP_GPA_RANGE request")]
-    InvalidMapGpaRange,
-    #[error("unsupported KVM_HC_MAP_GPA_RANGE attributes: {0:#x}")]
-    UnsupportedMapGpaRangeAttributes(u64),
-    #[error("failed to discard shared backing after private conversion")]
-    DiscardSharedBacking(#[source] std::io::Error),
-    #[error("failed to discard private backing after shared conversion")]
-    DiscardPrivateBacking(#[source] std::io::Error),
-    #[error("SNP launch is already in progress")]
-    SnpLaunchInProgress,
-    #[error("SNP launch previously failed")]
-    SnpLaunchFailed,
     #[error("partition isolation configuration was already supplied")]
     IsolationConfigurationAlreadySet,
     #[error("partition isolation configuration was not supplied before build")]
     IsolationConfigurationMissing,
-    #[error("SNP IGVM VP contexts do not match the configured virtual processors")]
-    InvalidSnpIgvmTopology,
-    #[error("SNP IGVM VMSA import markers do not match the supplied VP contexts")]
-    InvalidSnpIgvmVmsaImports,
-    #[error("KVM requires SNP IGVM VMSA directives after all measured page directives")]
-    UnsupportedSnpIgvmVmsaOrder,
-    #[error("SNP IGVM VMSA GPA {0:#x} is not supported by KVM")]
-    InvalidSnpVmsaGpa(u64),
-    #[error("invalid SNP IGVM VMSA: {0}")]
-    InvalidSnpIgvmVmsa(&'static str),
-    #[error("KVM does not support SNP VMSA feature bits {0:#x}")]
-    UnsupportedSnpVmsaFeatures(u64),
-    #[error("SNP IGVM requests unsupported highest VTL {0}")]
-    UnsupportedSnpVtl(u8),
-    #[error("SNP IGVM requests unsupported shared GPA boundary {0:#x}")]
-    UnsupportedSnpSharedGpaBoundary(u64),
-    #[error("KVM does not support SNP IGVM relocation")]
-    SnpIgvmRelocationUnsupported,
-    #[error("missing KVM CCA capability: {0}")]
-    MissingCcaCapability(&'static str),
-    #[error("CCA realm VMs require GICv3")]
-    CcaRequiresGicV3,
-    #[error("unsupported CCA initial page import type: {0:?}")]
-    UnsupportedCcaPageImportType(InitialPageImportType),
-    #[error("CCA initial page population is already in progress")]
-    CcaPopulateInProgress,
-    #[error("CCA initial page population previously failed")]
-    CcaPopulateFailed,
-    #[error("CCA initial population range is not page aligned")]
-    UnalignedCcaPopulateRange,
-    #[error("CCA initial population range is not contained in guest_memfd private memory")]
-    InvalidCcaPopulateRange,
-    #[cfg(guest_arch = "aarch64")]
-    #[error("invalid CCA memory fault")]
-    InvalidCcaMemoryFault,
-    #[cfg(guest_arch = "aarch64")]
-    #[error("unsupported CCA memory fault flags: {0:#x}")]
-    UnsupportedCcaMemoryFaultFlags(u64),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]

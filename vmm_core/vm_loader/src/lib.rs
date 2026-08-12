@@ -461,6 +461,7 @@ impl Loader<'_, X86Register> {
         &mut self,
         caps: &virt::x86::X86PartitionCapabilities,
         bsp: &vm_topology::processor::x86::X86VpInfo,
+        config: virt::x86::snp::SnpVmsaConfig,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!self.snp_vmsa_finalized, "SNP VMSA was already finalized");
         let page_base = self
@@ -468,7 +469,7 @@ impl Loader<'_, X86Register> {
             .ok_or_else(|| anyhow::anyhow!("SNP VP context page was not configured"))?;
         let regs = self.regs.values().copied().collect::<Vec<_>>();
         let initial = initial_regs::x86_initial_regs(&regs, caps, bsp);
-        let vmsa = virt::x86::snp::vmsa_from_initial_regs(&initial);
+        let vmsa = virt::x86::snp::vmsa_from_initial_regs(&initial, config);
         self.gm
             .write_plain(page_base * HV_PAGE_SIZE, &vmsa)
             .context("unable to write SNP VMSA")?;
@@ -476,7 +477,6 @@ impl Loader<'_, X86Register> {
         Ok(())
     }
 }
-
 fn boot_page_acceptance_to_import_type(acceptance: BootPageAcceptance) -> InitialPageImportType {
     match acceptance {
         BootPageAcceptance::Exclusive => InitialPageImportType::Normal,

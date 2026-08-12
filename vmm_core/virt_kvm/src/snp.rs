@@ -13,14 +13,68 @@
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
+use crate::memory::MemoryError;
 use crate::memory::private_memory_range_from_slots;
 use std::os::fd::AsFd;
 use std::sync::Arc;
+use thiserror::Error;
 use virt::InitialPageImportType;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 pub(crate) const KVM_SNP_VMSA_GPA: u64 = 0xffff_ffff_f000;
+
+#[derive(Debug, Error)]
+pub enum SnpError {
+    #[error("SNP isolation is not configured")]
+    IsolationNotSupported,
+    #[error("failed to open /dev/sev")]
+    OpenSev(#[source] std::io::Error),
+    #[error("unsupported SNP launch page import type: {0:?}")]
+    UnsupportedPageImportType(InitialPageImportType),
+    #[error("missing SNP VMSA import")]
+    MissingVmsa,
+    #[error("multiple SNP VMSA imports")]
+    MultipleVmsa,
+    #[error("invalid SNP VMSA")]
+    InvalidVmsa(#[source] virt::x86::snp::SnpVmsaError),
+    #[error("failed to access SNP VMSA memory")]
+    VmsaMemory(#[source] guestmem::GuestMemoryError),
+    #[error("invalid SNP launch range")]
+    InvalidLaunchRange,
+    #[error("too many CPUID entries for SNP launch page: {0}")]
+    TooManyCpuidEntries(usize),
+    #[error("SNP launch is already in progress")]
+    LaunchInProgress,
+    #[error("SNP launch is already complete")]
+    LaunchAlreadyFinished,
+    #[error("SNP launch previously failed")]
+    LaunchFailed,
+    #[error("invalid SNP BSP state: {0}")]
+    InvalidBspState(&'static str),
+    #[error("SNP IGVM VP contexts do not match the configured virtual processors")]
+    InvalidIgvmTopology,
+    #[error("SNP IGVM VMSA import markers do not match the supplied VP contexts")]
+    InvalidIgvmVmsaImports,
+    #[error("KVM requires SNP IGVM VMSA directives after all measured page directives")]
+    UnsupportedIgvmVmsaOrder,
+    #[error("SNP IGVM VMSA GPA {0:#x} is not supported by KVM")]
+    InvalidVmsaGpa(u64),
+    #[error("invalid SNP IGVM VMSA: {0}")]
+    InvalidIgvmVmsa(&'static str),
+    #[error("KVM does not support SNP VMSA feature bits {0:#x}")]
+    UnsupportedVmsaFeatures(u64),
+    #[error("SNP IGVM requests unsupported highest VTL {0}")]
+    UnsupportedVtl(u8),
+    #[error("SNP IGVM requests unsupported shared GPA boundary {0:#x}")]
+    UnsupportedSharedGpaBoundary(u64),
+    #[error("KVM does not support SNP IGVM relocation")]
+    IgvmRelocationUnsupported,
+    #[error("KVM SNP operation failed")]
+    Kvm(#[from] kvm::Error),
+    #[error(transparent)]
+    Memory(#[from] MemoryError),
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 /// Progress of the one-shot SNP launch sequence.
@@ -57,29 +111,29 @@ impl KvmSnpConfig {
     }
 }
 
-fn parse_vmsa_page(context: Arc<virt::SnpVpContext>) -> Result<KvmSnpVpConfig, KvmError> {
+fn parse_vmsa_page(context: Arc<virt::SnpVpContext>) -> Result<KvmSnpVpConfig, SnpError> {
     let (vmsa, _) = x86defs::snp::SevVmsa::read_from_prefix(context.page.as_ref())
-        .map_err(|_| KvmError::InvalidSnpIgvmVmsa("invalid VMSA page size"))?;
+        .map_err(|_| SnpError::InvalidIgvmVmsa("invalid VMSA page size"))?;
     Ok(KvmSnpVpConfig { context, vmsa })
 }
 
 pub(crate) fn prepare_snp_config(
     config: Arc<virt::SnpConfig>,
     supported_vmsa_features: u64,
-) -> Result<Arc<KvmSnpConfig>, KvmError> {
+) -> Result<Arc<KvmSnpConfig>, SnpError> {
     if config.highest_vtl != 0 {
-        return Err(KvmError::UnsupportedSnpVtl(config.highest_vtl));
+        return Err(SnpError::UnsupportedVtl(config.highest_vtl));
     }
     if config.shared_gpa_boundary != 0 {
-        return Err(KvmError::UnsupportedSnpSharedGpaBoundary(
+        return Err(SnpError::UnsupportedSharedGpaBoundary(
             config.shared_gpa_boundary,
         ));
     }
     if config.has_relocation {
-        return Err(KvmError::SnpIgvmRelocationUnsupported);
+        return Err(SnpError::IgvmRelocationUnsupported);
     }
     if config.vp_contexts.is_empty() {
-        return Err(KvmError::InvalidSnpIgvmTopology);
+        return Err(SnpError::InvalidIgvmTopology);
     }
 
     // KVM_SEV_INIT2 needs the VM-wide VMSA feature bits before any vCPUs
@@ -91,12 +145,12 @@ pub(crate) fn prepare_snp_config(
     for context in &config.vp_contexts {
         let vp = parse_vmsa_page(context.clone())?;
         if vp.vmsa.sev_features.vtom() || vp.vmsa.virtual_tom != 0 {
-            return Err(KvmError::InvalidSnpIgvmVmsa("vTOM is not supported"));
+            return Err(SnpError::InvalidIgvmVmsa("vTOM is not supported"));
         }
         let features = u64::from(vp.vmsa.sev_features) & !1;
         match vmsa_features {
             Some(previous) if previous != features => {
-                return Err(KvmError::InvalidSnpIgvmVmsa(
+                return Err(SnpError::InvalidIgvmVmsa(
                     "VP contexts have inconsistent VMSA features",
                 ));
             }
@@ -109,7 +163,7 @@ pub(crate) fn prepare_snp_config(
     let vmsa_features = vmsa_features.unwrap_or(0);
     let unsupported_features = vmsa_features & !supported_vmsa_features;
     if unsupported_features != 0 {
-        return Err(KvmError::UnsupportedSnpVmsaFeatures(unsupported_features));
+        return Err(SnpError::UnsupportedVmsaFeatures(unsupported_features));
     }
 
     Ok(Arc::new(KvmSnpConfig {
@@ -123,20 +177,21 @@ impl virt::AcceptInitialPages for KvmPartition {
     type Error = KvmError;
 
     fn accept_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), Self::Error> {
-        self.inner.snp_launch_initial_pages(pages)
+        self.inner.snp_launch_initial_pages(pages)?;
+        Ok(())
     }
 }
 
 impl KvmPartitionInner {
     /// Runs the SNP launch sequence once and records its terminal state.
-    fn snp_launch_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), KvmError> {
+    fn snp_launch_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), SnpError> {
         {
             let mut state = self.snp_launch_state.lock();
             match *state {
                 SnpLaunchState::NotStarted => *state = SnpLaunchState::Started,
-                SnpLaunchState::Started => return Err(KvmError::SnpLaunchInProgress),
-                SnpLaunchState::Finished => return Ok(()),
-                SnpLaunchState::Failed => return Err(KvmError::SnpLaunchFailed),
+                SnpLaunchState::Started => return Err(SnpError::LaunchInProgress),
+                SnpLaunchState::Finished => return Err(SnpError::LaunchAlreadyFinished),
+                SnpLaunchState::Failed => return Err(SnpError::LaunchFailed),
             }
         }
 
@@ -159,8 +214,8 @@ impl KvmPartitionInner {
     fn snp_launch_initial_pages_inner(
         &self,
         pages: &[virt::InitialPageImport],
-    ) -> Result<(), KvmError> {
-        let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
+    ) -> Result<(), SnpError> {
+        let sev = self.sev.as_ref().ok_or(SnpError::IsolationNotSupported)?;
         if let Some(config) = &self.snp_config {
             validate_snp_igvm_vmsa_imports(pages, &config.generic)?;
         } else {
@@ -263,23 +318,23 @@ impl KvmPartitionInner {
 
     // TODO: Remove this register translation once KVM supports importing a
     // loader-provided VMSA directly.
-    fn apply_snp_vmsa(&self, pages: &[virt::InitialPageImport]) -> Result<(), KvmError> {
+    fn apply_snp_vmsa(&self, pages: &[virt::InitialPageImport]) -> Result<(), SnpError> {
         let mut vmsa_pages = pages
             .iter()
             .filter(|page| page.import_type == InitialPageImportType::VpContext);
-        let page = vmsa_pages.next().ok_or(KvmError::MissingSnpVmsa)?;
+        let page = vmsa_pages.next().ok_or(SnpError::MissingVmsa)?;
         if vmsa_pages.next().is_some() {
-            return Err(KvmError::MultipleSnpVmsa);
+            return Err(SnpError::MultipleVmsa);
         }
         if page.range.len() != hvdef::HV_PAGE_SIZE {
-            return Err(KvmError::InvalidSnpLaunchRange);
+            return Err(SnpError::InvalidLaunchRange);
         }
 
         let vmsa = self
             .gm
             .read_plain::<x86defs::snp::SevVmsa>(page.range.start())
-            .map_err(KvmError::SnpVmsaMemory)?;
-        let state = virt::x86::snp::state_from_vmsa(&vmsa).map_err(KvmError::InvalidSnpVmsa)?;
+            .map_err(SnpError::VmsaMemory)?;
+        let state = virt::x86::snp::state_from_vmsa(&vmsa).map_err(SnpError::InvalidVmsa)?;
         let kvm_vp = self.vp_kvm(virt::VpIndex::BSP);
         let registers = state.registers;
         let regs = kvm::kvm_regs {
@@ -341,14 +396,14 @@ impl KvmPartitionInner {
     ///
     /// AP register state is not validated here because SNP APs are started
     /// later through GHCB AP creation with guest-provided VMSAs.
-    fn prepare_snp_vmsa_register_state(&self) -> Result<(), KvmError> {
+    fn prepare_snp_vmsa_register_state(&self) -> Result<(), SnpError> {
         for vp in &self.vps {
             let vp_info = vp.vp_info();
             let kvm_vp = self.kvm.vp(vp_info.apic_id);
             if let Some(config) = &self.snp_config {
                 let vp = config
                     .vp(vp_info.base.vp_index)
-                    .ok_or(KvmError::InvalidSnpIgvmTopology)?;
+                    .ok_or(SnpError::InvalidIgvmTopology)?;
                 set_snp_igvm_vmsa_state(&kvm_vp, &vp.vmsa)?;
             }
             let sregs = kvm_vp.get_sregs()?;
@@ -370,20 +425,20 @@ impl KvmPartitionInner {
 fn validate_snp_igvm_vmsa_imports(
     pages: &[virt::InitialPageImport],
     config: &virt::SnpConfig,
-) -> Result<(), KvmError> {
+) -> Result<(), SnpError> {
     let mut imports = pages
         .iter()
         .filter(|page| page.import_type == InitialPageImportType::VpContext);
     for context in &config.vp_contexts {
         let Some(import) = imports.next() else {
-            return Err(KvmError::InvalidSnpIgvmVmsaImports);
+            return Err(SnpError::InvalidIgvmVmsaImports);
         };
         if import.range.start() != context.gpa || import.range.len() != hvdef::HV_PAGE_SIZE {
-            return Err(KvmError::InvalidSnpIgvmVmsaImports);
+            return Err(SnpError::InvalidIgvmVmsaImports);
         }
     }
     if imports.next().is_some() {
-        return Err(KvmError::InvalidSnpIgvmVmsaImports);
+        return Err(SnpError::InvalidIgvmVmsaImports);
     }
 
     let contexts_are_ordered = config
@@ -400,7 +455,7 @@ fn validate_snp_igvm_vmsa_imports(
         _ => !saw_vmsa,
     });
     if !contexts_are_ordered || !vmsa_is_suffix {
-        return Err(KvmError::UnsupportedSnpIgvmVmsaOrder);
+        return Err(SnpError::UnsupportedIgvmVmsaOrder);
     }
 
     Ok(())
@@ -477,7 +532,7 @@ fn table_from_vmsa(table: x86defs::snp::SevSelector) -> kvm::kvm_dtable {
 fn set_snp_igvm_vmsa_state(
     kvm_vp: &kvm::Processor<'_>,
     vmsa: &x86defs::snp::SevVmsa,
-) -> Result<(), KvmError> {
+) -> Result<(), SnpError> {
     let regs = kvm::kvm_regs {
         rax: vmsa.rax,
         rbx: vmsa.rbx,
@@ -550,29 +605,29 @@ fn set_snp_igvm_vmsa_state(
 fn validate_snp_bsp_register_state(
     regs: &kvm::kvm_regs,
     sregs: &kvm::kvm_sregs,
-) -> Result<(), KvmError> {
+) -> Result<(), SnpError> {
     const REQUIRED_CR0: u64 = x86defs::X64_CR0_PE | x86defs::X64_CR0_PG;
     const REQUIRED_CR4: u64 = x86defs::X64_CR4_PAE;
     const REQUIRED_EFER: u64 =
         x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA | x86defs::X64_EFER_NXE;
 
     if sregs.cr0 & REQUIRED_CR0 != REQUIRED_CR0 {
-        return Err(KvmError::InvalidState("invalid SNP BSP CR0"));
+        return Err(SnpError::InvalidBspState("CR0"));
     }
     if sregs.cr3 == 0 {
-        return Err(KvmError::InvalidState("invalid SNP BSP CR3"));
+        return Err(SnpError::InvalidBspState("CR3"));
     }
     if sregs.cr4 & REQUIRED_CR4 != REQUIRED_CR4 {
-        return Err(KvmError::InvalidState("invalid SNP BSP CR4"));
+        return Err(SnpError::InvalidBspState("CR4"));
     }
     if sregs.efer & REQUIRED_EFER != REQUIRED_EFER {
-        return Err(KvmError::InvalidState("invalid SNP BSP EFER"));
+        return Err(SnpError::InvalidBspState("EFER"));
     }
     if sregs.cs.present == 0 || sregs.cs.l == 0 {
-        return Err(KvmError::InvalidState("invalid SNP BSP CS"));
+        return Err(SnpError::InvalidBspState("CS"));
     }
     if regs.rip == 0 {
-        return Err(KvmError::InvalidState("invalid SNP BSP RIP"));
+        return Err(SnpError::InvalidBspState("RIP"));
     }
 
     tracing::debug!(
@@ -611,9 +666,9 @@ fn write_snp_cpuid_page(
     cpuid: &[kvm::kvm_cpuid_entry2],
     initial_xcr0: u64,
     initial_xss: u64,
-) -> Result<(), KvmError> {
+) -> Result<(), SnpError> {
     if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64 {
-        return Err(KvmError::InvalidSnpLaunchRange);
+        return Err(SnpError::InvalidLaunchRange);
     }
 
     let cpuid = cpuid
@@ -625,7 +680,7 @@ fn write_snp_cpuid_page(
         })
         .collect::<Vec<_>>();
     if cpuid.len() > SNP_CPUID_COUNT_MAX {
-        return Err(KvmError::TooManySnpCpuidEntries(cpuid.len()));
+        return Err(SnpError::TooManyCpuidEntries(cpuid.len()));
     }
 
     let page = unsafe { std::slice::from_raw_parts_mut(page, page_len as usize) };
@@ -677,10 +732,12 @@ fn sanitize_snp_cpuid_entry(entry: &mut kvm::kvm_cpuid_entry2) {
 }
 
 /// Converts a generic private-slot lookup failure into the SNP launch error.
-fn map_snp_private_range_error(err: KvmError) -> KvmError {
+fn map_snp_private_range_error(err: MemoryError) -> SnpError {
     match err {
-        KvmError::InvalidPrivateMemoryRange => KvmError::InvalidSnpLaunchRange,
-        err => err,
+        MemoryError::InvalidPrivateMemoryRange | MemoryError::InvalidMapGpaRange => {
+            SnpError::InvalidLaunchRange
+        }
+        err => SnpError::Memory(err),
     }
 }
 
@@ -793,7 +850,7 @@ mod tests {
         let missing = [page_import(0x1000, InitialPageImportType::Normal)];
         assert!(matches!(
             validate_snp_igvm_vmsa_imports(&missing, &config),
-            Err(KvmError::InvalidSnpIgvmVmsaImports)
+            Err(SnpError::InvalidIgvmVmsaImports)
         ));
     }
 
@@ -808,7 +865,7 @@ mod tests {
 
         assert!(matches!(
             validate_snp_igvm_vmsa_imports(&pages, &config),
-            Err(KvmError::UnsupportedSnpIgvmVmsaOrder)
+            Err(SnpError::UnsupportedIgvmVmsaOrder)
         ));
     }
 
@@ -827,7 +884,7 @@ mod tests {
                 snp_config(valid_vmsa_page(features)),
                 0,
             ),
-            Err(KvmError::UnsupportedSnpVmsaFeatures(bits)) if bits == supported
+            Err(SnpError::UnsupportedVmsaFeatures(bits)) if bits == supported
         ));
     }
 
@@ -863,7 +920,7 @@ mod tests {
                 ]),
                 u64::MAX,
             ),
-            Err(KvmError::InvalidSnpIgvmVmsa(
+            Err(SnpError::InvalidIgvmVmsa(
                 "VP contexts have inconsistent VMSA features"
             ))
         ));
@@ -987,7 +1044,7 @@ mod tests {
         cpuid.last_mut().unwrap().eax = 1;
         assert!(matches!(
             write_snp_cpuid_page(page.as_mut_ptr(), page.len() as u64, &cpuid, 1, 0),
-            Err(KvmError::TooManySnpCpuidEntries(count)) if count == SNP_CPUID_COUNT_MAX + 1
+            Err(SnpError::TooManyCpuidEntries(count)) if count == SNP_CPUID_COUNT_MAX + 1
         ));
     }
 }

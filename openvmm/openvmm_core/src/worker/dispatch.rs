@@ -1026,6 +1026,7 @@ impl InitializedVm {
                 hv_config,
                 vmtime: &vmtime_source,
                 isolation: partition_isolation,
+                snp_disable_cpuid_offload: cfg.hypervisor.snp_disable_cpuid_offload,
                 nested_virt: cfg.hypervisor.nested_virt,
             })
             .context("failed to create the prototype partition")?;
@@ -1313,6 +1314,14 @@ impl InitializedVm {
             .attach_partition(Vtl::Vtl0, &partition.memory_mapper(Vtl::Vtl0), None)
             .await
             .context("failed to attach memory to the partition")?;
+
+        if cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Snp) {
+            memory_manager
+                .client()
+                .set_host_access(Some(partition.memory_mapper(Vtl::Vtl0)))
+                .await
+                .context("failed to install SNP host-access fault handler")?;
+        }
 
         if cfg.hypervisor.with_vtl2.is_some() {
             memory_manager
@@ -3087,6 +3096,7 @@ impl LoadedVmInner {
                 ref initrd,
                 ref cmdline,
                 enable_serial,
+                snp_restricted_injection,
                 boot_mode,
             } => {
                 match boot_mode {
@@ -3102,6 +3112,7 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
                     snp_c_bit: self.partition.caps().snp_c_bit,
+                    snp_restricted_injection,
                 };
                 super::vm_loaders::linux::load_linux_x86(
                     &kernel_config,
@@ -3136,6 +3147,7 @@ impl LoadedVmInner {
                 ref initrd,
                 ref cmdline,
                 enable_serial,
+                snp_restricted_injection: _,
                 boot_mode,
             } => {
                 use openvmm_defs::config::LinuxDirectBootMode;
@@ -3147,6 +3159,7 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
                     snp_c_bit: None,
+                    snp_restricted_injection: false,
                 };
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
@@ -3947,6 +3960,11 @@ impl LoadedVm {
     }
 
     async fn reset(&mut self, reload_firmware: bool) -> anyhow::Result<()> {
+        // TODO: Support reset in isolated partitions.
+        if reload_firmware && self.inner.hypervisor_cfg.with_isolation.is_some() {
+            anyhow::bail!("firmware reload reset is not supported for isolated VMs");
+        }
+
         let resume = self.pause().await;
 
         self.state_units.reset().await?;

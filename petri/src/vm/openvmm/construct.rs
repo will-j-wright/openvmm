@@ -688,6 +688,7 @@ impl PetriVmConfigOpenVmm {
                     None => None,
                     Some(IsolationType::Tdx) => anyhow::bail!("unsupported isolation type"),
                 },
+                snp_disable_cpuid_offload: false,
                 nested_virt: false,
             },
             vmbus: if properties.no_vmbus {
@@ -950,6 +951,7 @@ impl PetriVmConfigSetupCore<'_> {
                     initrd: Some(initrd),
                     cmdline,
                     enable_serial: self.enable_serial,
+                    snp_restricted_injection: false,
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
                 }
             }

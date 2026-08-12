@@ -1386,6 +1386,7 @@ async fn vm_config_from_command_line(
             initrd: initrd.map(Into::into),
             cmdline,
             enable_serial: any_serial_configured,
+            snp_restricted_injection: opt.snp_restricted_injection,
             boot_mode: if opt.device_tree {
                 openvmm_defs::config::LinuxDirectBootMode::DeviceTree
             } else {
@@ -2033,6 +2034,7 @@ async fn vm_config_from_command_line(
                 },
             }),
             with_isolation,
+            snp_disable_cpuid_offload: opt.snp_disable_cpuid_offload,
             nested_virt: opt.nested_virt,
         },
         #[cfg(windows)]
