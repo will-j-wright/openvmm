@@ -692,13 +692,21 @@ impl From<OfferParams> for OfferParamsInternal {
                 flags.set_enumerate_device_interface(true);
                 user_defined = interface_user_defined;
             }
-            ChannelType::Pipe { message_mode } => {
+            ChannelType::Pipe {
+                message_mode,
+                user_defined: pipe_user_defined,
+                pipe_flags,
+            } => {
                 flags.set_enumerate_device_interface(true);
                 flags.set_named_pipe_mode(true);
-                user_defined.as_pipe_params_mut().pipe_type = if message_mode {
-                    protocol::PipeType::MESSAGE
-                } else {
-                    protocol::PipeType::BYTE
+                *user_defined.as_pipe_params_mut() = protocol::PipeUserDefinedParameters {
+                    pipe_type: if message_mode {
+                        protocol::PipeType::MESSAGE
+                    } else {
+                        protocol::PipeType::BYTE
+                    },
+                    user_defined: pipe_user_defined,
+                    flags: pipe_flags,
                 };
             }
             ChannelType::HvSocket {

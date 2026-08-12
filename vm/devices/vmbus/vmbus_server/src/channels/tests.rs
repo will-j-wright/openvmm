@@ -14,6 +14,31 @@ use vmbus_core::protocol::TargetInfo;
 use zerocopy::FromBytes;
 
 #[test]
+fn pipe_offer_data_is_encoded_in_user_defined_data() {
+    let pipe_flags = protocol::PipeFlags::new().with_gpa_direct(true);
+    let user_defined = protocol::PipeUserDefinedData::from([0x5a; 112]);
+    let params: OfferParamsInternal = OfferParams {
+        channel_type: ChannelType::Pipe {
+            message_mode: true,
+            user_defined,
+            pipe_flags,
+        },
+        ..Default::default()
+    }
+    .into();
+
+    assert_eq!(
+        params.user_defined.as_pipe_params().pipe_type,
+        protocol::PipeType::MESSAGE
+    );
+    assert_eq!(
+        params.user_defined.as_pipe_params().user_defined,
+        user_defined
+    );
+    assert_eq!(params.user_defined.as_pipe_params().flags, pipe_flags);
+}
+
+#[test]
 fn test_version_negotiation_not_supported() {
     let mut env = TestEnv::new();
 
