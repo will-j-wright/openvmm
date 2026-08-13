@@ -15,7 +15,7 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 const IGVM_PAGE_SIZE_BYTES: u64 = 4096;
-const X64_PAGE_TABLE_ADDRESS_BIT_RANGE: std::ops::RangeInclusive<u8> = 32..=51;
+const X64_PAGE_TABLE_ADDRESS_BIT_RANGE: std::ops::RangeInclusive<u8> = 12..=51;
 
 /// The UEFI config type to pass to the UEFI loader.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
@@ -233,7 +233,7 @@ impl std::fmt::Display for ImageValidationError {
             ),
             Self::InvalidCBitPosition { c_bit_position } => write!(
                 f,
-                "c_bit_position {c_bit_position} is outside the supported range 32..=51"
+                "c_bit_position {c_bit_position} is outside the supported range 12..=51"
             ),
         }
     }
@@ -549,7 +549,7 @@ mod test {
 
     #[test]
     fn snp_linux_direct_rejects_invalid_c_bit_positions() {
-        for c_bit_position in [31, 52] {
+        for c_bit_position in [11, 52] {
             let image = snp_linux_direct_image(false, 1, 40960, c_bit_position);
 
             assert_eq!(

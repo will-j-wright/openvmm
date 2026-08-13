@@ -183,6 +183,13 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
             page_end <= self.ram_page_count,
             "{debug_tag} lies outside the configured RAM layout"
         );
+        if let Some(page_number) = (page_base..page_end).find(|page| self.pages.contains_key(page))
+        {
+            bail!(
+                "{debug_tag} overlaps an existing import at GPA {:#x}",
+                page_number * PAGE_SIZE
+            );
+        }
 
         for page_offset in 0..page_count {
             let data_start = (page_offset * PAGE_SIZE) as usize;
@@ -195,18 +202,13 @@ impl ImageLoad<X86Register> for TestIgvmImporter {
                 Vec::new()
             };
             let page_number = page_base + page_offset;
-            let previous = self.pages.insert(
+            self.pages.insert(
                 page_number,
                 ImportedPage {
                     acceptance,
                     data: page_data,
                     tag: debug_tag,
                 },
-            );
-            ensure!(
-                previous.is_none(),
-                "{debug_tag} overlaps an existing import at GPA {:#x}",
-                page_number * PAGE_SIZE
             );
         }
         Ok(())
@@ -912,5 +914,30 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(vp_indexes, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn overlapping_import_does_not_mutate_existing_pages() {
+        let mut importer = TestIgvmImporter::new(4, 51);
+        importer
+            .import_pages(1, 1, "first", BootPageAcceptance::Exclusive, &[0xaa])
+            .unwrap();
+
+        let error = importer
+            .import_pages(
+                0,
+                2,
+                "overlap",
+                BootPageAcceptance::Exclusive,
+                &[0xbb; PAGE_SIZE as usize * 2],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("overlaps an existing import"));
+        assert_eq!(importer.pages.len(), 1);
+        assert!(!importer.pages.contains_key(&0));
+        let existing = &importer.pages[&1];
+        assert_eq!(existing.tag, "first");
+        assert_eq!(existing.data, [0xaa]);
     }
 }
