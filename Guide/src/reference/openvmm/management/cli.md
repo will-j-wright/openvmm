@@ -318,6 +318,13 @@ complex name:
   this via the ACPI `_PXM` object. When omitted, no `_PXM` is emitted
   and the guest uses its default allocation policy.
 
+By default, PCIe ECAM is placed above 4 GiB to preserve low MMIO space for
+device BARs. Use `--pcie-ecam-below-4gb` to place every PCI segment's ECAM in
+32-bit MMIO instead. This compatibility workaround is intended for direct-boot
+guest kernels that cannot discover high ECAM without firmware interfaces
+available during a conventional boot. The flag defaults to off and requires
+`--pcie-root-complex`.
+
 ### Root port and switch options
 
 `--pcie-root-port` accepts optional comma-separated options after the port
