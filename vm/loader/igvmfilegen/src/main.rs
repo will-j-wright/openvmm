@@ -552,7 +552,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
     let has_snp_linux_direct = igvm_config
         .guest_configs
         .iter()
-        .any(|config| matches!(config.image, Image::SnpLinuxDirect { .. }));
+        .any(|config| matches!(&config.image, Image::SnpLinuxDirect { .. }));
     if has_snp_linux_direct && igvm_config.guest_configs.len() != 1 {
         bail!("snp_linux_direct must be the only guest config in an IGVM file");
     }
@@ -632,7 +632,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                     platform: IgvmPlatformType::SEV_SNP,
                     svn: config.guest_svn,
                     debug_enabled: policy.debug() == 1,
-                    snp_identity: Some(if matches!(config.image, Image::SnpLinuxDirect { .. }) {
+                    snp_identity: Some(if matches!(&config.image, Image::SnpLinuxDirect { .. }) {
                         snp_id_block::SnpImageIdentity::LINUX_DIRECT
                     } else {
                         snp_id_block::SnpImageIdentity::OPENHCL

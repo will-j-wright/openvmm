@@ -680,7 +680,7 @@ fn build_complete_ram_directives(
     processor_count: u32,
     ram_page_count: u64,
 ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, String)> {
-    let mut directives = Vec::with_capacity(ram_page_count as usize + processor_count as usize);
+    let mut directives = Vec::with_capacity(ram_page_count as usize + processor_count as usize + 1);
     let mut map_entries = Vec::new();
 
     for page in 0..ram_page_count {
