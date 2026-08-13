@@ -189,6 +189,7 @@ impl Manifest {
             floppy_disks: config.floppy_disks,
             ide_disks: config.ide_disks,
             pcie_root_complexes: config.pcie_root_complexes,
+            pcie_ecam_below_4gb: config.pcie_ecam_below_4gb,
             pcie_devices: config.pcie_devices,
             pcie_switches: config.pcie_switches,
             pcie_generic_initiators: config.pcie_generic_initiators,
@@ -232,6 +233,7 @@ pub struct Manifest {
     floppy_disks: Vec<FloppyDiskConfig>,
     ide_disks: Vec<IdeDeviceConfig>,
     pcie_root_complexes: Vec<PcieRootComplexConfig>,
+    pcie_ecam_below_4gb: bool,
     pcie_devices: Vec<PcieDeviceConfig>,
     pcie_switches: Vec<PcieSwitchConfig>,
     pcie_generic_initiators: Vec<openvmm_defs::config::PcieGenericInitiatorConfig>,
@@ -1129,6 +1131,7 @@ impl InitializedVm {
             layout: cfg.layout.clone(),
             pcie_root_complexes: &cfg.pcie_root_complexes,
             virtio_mmio_count,
+            pcie_ecam_below_4gb: cfg.pcie_ecam_below_4gb,
             vtl2_layout,
             ram_start_address,
             vtl2_framebuffer_size,
@@ -3943,6 +3946,7 @@ impl LoadedVm {
             floppy_disks: vec![],            // TODO
             ide_disks: vec![],               // TODO
             pcie_root_complexes: vec![],     // TODO
+            pcie_ecam_below_4gb: false,      // TODO
             pcie_devices: vec![],            // TODO
             pcie_switches: vec![],           // TODO
             pcie_generic_initiators: vec![], // TODO
