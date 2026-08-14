@@ -436,20 +436,6 @@ struct PlatformMeta {
     snp_identity: Option<snp_id_block::SnpImageIdentity>,
 }
 
-struct BuiltGuest {
-    guest: IgvmFile,
-    map: String,
-}
-
-impl From<file_loader::IgvmOutput> for BuiltGuest {
-    fn from(output: file_loader::IgvmOutput) -> Self {
-        Self {
-            guest: output.guest,
-            map: output.map.to_string(),
-        }
-    }
-}
-
 /// Build a sibling path of `output` named `<base>-<isolation><ext>`,
 /// where `base` is `output`'s stem, `<isolation>` is derived from
 /// `meta.platform`, and `ext` includes the leading dot
@@ -658,7 +644,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
             LoaderIsolationType::None => {}
         }
 
-        let igvm_output: BuiltGuest = match &config.image {
+        let igvm_output: file_loader::IgvmOutput = match &config.image {
             Image::SnpLinuxDirect {
                 linux,
                 processor_count,
@@ -702,7 +688,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 let with_paravisor = config.max_vtl == 2;
                 let mut loader = IgvmLoader::<R>::new(with_paravisor, loader_isolation_type);
                 load_image(&mut loader.loader(), &config.image, &resources)?;
-                loader.finalize().context("finalizing loader")?.into()
+                loader.finalize().context("finalizing loader")?
             }
         };
 
@@ -1265,7 +1251,7 @@ fn debug_validate_igvm_file(binary_file: &[u8]) {
 trait IgvmfilegenRegister: IgvmLoaderRegister + 'static {
     fn build_snp_linux_direct(
         params: snp_linux_direct::BuildParams<'_>,
-    ) -> anyhow::Result<BuiltGuest>;
+    ) -> anyhow::Result<file_loader::IgvmOutput>;
 
     fn load_uefi(
         importer: &mut dyn ImageLoad<Self>,
@@ -1303,12 +1289,8 @@ trait IgvmfilegenRegister: IgvmLoaderRegister + 'static {
 impl IgvmfilegenRegister for X86Register {
     fn build_snp_linux_direct(
         params: snp_linux_direct::BuildParams<'_>,
-    ) -> anyhow::Result<BuiltGuest> {
-        let output = snp_linux_direct::build(params)?;
-        Ok(BuiltGuest {
-            guest: output.guest,
-            map: output.map,
-        })
+    ) -> anyhow::Result<file_loader::IgvmOutput> {
+        snp_linux_direct::build(params)
     }
 
     fn load_uefi(
@@ -1370,7 +1352,7 @@ impl IgvmfilegenRegister for X86Register {
 impl IgvmfilegenRegister for Aarch64Register {
     fn build_snp_linux_direct(
         _params: snp_linux_direct::BuildParams<'_>,
-    ) -> anyhow::Result<BuiltGuest> {
+    ) -> anyhow::Result<file_loader::IgvmOutput> {
         bail!("snp_linux_direct is only supported for x64")
     }
 

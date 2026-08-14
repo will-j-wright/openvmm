@@ -10,39 +10,20 @@ use igvm::IgvmDirectiveHeader;
 use igvm::IgvmFile;
 use igvm::IgvmInitializationHeader;
 use igvm::IgvmPlatformHeader;
-use igvm::IgvmRevision;
 use igvm::IgvmSerializer;
-use igvm::snp_defs::SevFeatures;
-use igvm::snp_defs::SevSelector;
-use igvm::snp_defs::SevVmsa;
-use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
-use igvm_defs::IgvmPageDataFlags;
 use igvm_defs::IgvmPageDataType;
 use igvm_defs::IgvmPlatformType;
 use igvm_defs::SnpPolicy;
 use igvmfilegen_config::LinuxImage;
 use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
-use loader::importer::BootPageAcceptance;
-use loader::importer::IgvmParameterType;
-use loader::importer::ImageLoad;
-use loader::importer::IsolationConfig;
-use loader::importer::IsolationType;
-use loader::importer::ParameterAreaIndex;
-use loader::importer::SegmentRegister;
-use loader::importer::StartupMemoryType;
-use loader::importer::TableRegister;
 use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::io::Seek;
-use std::mem::discriminant;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::processor::TopologyBuilder;
-use zerocopy::FromZeros;
 
 const COMPATIBILITY_MASK: u32 = 1;
 const PAGE_SIZE: u64 = igvm_defs::PAGE_SIZE_4K;
@@ -63,217 +44,7 @@ pub struct BuildParams<'a> {
     pub resources: &'a Resources,
 }
 
-pub struct BuildOutput {
-    pub guest: IgvmFile,
-    pub map: String,
-}
-
-#[derive(Debug, Clone)]
-struct ImportedPage {
-    acceptance: BootPageAcceptance,
-    data: Vec<u8>,
-    tag: &'static str,
-}
-
-#[derive(Debug)]
-struct TestIgvmImporter {
-    pages: BTreeMap<u64, ImportedPage>,
-    registers: Vec<X86Register>,
-    ram_page_count: u64,
-    c_bit_mask: u64,
-}
-
-impl TestIgvmImporter {
-    fn new(ram_page_count: u64, c_bit_position: u8) -> Self {
-        Self {
-            pages: BTreeMap::new(),
-            registers: Vec::new(),
-            ram_page_count,
-            c_bit_mask: 1u64 << c_bit_position,
-        }
-    }
-
-    fn finish(
-        self,
-        processor_count: u32,
-    ) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, SevVmsa, String)> {
-        let vmsa = build_vmsa(&self.registers, self.c_bit_mask)?;
-        let (mut directives, map) = build_complete_ram_directives(
-            &self.pages,
-            &vmsa,
-            processor_count,
-            self.ram_page_count,
-        )?;
-        let ram_size = self
-            .ram_page_count
-            .checked_mul(PAGE_SIZE)
-            .context("RAM size overflow")?;
-        directives.insert(
-            0,
-            IgvmDirectiveHeader::RequiredMemory {
-                gpa: 0,
-                compatibility_mask: COMPATIBILITY_MASK,
-                number_of_bytes: ram_size
-                    .try_into()
-                    .context("RAM size does not fit in an IGVM required-memory directive")?,
-                vtl2_protectable: false,
-            },
-        );
-        Ok((directives, vmsa, map))
-    }
-}
-
-impl ImageLoad<X86Register> for TestIgvmImporter {
-    fn isolation_config(&self) -> IsolationConfig {
-        IsolationConfig {
-            paravisor_present: false,
-            isolation_type: IsolationType::Snp,
-            shared_gpa_boundary_bits: None,
-        }
-    }
-
-    fn create_parameter_area(
-        &mut self,
-        _page_base: u64,
-        _page_count: u32,
-        _debug_tag: &str,
-    ) -> anyhow::Result<ParameterAreaIndex> {
-        bail!("IGVM parameter areas are not supported by this fixed image")
-    }
-
-    fn create_parameter_area_with_data(
-        &mut self,
-        _page_base: u64,
-        _page_count: u32,
-        _debug_tag: &str,
-        _initial_data: &[u8],
-    ) -> anyhow::Result<ParameterAreaIndex> {
-        bail!("IGVM parameter areas are not supported by this fixed image")
-    }
-
-    fn import_parameter(
-        &mut self,
-        _parameter_area: ParameterAreaIndex,
-        _byte_offset: u32,
-        _parameter_type: IgvmParameterType,
-    ) -> anyhow::Result<()> {
-        bail!("IGVM parameters are not supported by this fixed image")
-    }
-
-    fn import_pages(
-        &mut self,
-        page_base: u64,
-        page_count: u64,
-        debug_tag: &'static str,
-        acceptance: BootPageAcceptance,
-        data: &[u8],
-    ) -> anyhow::Result<()> {
-        ensure!(page_count != 0, "cannot import an empty page range");
-        let byte_capacity = page_count
-            .checked_mul(PAGE_SIZE)
-            .context("imported page range size overflow")?;
-        ensure!(
-            data.len() as u64 <= byte_capacity,
-            "data for {debug_tag} exceeds its imported page range"
-        );
-        let page_end = page_base
-            .checked_add(page_count)
-            .context("imported page range overflow")?;
-        ensure!(
-            page_end <= self.ram_page_count,
-            "{debug_tag} lies outside the configured RAM layout"
-        );
-        if let Some(page_number) = (page_base..page_end).find(|page| self.pages.contains_key(page))
-        {
-            bail!(
-                "{debug_tag} overlaps an existing import at GPA {:#x}",
-                page_number * PAGE_SIZE
-            );
-        }
-
-        for page_offset in 0..page_count {
-            let data_start = (page_offset * PAGE_SIZE) as usize;
-            let data_end = data
-                .len()
-                .min(data_start.saturating_add(PAGE_SIZE as usize));
-            let page_data = if data_start < data.len() {
-                data[data_start..data_end].to_vec()
-            } else {
-                Vec::new()
-            };
-            let page_number = page_base + page_offset;
-            self.pages.insert(
-                page_number,
-                ImportedPage {
-                    acceptance,
-                    data: page_data,
-                    tag: debug_tag,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn import_vp_register(&mut self, register: X86Register) -> anyhow::Result<()> {
-        ensure!(
-            !self
-                .registers
-                .iter()
-                .any(|existing| discriminant(existing) == discriminant(&register)),
-            "duplicate initial register {register:?}"
-        );
-        self.registers.push(register);
-        Ok(())
-    }
-
-    fn verify_startup_memory_available(
-        &mut self,
-        page_base: u64,
-        page_count: u64,
-        _memory_type: StartupMemoryType,
-    ) -> anyhow::Result<()> {
-        let page_end = page_base
-            .checked_add(page_count)
-            .context("required memory range overflow")?;
-        ensure!(
-            page_end <= self.ram_page_count,
-            "required memory lies outside the configured RAM layout"
-        );
-        Ok(())
-    }
-
-    fn set_vp_context_page(&mut self, _page_base: u64) -> anyhow::Result<()> {
-        bail!("the direct-Linux path must not select a guest-RAM VMSA page")
-    }
-
-    fn relocation_region(
-        &mut self,
-        _gpa: u64,
-        _size_bytes: u64,
-        _relocation_alignment: u64,
-        _minimum_relocation_gpa: u64,
-        _maximum_relocation_gpa: u64,
-        _apply_rip_offset: bool,
-        _apply_gdtr_offset: bool,
-        _vp_index: u16,
-    ) -> anyhow::Result<()> {
-        bail!("relocations are not supported by this fixed image")
-    }
-
-    fn page_table_relocation(
-        &mut self,
-        _page_table_gpa: u64,
-        _size_pages: u64,
-        _used_pages: u64,
-        _vp_index: u16,
-    ) -> anyhow::Result<()> {
-        bail!("page-table relocations are not supported by this fixed image")
-    }
-
-    fn set_imported_regions_config_page(&mut self, _page_base: u64) {}
-}
-
-pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
+pub fn build(params: BuildParams<'_>) -> anyhow::Result<crate::file_loader::IgvmOutput> {
     let BuildParams {
         linux,
         processor_count,
@@ -339,9 +110,19 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         None
     };
 
-    let mut importer = TestIgvmImporter::new(memory_page_count, c_bit_position);
+    let mut loader = crate::file_loader::IgvmLoader::<X86Register>::new_snp_linux_direct(
+        crate::file_loader::SnpLinuxDirectConfig {
+            policy,
+            c_bit_mask: 1u64 << c_bit_position,
+            ram_page_count: memory_page_count,
+            vp_context_count: processor_count,
+            vmsa_page: Some(KVM_VMSA_GPA / PAGE_SIZE),
+            injection_type: crate::vp_context_builder::snp::InjectionType::Normal,
+            import_all_ram: true,
+        },
+    );
     loader::linux::load_x86(
-        &mut importer,
+        &mut loader.loader(),
         &mut kernel,
         initrd_config,
         &linux.command_line,
@@ -364,30 +145,9 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
     )
     .context("loading direct-Linux image")?;
 
-    let (directives, _vmsa, map) = importer.finish(processor_count)?;
     let policy: u64 = policy.into();
-    let platform_headers = vec![IgvmPlatformHeader::SupportedPlatform(
-        IGVM_VHS_SUPPORTED_PLATFORM {
-            compatibility_mask: COMPATIBILITY_MASK,
-            highest_vtl: 0,
-            platform_type: IgvmPlatformType::SEV_SNP,
-            platform_version: igvm_defs::IGVM_SEV_SNP_PLATFORM_VERSION,
-            shared_gpa_boundary: 0,
-        },
-    )];
-    let initialization_headers = vec![IgvmInitializationHeader::GuestPolicy {
-        policy,
-        compatibility_mask: COMPATIBILITY_MASK,
-    }];
-
-    let igvm = IgvmFile::new(
-        IgvmRevision::V1,
-        platform_headers,
-        initialization_headers,
-        directives,
-    )
-    .context("constructing IGVM")?;
-    let serializer = IgvmSerializer::new(&igvm).context("measuring SNP IGVM")?;
+    let output = loader.finalize().context("finalizing SNP IGVM")?;
+    let serializer = IgvmSerializer::new(&output.guest).context("measuring SNP IGVM")?;
     let launch_digest: [u8; 48] = serializer
         .measurement_for(IgvmPlatformType::SEV_SNP)
         .context("missing SNP launch measurement")?
@@ -410,7 +170,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<BuildOutput> {
         1u64 << c_bit_position,
     )?;
 
-    Ok(BuildOutput { guest: igvm, map })
+    Ok(output)
 }
 
 fn validate_generated_igvm(
@@ -572,257 +332,66 @@ fn validate_generated_igvm(
     Ok(())
 }
 
-fn build_vmsa(registers: &[X86Register], c_bit_mask: u64) -> anyhow::Result<SevVmsa> {
-    let mut vmsa = SevVmsa::new_zeroed();
-    vmsa.efer = x86defs::X64_EFER_SVME;
-    vmsa.sev_features = SevFeatures::new().with_snp(true);
-    vmsa.virtual_tom = 0;
-    vmsa.xcr0 = 1;
-    vmsa.rflags = u64::from(x86defs::RFlags::at_reset());
-    vmsa.dr6 = 0xffff_0ff0;
-    vmsa.dr7 = 0x400;
-    vmsa.tr = segment_selector(SegmentRegister {
-        base: 0,
-        limit: 0xffff,
-        selector: 0,
-        attributes: 0x8b,
-    });
-    vmsa.ldtr = segment_selector(SegmentRegister {
-        base: 0,
-        limit: 0xffff,
-        selector: 0,
-        attributes: 0x82,
-    });
-    vmsa.idtr = table_selector(TableRegister {
-        base: 0,
-        limit: 0xffff,
-    });
-    vmsa.x87_fcw = x86defs::xsave::INIT_FCW;
-    vmsa.mxcsr = x86defs::xsave::DEFAULT_MXCSR;
-
-    for &register in registers {
-        match register {
-            X86Register::Gdtr(value) => vmsa.gdtr = table_selector(value),
-            X86Register::Idtr(value) => vmsa.idtr = table_selector(value),
-            X86Register::Ds(value) => vmsa.ds = segment_selector(value),
-            X86Register::Es(value) => vmsa.es = segment_selector(value),
-            X86Register::Fs(value) => vmsa.fs = segment_selector(value),
-            X86Register::Gs(value) => vmsa.gs = segment_selector(value),
-            X86Register::Ss(value) => vmsa.ss = segment_selector(value),
-            X86Register::Cs(value) => vmsa.cs = segment_selector(value),
-            X86Register::Tr(value) => vmsa.tr = segment_selector(value),
-            X86Register::Cr0(value) => vmsa.cr0 = value | x86defs::X64_CR0_ET,
-            X86Register::Cr3(value) => vmsa.cr3 = value | c_bit_mask,
-            X86Register::Cr4(value) => vmsa.cr4 = value | x86defs::X64_CR4_MCE,
-            X86Register::Efer(value) => vmsa.efer = value | x86defs::X64_EFER_SVME,
-            X86Register::Pat(value) => vmsa.pat = value,
-            X86Register::Rbp(value) => vmsa.rbp = value,
-            X86Register::Rip(value) => vmsa.rip = value,
-            X86Register::Rsi(value) => vmsa.rsi = value,
-            X86Register::Rsp(value) => vmsa.rsp = value,
-            X86Register::R8(value) => vmsa.r8 = value,
-            X86Register::R9(value) => vmsa.r9 = value,
-            X86Register::R10(value) => vmsa.r10 = value,
-            X86Register::R11(value) => vmsa.r11 = value,
-            X86Register::R12(value) => vmsa.r12 = value,
-            X86Register::Rflags(value) => vmsa.rflags = value,
-            X86Register::MtrrDefType(_)
-            | X86Register::MtrrPhysBase0(_)
-            | X86Register::MtrrPhysMask0(_)
-            | X86Register::MtrrPhysBase1(_)
-            | X86Register::MtrrPhysMask1(_)
-            | X86Register::MtrrPhysBase2(_)
-            | X86Register::MtrrPhysMask2(_)
-            | X86Register::MtrrPhysBase3(_)
-            | X86Register::MtrrPhysMask3(_)
-            | X86Register::MtrrPhysBase4(_)
-            | X86Register::MtrrPhysMask4(_)
-            | X86Register::MtrrFix64k00000(_)
-            | X86Register::MtrrFix16k80000(_)
-            | X86Register::MtrrFix4kE0000(_)
-            | X86Register::MtrrFix4kE8000(_)
-            | X86Register::MtrrFix4kF0000(_)
-            | X86Register::MtrrFix4kF8000(_) => {}
-        }
-    }
-
-    ensure!(vmsa.rip != 0, "Linux loader did not provide an entry point");
-    ensure!(
-        vmsa.cr3 & c_bit_mask != 0,
-        "initial CR3 does not contain the fixed SNP C-bit"
-    );
-    ensure!(
-        !vmsa.sev_features.vtom(),
-        "C-bit image must not enable vTOM"
-    );
-    Ok(vmsa)
-}
-
-fn table_selector(value: TableRegister) -> SevSelector {
-    SevSelector {
-        selector: 0,
-        attrib: 0,
-        limit: value.limit.into(),
-        base: value.base,
-    }
-}
-
-fn segment_selector(value: SegmentRegister) -> SevSelector {
-    SevSelector {
-        selector: value.selector,
-        attrib: (value.attributes & 0xff) | ((value.attributes >> 4) & 0xf00),
-        limit: value.limit,
-        base: value.base,
-    }
-}
-
-fn build_complete_ram_directives(
-    imported: &BTreeMap<u64, ImportedPage>,
-    vmsa: &SevVmsa,
-    processor_count: u32,
-    ram_page_count: u64,
-) -> anyhow::Result<(Vec<IgvmDirectiveHeader>, String)> {
-    let mut directives = Vec::with_capacity(ram_page_count as usize + processor_count as usize + 1);
-    let mut map_entries = Vec::new();
-
-    for page in 0..ram_page_count {
-        let (directive, tag, kind) = match imported.get(&page) {
-            Some(imported) => {
-                let (data_type, flags, kind) = page_data_shape(imported.acceptance)?;
-                (
-                    IgvmDirectiveHeader::PageData {
-                        gpa: page * PAGE_SIZE,
-                        compatibility_mask: COMPATIBILITY_MASK,
-                        flags,
-                        data_type,
-                        data: imported.data.clone(),
-                    },
-                    imported.tag.to_owned(),
-                    kind,
-                )
-            }
-            None => (
-                IgvmDirectiveHeader::PageData {
-                    gpa: page * PAGE_SIZE,
-                    compatibility_mask: COMPATIBILITY_MASK,
-                    flags: IgvmPageDataFlags::new(),
-                    data_type: IgvmPageDataType::NORMAL,
-                    data: Vec::new(),
-                },
-                "accepted-zero-ram".to_owned(),
-                "NORMAL",
-            ),
-        };
-        directives.push(directive);
-        map_entries.push((page, tag, kind));
-    }
-    for vp_index in 0..processor_count {
-        directives.push(IgvmDirectiveHeader::SnpVpContext {
-            gpa: KVM_VMSA_GPA,
-            compatibility_mask: COMPATIBILITY_MASK,
-            vp_index: vp_index
-                .try_into()
-                .context("VP index does not fit in IGVM")?,
-            vmsa: Box::new(*vmsa),
-        });
-        map_entries.push((
-            KVM_VMSA_GPA / PAGE_SIZE,
-            format!("snp-vmsa-vp{vp_index}"),
-            "VMSA",
-        ));
-    }
-
-    ensure!(
-        imported.keys().all(|page| *page < ram_page_count),
-        "an imported page lies outside RAM"
-    );
-    Ok((directives, format_map(&map_entries, ram_page_count)))
-}
-
-fn page_data_shape(
-    acceptance: BootPageAcceptance,
-) -> anyhow::Result<(IgvmPageDataType, IgvmPageDataFlags, &'static str)> {
-    Ok(match acceptance {
-        BootPageAcceptance::Exclusive => {
-            (IgvmPageDataType::NORMAL, IgvmPageDataFlags::new(), "NORMAL")
-        }
-        BootPageAcceptance::ExclusiveUnmeasured => (
-            IgvmPageDataType::NORMAL,
-            IgvmPageDataFlags::new().with_unmeasured(true),
-            "UNMEASURED",
-        ),
-        BootPageAcceptance::SecretsPage => (
-            IgvmPageDataType::SECRETS,
-            IgvmPageDataFlags::new(),
-            "SECRETS",
-        ),
-        BootPageAcceptance::CpuidPage => (
-            IgvmPageDataType::CPUID_DATA,
-            IgvmPageDataFlags::new(),
-            "CPUID",
-        ),
-        BootPageAcceptance::CpuidExtendedStatePage => (
-            IgvmPageDataType::CPUID_XF,
-            IgvmPageDataFlags::new(),
-            "CPUID_XF",
-        ),
-        BootPageAcceptance::Shared => (
-            IgvmPageDataType::NORMAL,
-            IgvmPageDataFlags::new().with_shared(true),
-            "SHARED",
-        ),
-        BootPageAcceptance::VpContext => {
-            bail!("VP context must be emitted as SnpVpContext")
-        }
-    })
-}
-
-fn format_map(entries: &[(u64, String, &'static str)], ram_page_count: u64) -> String {
-    let ram_size = ram_page_count * PAGE_SIZE;
-    let mut output = format!(
-        "IGVM file isolation: SNP (C-bit model)\n\
-         Required memory: 0000000000000000 - {ram_size:016x} ({ram_size:#x} bytes)\n\
-         IGVM file layout:\n"
-    );
-    let mut index = 0;
-    while index < entries.len() {
-        let (start_page, tag, kind) = &entries[index];
-        let mut end = index + 1;
-        while end < entries.len() && entries[end].1 == *tag && entries[end].2 == *kind {
-            end += 1;
-        }
-        let end_page = entries[end - 1].0 + 1;
-        let _ = writeln!(
-            output,
-            "  {:016x} - {:016x} ({:#x} bytes) {} [{}]",
-            start_page * PAGE_SIZE,
-            end_page * PAGE_SIZE,
-            (end_page - start_page) * PAGE_SIZE,
-            tag,
-            kind
-        );
-        index = end;
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_loader::IgvmLoader;
+    use crate::file_loader::SnpLinuxDirectConfig;
+    use crate::vp_context_builder::VpContextBuilder;
+    use crate::vp_context_builder::snp::InjectionType;
+    use crate::vp_context_builder::snp::SnpHardwareContext;
+    use loader::importer::BootPageAcceptance;
+    use loader::importer::ImageLoad;
     use test_with_tracing::test;
 
     const TEST_C_BIT_MASK: u64 = 1 << 51;
 
+    fn test_loader(ram_page_count: u64, vp_context_count: u32) -> IgvmLoader<X86Register> {
+        IgvmLoader::new_snp_linux_direct(SnpLinuxDirectConfig {
+            policy: SnpPolicy::from(0x30000),
+            c_bit_mask: TEST_C_BIT_MASK,
+            ram_page_count,
+            vp_context_count,
+            vmsa_page: Some(KVM_VMSA_GPA / PAGE_SIZE),
+            injection_type: InjectionType::Normal,
+            import_all_ram: true,
+        })
+    }
+
+    fn import_test_registers(importer: &mut dyn ImageLoad<X86Register>) {
+        importer
+            .import_vp_register(X86Register::Rip(0x100000))
+            .unwrap();
+        importer
+            .import_vp_register(X86Register::Cr3(0x4000 | TEST_C_BIT_MASK))
+            .unwrap();
+        importer
+            .import_vp_register(X86Register::Cr0(x86defs::X64_CR0_PE | x86defs::X64_CR0_PG))
+            .unwrap();
+        importer
+            .import_vp_register(X86Register::Cr4(x86defs::X64_CR4_PAE))
+            .unwrap();
+        importer
+            .import_vp_register(X86Register::Efer(
+                x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA,
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn vmsa_uses_c_bit_model() {
-        let registers = [
+        let mut context =
+            SnpHardwareContext::new_linux_direct(TEST_C_BIT_MASK, InjectionType::Normal);
+        for register in [
             X86Register::Rip(0x100000),
             X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
             X86Register::Cr0(x86defs::X64_CR0_PE | x86defs::X64_CR0_PG),
             X86Register::Cr4(x86defs::X64_CR4_PAE),
             X86Register::Efer(x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA),
-        ];
-        let vmsa = build_vmsa(&registers, TEST_C_BIT_MASK).unwrap();
+        ] {
+            context.import_vp_register(register);
+        }
+        let vmsa = context.vmsa();
         assert_eq!(vmsa.rip, 0x100000);
         assert_ne!(vmsa.cr3 & TEST_C_BIT_MASK, 0);
         assert_ne!(vmsa.cr0 & x86defs::X64_CR0_ET, 0);
@@ -845,27 +414,24 @@ mod tests {
 
     #[test]
     fn complete_ram_has_one_directive_per_page() {
-        let mut imported = BTreeMap::new();
-        imported.insert(
-            1,
-            ImportedPage {
-                acceptance: BootPageAcceptance::SecretsPage,
-                data: Vec::new(),
-                tag: "secret",
-            },
-        );
-        let vmsa = build_vmsa(
-            &[
-                X86Register::Rip(0x100000),
-                X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
-            ],
-            TEST_C_BIT_MASK,
-        )
-        .unwrap();
-        let (directives, _) = build_complete_ram_directives(&imported, &vmsa, 1, 4).unwrap();
-        assert_eq!(directives.len(), 5);
+        let mut loader = test_loader(4, 1);
+        {
+            let mut importer = loader.loader();
+            importer
+                .import_pages(1, 1, "secret", BootPageAcceptance::SecretsPage, &[])
+                .unwrap();
+            import_test_registers(&mut importer);
+        }
+        let output = loader.finalize().unwrap();
+        let directives = output.guest.directives();
+
+        assert_eq!(directives.len(), 6);
         assert!(matches!(
             directives[0],
+            IgvmDirectiveHeader::RequiredMemory { .. }
+        ));
+        assert!(matches!(
+            directives[1],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::NORMAL,
                 ref data,
@@ -873,21 +439,21 @@ mod tests {
             } if data.is_empty()
         ));
         assert!(matches!(
-            directives[1],
+            directives[2],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::SECRETS,
                 ..
             }
         ));
         assert!(matches!(
-            directives[2],
+            directives[3],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::NORMAL,
                 ..
             }
         ));
         assert!(matches!(
-            directives[4],
+            directives[5],
             IgvmDirectiveHeader::SnpVpContext {
                 gpa: KVM_VMSA_GPA,
                 ..
@@ -897,16 +463,12 @@ mod tests {
 
     #[test]
     fn complete_ram_emits_one_vmsa_per_processor() {
-        let vmsa = build_vmsa(
-            &[
-                X86Register::Rip(0x100000),
-                X86Register::Cr3(0x4000 | TEST_C_BIT_MASK),
-            ],
-            TEST_C_BIT_MASK,
-        )
-        .unwrap();
-        let (directives, _) = build_complete_ram_directives(&BTreeMap::new(), &vmsa, 4, 1).unwrap();
-        let vp_indexes = directives
+        let mut loader = test_loader(1, 4);
+        import_test_registers(&mut loader.loader());
+        let output = loader.finalize().unwrap();
+        let vp_indexes = output
+            .guest
+            .directives()
             .iter()
             .filter_map(|directive| match directive {
                 IgvmDirectiveHeader::SnpVpContext { vp_index, .. } => Some(*vp_index),
@@ -918,26 +480,35 @@ mod tests {
 
     #[test]
     fn overlapping_import_does_not_mutate_existing_pages() {
-        let mut importer = TestIgvmImporter::new(4, 51);
-        importer
-            .import_pages(1, 1, "first", BootPageAcceptance::Exclusive, &[0xaa])
+        let mut loader = test_loader(4, 1);
+        {
+            let mut importer = loader.loader();
+            importer
+                .import_pages(1, 1, "first", BootPageAcceptance::Exclusive, &[0xaa])
+                .unwrap();
+            let error = importer
+                .import_pages(
+                    0,
+                    2,
+                    "overlap",
+                    BootPageAcceptance::Exclusive,
+                    &[0xbb; PAGE_SIZE as usize * 2],
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("overlaps"));
+            import_test_registers(&mut importer);
+        }
+
+        let output = loader.finalize().unwrap();
+        let page = output
+            .guest
+            .directives()
+            .iter()
+            .find_map(|directive| match directive {
+                IgvmDirectiveHeader::PageData { gpa, data, .. } if *gpa == PAGE_SIZE => Some(data),
+                _ => None,
+            })
             .unwrap();
-
-        let error = importer
-            .import_pages(
-                0,
-                2,
-                "overlap",
-                BootPageAcceptance::Exclusive,
-                &[0xbb; PAGE_SIZE as usize * 2],
-            )
-            .unwrap_err();
-
-        assert!(error.to_string().contains("overlaps an existing import"));
-        assert_eq!(importer.pages.len(), 1);
-        assert!(!importer.pages.contains_key(&0));
-        let existing = &importer.pages[&1];
-        assert_eq!(existing.tag, "first");
-        assert_eq!(existing.data, [0xaa]);
+        assert_eq!(page, &[0xaa]);
     }
 }

@@ -129,7 +129,6 @@ pub enum Image {
         /// The Linux image to load.
         linux: LinuxImage,
         /// The number of virtual processors in the guest.
-        #[serde(default = "default_processor_count")]
         processor_count: u32,
         /// The number of pages in the guest.
         memory_page_count: u64,
@@ -203,46 +202,27 @@ impl Image {
 }
 
 /// Error returned when an image configuration contains invalid intrinsic fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum ImageValidationError {
     /// The image requests no virtual processors.
+    #[error("processor_count must be nonzero")]
     ZeroProcessorCount,
     /// The image requests no guest memory.
+    #[error("memory_page_count must be nonzero")]
     ZeroMemoryPageCount,
     /// The requested memory byte count cannot be represented by an IGVM
     /// required-memory directive.
+    #[error("memory_page_count {memory_page_count} has a byte count that does not fit in u32")]
     MemoryByteCountTooLarge {
         /// The invalid number of 4-KiB pages.
         memory_page_count: u64,
     },
     /// The SNP C-bit is outside the address bits available in x64 page tables.
+    #[error("c_bit_position {c_bit_position} is outside the supported range 12..=51")]
     InvalidCBitPosition {
         /// The invalid C-bit position.
         c_bit_position: u8,
     },
-}
-
-impl std::fmt::Display for ImageValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::ZeroProcessorCount => write!(f, "processor_count must be nonzero"),
-            Self::ZeroMemoryPageCount => write!(f, "memory_page_count must be nonzero"),
-            Self::MemoryByteCountTooLarge { memory_page_count } => write!(
-                f,
-                "memory_page_count {memory_page_count} has a byte count that does not fit in u32"
-            ),
-            Self::InvalidCBitPosition { c_bit_position } => write!(
-                f,
-                "c_bit_position {c_bit_position} is outside the supported range 12..=51"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ImageValidationError {}
-
-const fn default_processor_count() -> u32 {
-    1
 }
 
 impl LinuxImage {

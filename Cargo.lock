@@ -3876,6 +3876,7 @@ dependencies = [
  "product_policy",
  "serde",
  "serde_json",
+ "thiserror 2.0.16",
 ]
 
 [[package]]
