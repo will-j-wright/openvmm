@@ -260,12 +260,6 @@ jobs:
       ${{ parameters.verbose }}
       EOF
     displayName: 🌼🛫 Initialize job
-  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_rust 0
-    displayName: install Rust
-  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_dist_pkg 0
-    displayName: checking if packages need to be installed
-  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_dist_pkg 1
-    displayName: installing packages
   - bash: |-
       set -e
       $(FLOWEY_BIN) e 21 flowey_lib_common::git_checkout 0
@@ -292,8 +286,16 @@ jobs:
       $(FLOWEY_BIN) e 21 flowey_lib_common::system_info 0
       $(FLOWEY_BIN) e 21 flowey_lib_hvlite::git_checkout_openvmm_repo 0
     displayName: print system info
-  - bash: $(FLOWEY_BIN) e 21 flowey_lib_hvlite::assemble_openvmm_source_release 0
-    displayName: assemble OpenVMM source archive
+  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_rust 0
+    displayName: install Rust
+  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_rust 1
+    displayName: detect active toolchain
+  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_dist_pkg 0
+    displayName: checking if packages need to be installed
+  - bash: $(FLOWEY_BIN) e 21 flowey_lib_common::install_dist_pkg 1
+    displayName: installing packages
+  - bash: $(FLOWEY_BIN) e 21 flowey_lib_hvlite::assemble_openvmm_vendor_release 0
+    displayName: assemble OpenVMM vendor archive
   - bash: $(FLOWEY_BIN) e 21 flowey_lib_hvlite::_jobs::check_distro_build 0
     displayName: build openvmm in a distribution configuration
 - job: job15

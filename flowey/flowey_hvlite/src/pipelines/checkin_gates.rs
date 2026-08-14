@@ -1777,7 +1777,7 @@ impl IntoPipeline for CheckinGatesCli {
             }
         }
 
-        // Build the assembled source archive without the repository's
+        // Build the vendored source tree without the repository's
         // `.packages/` provisioning, as a Linux distribution would.
         {
             let distro_build_job = pipeline

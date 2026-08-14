@@ -6465,18 +6465,6 @@ jobs:
         ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
-    - name: add default cargo home to path
-      run: flowey e 29 flowey_lib_common::install_rust 0
-      shell: bash
-    - name: install Rust
-      run: flowey e 29 flowey_lib_common::install_rust 1
-      shell: bash
-    - name: checking if packages need to be installed
-      run: flowey e 29 flowey_lib_common::install_dist_pkg 0
-      shell: bash
-    - name: installing packages
-      run: flowey e 29 flowey_lib_common::install_dist_pkg 1
-      shell: bash
     - name: check if openvmm needs to be cloned
       run: |-
         flowey e 29 flowey_lib_common::git_checkout 0
@@ -6503,8 +6491,23 @@ jobs:
         flowey e 29 flowey_lib_common::system_info 0
         flowey e 29 flowey_lib_hvlite::git_checkout_openvmm_repo 0
       shell: bash
-    - name: assemble OpenVMM source archive
-      run: flowey e 29 flowey_lib_hvlite::assemble_openvmm_source_release 0
+    - name: add default cargo home to path
+      run: flowey e 29 flowey_lib_common::install_rust 0
+      shell: bash
+    - name: install Rust
+      run: flowey e 29 flowey_lib_common::install_rust 1
+      shell: bash
+    - name: detect active toolchain
+      run: flowey e 29 flowey_lib_common::install_rust 2
+      shell: bash
+    - name: checking if packages need to be installed
+      run: flowey e 29 flowey_lib_common::install_dist_pkg 0
+      shell: bash
+    - name: installing packages
+      run: flowey e 29 flowey_lib_common::install_dist_pkg 1
+      shell: bash
+    - name: assemble OpenVMM vendor archive
+      run: flowey e 29 flowey_lib_hvlite::assemble_openvmm_vendor_release 0
       shell: bash
     - name: build openvmm in a distribution configuration
       run: flowey e 29 flowey_lib_hvlite::_jobs::check_distro_build 0
