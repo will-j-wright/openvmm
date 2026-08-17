@@ -17,6 +17,14 @@ normally creates the resource file that supplies each recipe's binary inputs.
 - SNP C-bit position 51, which is a test-host assumption rather than a portable
   SNP property
 
+The IGVM contains only the BSP VMSA, regardless of processor count. Backends
+are responsible for any AP launch state they require. Current KVM synthesizes
+and measures one additional VMSA for every AP from the reset state configured
+by `virt_kvm`. Those backend-created VMSAs are not part of the IGVM launch
+measurement, so `virt_kvm` does not submit the file's SNP ID block for a
+multi-processor KVM guest. Multi-processor KVM attestation against that ID
+block remains unsupported until KVM accepts userspace-provided VMSAs.
+
 To build it manually, create a resources file containing absolute paths:
 
 ```json

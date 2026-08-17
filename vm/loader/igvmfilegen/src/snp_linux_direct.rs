@@ -115,7 +115,6 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<crate::file_loader::Igvm
             policy,
             c_bit_mask: 1u64 << c_bit_position,
             ram_page_count: memory_page_count,
-            vp_context_count: processor_count,
             vmsa_page: Some(KVM_VMSA_GPA / PAGE_SIZE),
             injection_type: crate::vp_context_builder::snp::InjectionType::Normal,
             import_all_ram: true,
@@ -165,7 +164,6 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<crate::file_loader::Igvm
         &reparsed,
         launch_digest,
         policy,
-        processor_count,
         memory_page_count,
         1u64 << c_bit_position,
     )?;
@@ -177,7 +175,6 @@ fn validate_generated_igvm(
     igvm: &IgvmFile,
     expected_launch_digest: [u8; 48],
     expected_policy: u64,
-    processor_count: u32,
     ram_page_count: u64,
     c_bit_mask: u64,
 ) -> anyhow::Result<()> {
@@ -310,10 +307,7 @@ fn validate_generated_igvm(
         "IGVM does not cover every page of the fixed RAM layout"
     );
     ensure!(required_memory_count == 1, "expected one RequiredMemory");
-    ensure!(
-        next_vmsa_index == processor_count,
-        "expected one SNP VMSA per processor"
-    );
+    ensure!(next_vmsa_index == 1, "expected one SNP BSP VMSA");
     ensure!(secrets_count == 1, "expected one SNP secrets page");
     ensure!(cpuid_count == 1, "expected one SNP CPUID page");
 
@@ -346,12 +340,11 @@ mod tests {
 
     const TEST_C_BIT_MASK: u64 = 1 << 51;
 
-    fn test_loader(ram_page_count: u64, vp_context_count: u32) -> IgvmLoader<X86Register> {
+    fn test_loader(ram_page_count: u64) -> IgvmLoader<X86Register> {
         IgvmLoader::new_snp_linux_direct(SnpLinuxDirectConfig {
             policy: SnpPolicy::from(0x30000),
             c_bit_mask: TEST_C_BIT_MASK,
             ram_page_count,
-            vp_context_count,
             vmsa_page: Some(KVM_VMSA_GPA / PAGE_SIZE),
             injection_type: InjectionType::Normal,
             import_all_ram: true,
@@ -414,7 +407,7 @@ mod tests {
 
     #[test]
     fn complete_ram_has_one_directive_per_page() {
-        let mut loader = test_loader(4, 1);
+        let mut loader = test_loader(4);
         {
             let mut importer = loader.loader();
             importer
@@ -462,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn complete_ram_emits_one_vmsa_per_processor() {
-        let mut loader = test_loader(1, 4);
+    fn complete_ram_emits_only_the_bsp_vmsa() {
+        let mut loader = test_loader(1);
         import_test_registers(&mut loader.loader());
         let output = loader.finalize().unwrap();
         let vp_indexes = output
@@ -475,12 +468,12 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(vp_indexes, [0, 1, 2, 3]);
+        assert_eq!(vp_indexes, [0]);
     }
 
     #[test]
     fn overlapping_import_does_not_mutate_existing_pages() {
-        let mut loader = test_loader(4, 1);
+        let mut loader = test_loader(4);
         {
             let mut importer = loader.loader();
             importer

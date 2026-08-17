@@ -91,7 +91,6 @@ pub struct SnpLinuxDirectConfig {
     pub policy: SnpPolicy,
     pub c_bit_mask: u64,
     pub ram_page_count: u64,
-    pub vp_context_count: u32,
     pub vmsa_page: Option<u64>,
     pub injection_type: InjectionType,
     pub import_all_ram: bool,
@@ -637,9 +636,8 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
             .filter(|directive| matches!(directive, IgvmDirectiveHeader::SnpVpContext { .. }))
             .count();
         anyhow::ensure!(
-            vmsa_count == config.vp_context_count as usize,
-            "expected {} SNP VMSA contexts, found {vmsa_count}",
-            config.vp_context_count
+            vmsa_count == 1,
+            "expected one SNP BSP VMSA context, found {vmsa_count}"
         );
         Ok(())
     }
@@ -1047,7 +1045,7 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
             padded[..data.len()].copy_from_slice(data);
 
             let vmsa = SevVmsa::read_from_bytes(padded.as_slice()).expect("should be correct size");
-            let vp_context_count = if let Some(config) = self.snp_linux_direct {
+            if let Some(config) = self.snp_linux_direct {
                 anyhow::ensure!(vmsa.rip != 0, "Linux loader did not provide an entry point");
                 anyhow::ensure!(
                     vmsa.cr3 & config.c_bit_mask != 0,
@@ -1057,20 +1055,13 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                     !vmsa.sev_features.vtom() && vmsa.virtual_tom == 0,
                     "C-bit image must not enable vTOM"
                 );
-                config.vp_context_count
-            } else {
-                1
-            };
-            for vp_index in 0..vp_context_count {
-                self.directives.push(IgvmDirectiveHeader::SnpVpContext {
-                    gpa: page_base * PAGE_SIZE_4K,
-                    compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
-                    vp_index: vp_index
-                        .try_into()
-                        .context("VP index does not fit in IGVM")?,
-                    vmsa: Box::new(vmsa),
-                });
             }
+            self.directives.push(IgvmDirectiveHeader::SnpVpContext {
+                gpa: page_base * PAGE_SIZE_4K,
+                compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
+                vp_index: 0,
+                vmsa: Box::new(vmsa),
+            });
         } else {
             for page in page_base..page_base + page_count {
                 let (data_type, flags) = match acceptance {
