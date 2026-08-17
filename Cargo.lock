@@ -3839,6 +3839,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bitfield-struct 0.11.0",
+ "chipset_resources",
  "clap",
  "corim",
  "crypto",
@@ -3857,6 +3858,7 @@ dependencies = [
  "range_map_vec",
  "serde",
  "serde_json",
+ "serial_16550_resources",
  "signature",
  "test_with_tracing",
  "tracing",
@@ -3873,6 +3875,8 @@ dependencies = [
 name = "igvmfilegen_config"
 version = "0.0.0"
 dependencies = [
+ "igvm_defs",
+ "page_table",
  "product_policy",
  "serde",
  "serde_json",

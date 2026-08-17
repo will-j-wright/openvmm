@@ -171,9 +171,10 @@ enum Options {
     ///   and `--id-public-key <key.pem>` (the signer's X.509 certificate or
     ///   SPKI public key, PEM or DER). No private key is held by this tool.
     ///   The guest SVN comes from the signing payload.
-    /// * Temporary key (development/test): pass `--guest-svn <N>` or
-    ///   `--manifest <config.json>` (to source the SVN from the SNP guest
-    ///   config). An ephemeral ECDSA P-384 key signs the block in-process.
+    /// * Temporary key (development/test): pass `--guest-svn <N>` to sign an
+    ///   OpenHCL identity, or `--manifest <config.json>` to source both the SVN
+    ///   and image identity from its SNP guest config. An ephemeral ECDSA P-384
+    ///   key signs the block in-process.
     AddSnpIdBlock {
         /// Input IGVM file path
         #[clap(short, long)]
@@ -181,12 +182,13 @@ enum Options {
         /// Output IGVM file path (can be the same as input to modify in place)
         #[clap(short, long)]
         output: PathBuf,
-        /// Temporary-key mode: guest security version number to embed.
+        /// Temporary-key mode: guest security version number to embed using
+        /// the OpenHCL image identity.
         /// Mutually exclusive with the out-of-band inputs and with `--manifest`.
         #[clap(long, conflicts_with_all = ["manifest", "id_block", "id_signature", "id_public_key"])]
         guest_svn: Option<u32>,
-        /// Temporary-key mode: source the guest SVN from the SNP guest config
-        /// in this manifest instead of `--guest-svn`.
+        /// Temporary-key mode: source the guest SVN and image identity from
+        /// the SNP guest config in this manifest instead of `--guest-svn`.
         #[clap(long, conflicts_with_all = ["guest_svn", "id_block", "id_signature", "id_public_key"])]
         manifest: Option<PathBuf>,
         /// Out-of-band mode: path to the SNP ID block signing payload
@@ -904,17 +906,17 @@ fn add_snp_id_block_command(
             &public_key,
         )?
     } else {
-        // Temporary-key (development/test) mode. The SVN comes from
-        // `--guest-svn` or is sourced from the SNP guest config in `--manifest`.
-        let svn = if let Some(svn) = guest_svn {
-            svn
+        // Temporary-key (development/test) mode. Raw `--guest-svn` preserves
+        // the original OpenHCL behavior; a manifest selects both fields.
+        let (svn, identity) = if let Some(svn) = guest_svn {
+            (svn, snp_id_block::SnpImageIdentity::OPENHCL)
         } else if let Some(manifest_path) = manifest {
             let config: Config = serde_json::from_str(
                 &fs_err::read_to_string(&manifest_path)
                     .with_context(|| format!("reading manifest at {}", manifest_path.display()))?,
             )
             .with_context(|| format!("parsing manifest at {}", manifest_path.display()))?;
-            snp_guest_svn_from_config(&config)?
+            snp_temporary_signing_metadata_from_config(&config)?
         } else {
             bail!(
                 "provide either --guest-svn/--manifest (temporary-key signing) \
@@ -926,30 +928,37 @@ fn add_snp_id_block_command(
             input = %input.display(),
             output = %output.display(),
             guest_svn = svn,
+            ?identity,
             "Adding SNP ID block (temporary key)"
         );
-        snp_id_block::add_snp_id_block_temp_key(&igvm_data, svn)?
+        snp_id_block::add_snp_id_block_temp_key(&igvm_data, svn, identity)?
     };
 
     write_igvm_file_atomic(&output, &new_igvm, "Writing IGVM file with SNP ID block")
 }
 
-/// Extract the guest SVN from the (single) SEV-SNP guest config in a manifest.
-fn snp_guest_svn_from_config(config: &Config) -> anyhow::Result<u32> {
-    let mut snp_svns = config
+/// Extract temporary-signing metadata from the single SNP guest config.
+fn snp_temporary_signing_metadata_from_config(
+    config: &Config,
+) -> anyhow::Result<(u32, snp_id_block::SnpImageIdentity)> {
+    let mut snp_guests = config
         .guest_configs
         .iter()
-        .filter(|c| matches!(c.isolation_type, ConfigIsolationType::Snp { .. }))
-        .map(|c| c.guest_svn);
-    let svn = snp_svns
-        .next()
-        .context("manifest has no SEV-SNP guest config to source --guest-svn from")?;
+        .filter(|c| matches!(&c.isolation_type, ConfigIsolationType::Snp { .. }));
+    let guest = snp_guests.next().context(
+        "manifest has no SEV-SNP guest config to source temporary-signing metadata from",
+    )?;
     anyhow::ensure!(
-        snp_svns.next().is_none(),
+        snp_guests.next().is_none(),
         "manifest has more than one SEV-SNP guest config; cannot unambiguously \
-         source --guest-svn (pass --guest-svn explicitly instead)"
+         source temporary-signing metadata"
     );
-    Ok(svn)
+    let identity = if matches!(&guest.image, Image::SnpLinuxDirect { .. }) {
+        snp_id_block::SnpImageIdentity::LINUX_DIRECT
+    } else {
+        snp_id_block::SnpImageIdentity::OPENHCL
+    };
+    Ok((guest.guest_svn, identity))
 }
 
 /// Dump CoRIM headers from an IGVM file.
@@ -1603,4 +1612,28 @@ fn load_linux<R: IgvmfilegenRegister + GuestArch + 'static>(
     let load_info = R::load_linux_kernel_and_initrd(loader, &mut kernel, 0, initrd, None)
         .context("loading linux kernel and initrd")?;
     Ok(load_info)
+}
+
+#[cfg(test)]
+mod temporary_signing_tests {
+    use super::*;
+
+    #[test]
+    fn linux_direct_manifest_selects_linux_direct_identity() {
+        let config: Config =
+            serde_json::from_str(include_str!("../../manifests/snp-linux-direct.json")).unwrap();
+
+        let (svn, identity) = snp_temporary_signing_metadata_from_config(&config).unwrap();
+        assert_eq!(svn, 1);
+        assert_eq!(identity, snp_id_block::SnpImageIdentity::LINUX_DIRECT);
+    }
+
+    #[test]
+    fn openhcl_manifest_selects_openhcl_identity() {
+        let config: Config =
+            serde_json::from_str(include_str!("../../manifests/openhcl-x64-cvm-dev.json")).unwrap();
+
+        let (_, identity) = snp_temporary_signing_metadata_from_config(&config).unwrap();
+        assert_eq!(identity, snp_id_block::SnpImageIdentity::OPENHCL);
+    }
 }

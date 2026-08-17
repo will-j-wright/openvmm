@@ -538,6 +538,15 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
         }
     }
 
+    /// Adds the fixed-memory contract required by a self-contained
+    /// Linux-direct image.
+    ///
+    /// The generic Linux loader imports only the pages that contain boot data
+    /// and does not call `verify_startup_memory_available`. UEFI and paravisor
+    /// loaders use that callback to emit their required-memory directives, but
+    /// a direct Linux IGVM must describe its complete startup RAM here. When
+    /// requested, this also imports every otherwise-unused RAM page as measured
+    /// zero data. The caller then places the BSP VMSA after those page updates.
     fn finalize_snp_linux_direct(&mut self, config: SnpLinuxDirectConfig) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.required_memory.is_empty(),
@@ -847,6 +856,10 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
         if let Some(config) = self.snp_linux_direct {
             self.finalize_snp_linux_direct(config)?;
 
+            // Current KVM measures initial VMSAs during launch finish, after
+            // every userspace page update. Keep the file's BSP VMSA last so a
+            // single-VP launch measurement and ID block match that ordering.
+            // This remains necessary until KVM accepts userspace VMSA pages.
             let (mut vmsa_directives, mut other_directives): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut self.directives)
                     .into_iter()

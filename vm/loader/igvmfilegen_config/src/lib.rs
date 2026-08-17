@@ -7,15 +7,14 @@
 #![expect(missing_docs)]
 #![forbid(unsafe_code)]
 
+use igvm_defs::PAGE_SIZE_4K;
+use page_table::x64::X64_PTE_ADDRESS_BIT_RANGE;
 use product_policy::ProductPolicy;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::PathBuf;
-
-const IGVM_PAGE_SIZE_BYTES: u64 = 4096;
-const X64_PAGE_TABLE_ADDRESS_BIT_RANGE: std::ops::RangeInclusive<u8> = 12..=51;
 
 /// The UEFI config type to pass to the UEFI loader.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
@@ -186,13 +185,15 @@ impl Image {
             }
 
             let memory_byte_count = memory_page_count
-                .checked_mul(IGVM_PAGE_SIZE_BYTES)
+                .checked_mul(PAGE_SIZE_4K)
                 .ok_or(ImageValidationError::MemoryByteCountTooLarge { memory_page_count })?;
             if u32::try_from(memory_byte_count).is_err() {
                 return Err(ImageValidationError::MemoryByteCountTooLarge { memory_page_count });
             }
 
-            if !X64_PAGE_TABLE_ADDRESS_BIT_RANGE.contains(&c_bit_position) {
+            // Encrypted PTEs store the C-bit in the physical-address field.
+            // Page-offset and control bits cannot carry it.
+            if !X64_PTE_ADDRESS_BIT_RANGE.contains(&c_bit_position) {
                 return Err(ImageValidationError::InvalidCBitPosition { c_bit_position });
             }
         }
@@ -218,7 +219,7 @@ pub enum ImageValidationError {
         memory_page_count: u64,
     },
     /// The SNP C-bit is outside the address bits available in x64 page tables.
-    #[error("c_bit_position {c_bit_position} is outside the supported range 12..=51")]
+    #[error("c_bit_position {c_bit_position} is outside the x64 PTE address field")]
     InvalidCBitPosition {
         /// The invalid C-bit position.
         c_bit_position: u8,
@@ -518,7 +519,7 @@ mod test {
 
     #[test]
     fn snp_linux_direct_rejects_oversized_memory() {
-        let memory_page_count = u64::from(u32::MAX) / IGVM_PAGE_SIZE_BYTES + 1;
+        let memory_page_count = u64::from(u32::MAX) / PAGE_SIZE_4K + 1;
         let image = snp_linux_direct_image(false, 1, memory_page_count, 51);
 
         assert_eq!(
