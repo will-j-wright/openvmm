@@ -15,15 +15,15 @@ normally creates the resource file that supplies each recipe's binary inputs.
 - an initrd and the kernel command line
   `console=ttyS0 earlyprintk=serial earlycon panic=-1`
 - SNP C-bit position 51, which is a test-host assumption rather than a portable
-  SNP property
+  SNP property; the generator requires bit 32 or higher because the startup
+  page tables identity-map the lower 4 GiB
 
 The IGVM contains only the BSP VMSA, regardless of processor count. Backends
-are responsible for any AP launch state they require. Current KVM synthesizes
-and measures one additional VMSA for every AP from the reset state configured
-by `virt_kvm`. Those backend-created VMSAs are not part of the IGVM launch
-measurement, so `virt_kvm` does not submit the file's SNP ID block for a
-multi-processor KVM guest. Multi-processor KVM attestation against that ID
-block remains unsupported until KVM accepts userspace-provided VMSAs.
+are responsible for any AP launch state they require. Current KVM constructs
+and measures the initial VMSAs itself rather than accepting the IGVM VMSA page.
+Those KVM-created VMSAs are not part of the IGVM launch measurement, so the
+file's SNP ID block is not valid for KVM. KVM attestation against that ID block
+remains unsupported until KVM accepts userspace-provided VMSAs.
 
 To build it manually, create a resources file containing absolute paths:
 

@@ -715,10 +715,7 @@ impl<'a> IdentityMapBuilder<'a> {
         };
 
         // Build PDEs that point to 2 MB pages.
-        let top_address = match params.identity_map_size {
-            IdentityMapSize::Size4Gb => 0x100000000u64,
-            IdentityMapSize::Size8Gb => 0x200000000u64,
-        };
+        let top_address = params.identity_map_size.address_space_size();
         let mut current_va = 0;
 
         while current_va < top_address {

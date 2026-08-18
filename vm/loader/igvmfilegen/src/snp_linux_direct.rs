@@ -285,7 +285,6 @@ mod tests {
         let mut next_vmsa_index = 0;
         let mut secrets_count = 0;
         let mut cpuid_count = 0;
-        let mut saw_vmsa = false;
 
         for directive in reparsed.directives() {
             match directive {
@@ -296,10 +295,6 @@ mod tests {
                     data,
                     ..
                 } => {
-                    // Current KVM measures its VMSA during launch finish, after
-                    // userspace page updates. A suffix VMSA keeps the serialized
-                    // single-VP measurement identical to KVM's measurement.
-                    assert!(!saw_vmsa, "PageData appears after the VMSA directive");
                     assert!(gpa.is_multiple_of(PAGE_SIZE));
                     let page = gpa / PAGE_SIZE;
                     assert!(page < ram_page_count);
@@ -333,7 +328,6 @@ mod tests {
                     assert_eq!(vmsa.x87_fcw, x86defs::xsave::INIT_FCW);
                     assert_eq!(vmsa.mxcsr, x86defs::xsave::DEFAULT_MXCSR);
                     next_vmsa_index += 1;
-                    saw_vmsa = true;
                 }
                 IgvmDirectiveHeader::RequiredMemory {
                     gpa,
@@ -423,7 +417,7 @@ mod tests {
             IgvmDirectiveHeader::RequiredMemory { .. }
         ));
         assert!(matches!(
-            directives[1],
+            directives[2],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::NORMAL,
                 ref data,
@@ -431,28 +425,28 @@ mod tests {
             } if data.is_empty()
         ));
         assert!(matches!(
-            directives[2],
+            directives[3],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::SECRETS,
                 ..
             }
         ));
         assert!(matches!(
-            directives[3],
+            directives[4],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::CPUID_DATA,
                 ..
             }
         ));
         assert!(matches!(
-            directives[4],
+            directives[5],
             IgvmDirectiveHeader::PageData {
                 data_type: IgvmPageDataType::NORMAL,
                 ..
             }
         ));
         assert!(matches!(
-            directives[5],
+            directives[1],
             IgvmDirectiveHeader::SnpVpContext {
                 gpa: KVM_VMSA_GPA,
                 ..

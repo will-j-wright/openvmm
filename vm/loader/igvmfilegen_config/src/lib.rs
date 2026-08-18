@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use igvm_defs::PAGE_SIZE_4K;
+use page_table::IdentityMapSize;
 use page_table::x64::X64_PTE_ADDRESS_BIT_RANGE;
 use product_policy::ProductPolicy;
 use serde::Deserialize;
@@ -191,9 +192,13 @@ impl Image {
                 return Err(ImageValidationError::MemoryByteCountTooLarge { memory_page_count });
             }
 
-            // Encrypted PTEs store the C-bit in the physical-address field.
-            // Page-offset and control bits cannot carry it.
-            if !X64_PTE_ADDRESS_BIT_RANGE.contains(&c_bit_position) {
+            // The Linux startup page tables identity-map the lower 4 GiB and
+            // set the C-bit by ORing it into each PTE. The bit must therefore
+            // be outside that mapped address range as well as inside the
+            // architectural PTE address field.
+            let valid_c_bit = X64_PTE_ADDRESS_BIT_RANGE.contains(&c_bit_position)
+                && (1u64 << c_bit_position) >= IdentityMapSize::Size4Gb.address_space_size();
+            if !valid_c_bit {
                 return Err(ImageValidationError::InvalidCBitPosition { c_bit_position });
             }
         }
@@ -218,8 +223,11 @@ pub enum ImageValidationError {
         /// The invalid number of 4-KiB pages.
         memory_page_count: u64,
     },
-    /// The SNP C-bit is outside the address bits available in x64 page tables.
-    #[error("c_bit_position {c_bit_position} is outside the x64 PTE address field")]
+    /// The SNP C-bit overlaps the identity map or lies outside the x64 PTE
+    /// address field.
+    #[error(
+        "c_bit_position {c_bit_position} overlaps the 4-GiB identity map or lies outside the x64 PTE address field"
+    )]
     InvalidCBitPosition {
         /// The invalid C-bit position.
         c_bit_position: u8,
@@ -530,7 +538,7 @@ mod test {
 
     #[test]
     fn snp_linux_direct_rejects_invalid_c_bit_positions() {
-        for c_bit_position in [11, 52] {
+        for c_bit_position in [11, 31, 52] {
             let image = snp_linux_direct_image(false, 1, 40960, c_bit_position);
 
             assert_eq!(
@@ -538,6 +546,10 @@ mod test {
                 Err(ImageValidationError::InvalidCBitPosition { c_bit_position })
             );
         }
+
+        snp_linux_direct_image(false, 1, 40960, 32)
+            .validate()
+            .unwrap();
     }
 
     #[test]

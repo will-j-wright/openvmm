@@ -855,27 +855,13 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
 
         if let Some(config) = self.snp_linux_direct {
             self.finalize_snp_linux_direct(config)?;
-
-            // Current KVM measures initial VMSAs during launch finish, after
-            // every userspace page update. Keep the file's BSP VMSA last so a
-            // single-VP launch measurement and ID block match that ordering.
-            // This remains necessary until KVM accepts userspace VMSA pages.
-            let (mut vmsa_directives, mut other_directives): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut self.directives)
-                    .into_iter()
-                    .partition(|directive| {
-                        matches!(directive, IgvmDirectiveHeader::SnpVpContext { .. })
-                    });
-            other_directives.append(&mut self.page_data_directives);
-            other_directives.append(&mut vmsa_directives);
-            self.directives = other_directives;
-        } else {
-            // Merge the page_data_directives into the others directives. This
-            // must be done before constructing the IGVM file so that subsequent
-            // measurement computation (in `IgvmSerializer`) sees the full set
-            // of directives.
-            self.directives.append(&mut self.page_data_directives);
         }
+
+        // Merge the page_data_directives into the others directives. This
+        // must be done before constructing the IGVM file so that subsequent
+        // measurement computation (in `IgvmSerializer`) sees the full set
+        // of directives.
+        self.directives.append(&mut self.page_data_directives);
 
         // Display a report about the build igvm file's layout.
         let map_file = MapFile {
