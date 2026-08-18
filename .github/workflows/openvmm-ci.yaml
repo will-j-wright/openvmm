@@ -4267,6 +4267,7 @@ jobs:
     - Windows
     - X64
     - TDX
+    - GNR
     - Baremetal
     permissions:
       contents: read
