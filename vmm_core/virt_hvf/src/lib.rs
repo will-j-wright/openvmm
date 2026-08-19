@@ -115,6 +115,12 @@ impl virt::Hypervisor for HvfHypervisor {
         &'a mut self,
         config: virt::ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
+        if config.igvm_isolation_config.is_some() {
+            return Err(
+                anyhow::anyhow!("HVF does not support IGVM isolation configuration").into(),
+            );
+        }
+
         let mut ipa_bit_length = 0;
         // SAFETY: `ipa_bit_length` is a valid out parameter.
         unsafe { abi::hv_vm_config_get_default_ipa_size(&mut ipa_bit_length) }
@@ -143,18 +149,6 @@ impl virt::ProtoPartition for HvfProtoPartition<'_> {
     type Partition = HvfPartition;
     type ProcessorBinder = HvfProcessorBinder;
     type Error = Error;
-
-    fn configure_isolation(
-        &mut self,
-        config: Option<&virt::IgvmIsolationConfig>,
-    ) -> Result<(), Self::Error> {
-        if config.is_some() {
-            return Err(
-                anyhow::anyhow!("HVF does not support IGVM isolation configuration").into(),
-            );
-        }
-        Ok(())
-    }
 
     fn build(
         self,

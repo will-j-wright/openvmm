@@ -241,32 +241,12 @@ pub struct SnpVpContext {
     /// The virtual processor described by the context.
     pub vp_index: VpIndex,
     /// The complete 4-KiB VMSA page.
-    pub page: Arc<[u8; 4096]>,
+    pub page: Box<[u8; 4096]>,
 }
 
-/// An SNP ID-block signature.
+/// SNP ID block and authentication data supplied by an IGVM file.
 #[derive(Eq, PartialEq, Debug, Clone)]
-pub struct SnpIdBlockSignature {
-    /// The ECDSA R component.
-    pub r: [u8; 72],
-    /// The ECDSA S component.
-    pub s: [u8; 72],
-}
-
-/// An SNP ID-block public key.
-#[derive(Eq, PartialEq, Debug, Clone)]
-pub struct SnpIdBlockPublicKey {
-    /// The elliptic curve identifier.
-    pub curve: u32,
-    /// The public key X coordinate.
-    pub qx: [u8; 72],
-    /// The public key Y coordinate.
-    pub qy: [u8; 72],
-}
-
-/// SNP launch identity as supplied by an IGVM file.
-#[derive(Eq, PartialEq, Debug, Clone)]
-pub struct SnpIdentity {
+pub struct SnpIdBlock {
     /// Whether the author key is enabled.
     pub author_key_enabled: u8,
     /// The launch digest supplied by the IGVM file.
@@ -284,13 +264,13 @@ pub struct SnpIdentity {
     /// The author-key algorithm.
     pub author_key_algorithm: u32,
     /// The ID-block signature.
-    pub id_key_signature: SnpIdBlockSignature,
+    pub id_key_signature: x86defs::snp::SnpIdBlockSignature,
     /// The ID public key.
-    pub id_public_key: SnpIdBlockPublicKey,
+    pub id_public_key: x86defs::snp::SnpIdBlockPublicKey,
     /// The author-key signature.
-    pub author_key_signature: SnpIdBlockSignature,
+    pub author_key_signature: x86defs::snp::SnpIdBlockSignature,
     /// The author public key.
-    pub author_public_key: SnpIdBlockPublicKey,
+    pub author_public_key: x86defs::snp::SnpIdBlockPublicKey,
 }
 
 /// Backend-neutral SNP launch configuration extracted from an IGVM file.
@@ -305,16 +285,16 @@ pub struct SnpConfig {
     /// Whether the IGVM contains relocation metadata.
     pub has_relocation: bool,
     /// Opaque virtual processor contexts in file order.
-    pub vp_contexts: Vec<Arc<SnpVpContext>>,
-    /// Optional launch identity and authentication data.
-    pub identity: Option<SnpIdentity>,
+    pub vp_contexts: Vec<SnpVpContext>,
+    /// Optional ID block and authentication data.
+    pub id_block: Option<SnpIdBlock>,
 }
 
 /// Isolation configuration extracted from a filtered IGVM file.
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum IgvmIsolationConfig {
     /// AMD SEV-SNP launch configuration.
-    Snp(Arc<SnpConfig>),
+    Snp(SnpConfig),
 }
 
 /// Prototype partition creation configuration.
@@ -327,6 +307,8 @@ pub struct ProtoPartitionConfig<'a> {
     pub vmtime: &'a VmTimeSource,
     /// Isolation type for this partition.
     pub isolation: IsolationType,
+    /// Optional backend configuration extracted from an IGVM file.
+    pub igvm_isolation_config: Option<IgvmIsolationConfig>,
     /// Expose hardware virtualization (VMX/SVM) to the guest so that it can run
     /// its own hypervisor.
     ///
@@ -419,16 +401,6 @@ pub trait ProtoPartition {
     fn supports_memory_fault_resolution(&self) -> bool {
         false
     }
-
-    /// Configures isolation after the prototype VM exists and before any guest
-    /// memory regions or virtual processors are created.
-    ///
-    /// The VM orchestrator calls this exactly once for every partition,
-    /// including partitions that are not loaded from IGVM.
-    fn configure_isolation(
-        &mut self,
-        config: Option<&IgvmIsolationConfig>,
-    ) -> Result<(), Self::Error>;
 
     /// Constructs the full partition.
     fn build(

@@ -1112,12 +1112,13 @@ impl InitializedVm {
         let device_assignment_msi_iova_range =
             resolve_device_assignment_msi_iova_range(platform_info.device_assignment_msi_iova);
 
-        let mut proto = hypervisor
+        let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
                 hv_config,
                 vmtime: &vmtime_source,
                 isolation: partition_isolation,
+                igvm_isolation_config,
                 nested_virt: cfg.hypervisor.nested_virt,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
@@ -1404,10 +1405,6 @@ impl InitializedVm {
                 confidential_vmbus,
             ));
         }
-
-        proto
-            .configure_isolation(igvm_isolation_config.as_ref())
-            .context("failed to configure partition isolation")?;
 
         let (partition, vps) = proto
             .build(virt::PartitionConfig {

@@ -313,6 +313,20 @@ impl KvmPartitionInner {
         }
     }
 
+    /// Marks an IGVM-provided range shared before SNP launch.
+    ///
+    /// KVM private memory starts with private attributes. Shared IGVM page
+    /// imports must clear those attributes and discard stale private backing
+    /// before launch updates begin.
+    #[cfg(guest_arch = "x86_64")]
+    pub(crate) fn set_initial_shared_memory(&self, range: MemoryRange) -> Result<(), MemoryError> {
+        let state = self.memory.lock();
+        let segments = guest_memfd_range_segments(range, &state.ranges)?;
+        self.kvm
+            .set_memory_attributes(range.start(), range.len(), 0)?;
+        self.discard_stale_private_memory_backing(&segments, false, "SNP")
+    }
+
     /// Applies a guest-requested SNP shared/private state change.
     ///
     /// `page_count` is always expressed in 4-KiB pages by
@@ -325,15 +339,6 @@ impl KvmPartitionInner {
     /// state. After updating KVM's private-memory attributes, the backing for
     /// the old state is discarded so stale data cannot be reused if the page
     /// later transitions back.
-    #[cfg(guest_arch = "x86_64")]
-    pub(crate) fn set_initial_shared_memory(&self, range: MemoryRange) -> Result<(), MemoryError> {
-        let state = self.memory.lock();
-        let segments = guest_memfd_range_segments(range, &state.ranges)?;
-        self.kvm
-            .set_memory_attributes(range.start(), range.len(), 0)?;
-        self.discard_stale_private_memory_backing(&segments, false, "SNP")
-    }
-
     #[cfg(guest_arch = "x86_64")]
     pub(crate) fn set_map_gpa_range_attributes(
         &self,

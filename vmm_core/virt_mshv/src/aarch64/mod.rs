@@ -67,6 +67,9 @@ impl virt::Hypervisor for LinuxMshv {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
+        if config.igvm_isolation_config.is_some() {
+            return Err(ErrorInner::IsolationNotSupported.into());
+        }
         if config.isolation.is_isolated() {
             return Err(ErrorInner::IsolationNotSupported.into());
         }
@@ -159,16 +162,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         self.vmfd
             .get_partition_property(HvPartitionPropertyCode::PhysicalAddressWidth.0)
             .expect("failed to get physical address width") as u8
-    }
-
-    fn configure_isolation(
-        &mut self,
-        config: Option<&virt::IgvmIsolationConfig>,
-    ) -> Result<(), Self::Error> {
-        if config.is_some() {
-            return Err(ErrorInner::IsolationNotSupported.into());
-        }
-        Ok(())
     }
 
     fn build(

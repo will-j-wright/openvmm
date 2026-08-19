@@ -16,10 +16,10 @@ use crate::KvmPartitionInner;
 use crate::memory::MemoryError;
 use crate::memory::private_memory_range_from_slots;
 use std::os::fd::AsFd;
-use std::sync::Arc;
 use thiserror::Error;
 use virt::InitialPageImportType;
 use zerocopy::FromBytes;
+use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
 pub(crate) const KVM_SNP_VMSA_GPA: u64 = 0xffff_ffff_f000;
@@ -87,27 +87,30 @@ pub(crate) enum SnpLaunchState {
 
 #[derive(Debug)]
 pub(crate) struct KvmSnpVpConfig {
-    pub(crate) context: Arc<virt::SnpVpContext>,
+    pub(crate) gpa: u64,
     pub(crate) vmsa: x86defs::snp::SevVmsa,
 }
 
 #[derive(Debug)]
 pub(crate) struct KvmSnpConfig {
-    pub(crate) generic: Arc<virt::SnpConfig>,
+    pub(crate) generic: virt::SnpConfig,
     pub(crate) bsp: KvmSnpVpConfig,
     pub(crate) vmsa_features: u64,
 }
 
-fn parse_vmsa_page(context: Arc<virt::SnpVpContext>) -> Result<KvmSnpVpConfig, SnpError> {
+fn parse_vmsa_page(context: &virt::SnpVpContext) -> Result<KvmSnpVpConfig, SnpError> {
     let (vmsa, _) = x86defs::snp::SevVmsa::read_from_prefix(context.page.as_ref())
         .map_err(|_| SnpError::InvalidIgvmVmsa("invalid VMSA page size"))?;
-    Ok(KvmSnpVpConfig { context, vmsa })
+    Ok(KvmSnpVpConfig {
+        gpa: context.gpa,
+        vmsa,
+    })
 }
 
 pub(crate) fn prepare_snp_config(
-    config: Arc<virt::SnpConfig>,
+    config: virt::SnpConfig,
     supported_vmsa_features: u64,
-) -> Result<Arc<KvmSnpConfig>, SnpError> {
+) -> Result<KvmSnpConfig, SnpError> {
     if config.highest_vtl != 0 {
         return Err(SnpError::UnsupportedVtl(config.highest_vtl));
     }
@@ -129,24 +132,27 @@ pub(crate) fn prepare_snp_config(
     // KVM_SEV_INIT2 needs the VM-wide VMSA feature bits before any vCPUs
     // exist. The IGVM describes only the BSP; KVM synthesizes AP VMSAs from
     // the reset state configured by this backend.
-    let bsp = parse_vmsa_page(context.clone())?;
+    let bsp = parse_vmsa_page(context)?;
     if bsp.vmsa.sev_features.vtom() || bsp.vmsa.virtual_tom != 0 {
         return Err(SnpError::InvalidIgvmVmsa("vTOM is not supported"));
     }
-    let vmsa_features = u64::from(bsp.vmsa.sev_features) & !1;
+    // KVM_SEV_INIT2 takes the feature bits that configure the VMSA, excluding
+    // the SNP-active bit stored in the VMSA itself.
+    let vmsa_features = u64::from(bsp.vmsa.sev_features.with_snp(false));
     let unsupported_features = vmsa_features & !supported_vmsa_features;
     if unsupported_features != 0 {
         return Err(SnpError::UnsupportedVmsaFeatures(unsupported_features));
     }
+    validate_snp_igvm_vmsa_state(&bsp.vmsa)?;
 
-    Ok(Arc::new(KvmSnpConfig {
+    Ok(KvmSnpConfig {
         generic: config,
         bsp,
         vmsa_features,
-    }))
+    })
 }
 
-fn launch_identity(_config: &KvmSnpConfig) -> Option<&virt::SnpIdentity> {
+fn launch_id_block(_config: &KvmSnpConfig) -> Option<&virt::SnpIdBlock> {
     // KVM constructs and measures every initial VMSA outside the IGVM
     // directive stream. The file identity cannot describe that measurement.
     None
@@ -196,7 +202,7 @@ impl KvmPartitionInner {
     ) -> Result<(), SnpError> {
         let sev = self.sev.as_ref().ok_or(SnpError::IsolationNotSupported)?;
         if let Some(config) = &self.snp_config {
-            validate_snp_igvm_vmsa_imports(pages, &config.generic)?;
+            validate_vp_context_imports(pages, &config.generic)?;
         } else {
             self.apply_snp_vmsa(pages)?;
         }
@@ -270,29 +276,26 @@ impl KvmPartitionInner {
         }
         self.prepare_snp_vmsa_register_state()?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
-        let identity = self
-            .snp_config
-            .as_ref()
-            .and_then(|config| launch_identity(config));
+        let id_block = self.snp_config.as_ref().and_then(launch_id_block);
         if self
             .snp_config
             .as_ref()
-            .is_some_and(|config| config.generic.identity.is_some())
-            && identity.is_none()
+            .is_some_and(|config| config.generic.id_block.is_some())
+            && id_block.is_none()
         {
             tracing::warn!(
                 vp_count = self.vps.len(),
                 "ignoring SNP ID block because KVM constructs VMSAs outside the IGVM measurement"
             );
         }
-        if let Some(identity) = identity {
-            let id_block = snp_id_block(identity, launch_start.policy);
-            let id_auth = snp_id_auth(identity);
+        if let Some(id_block) = id_block {
+            let psp_id_block = snp_id_block(id_block, launch_start.policy);
+            let id_auth = snp_id_auth(id_block);
             let mut finish = kvm::kvm_sev_snp_launch_finish {
-                id_block_uaddr: id_block.as_bytes().as_ptr() as u64,
+                id_block_uaddr: psp_id_block.as_bytes().as_ptr() as u64,
                 id_auth_uaddr: id_auth.as_ptr() as u64,
                 id_block_en: 1,
-                auth_key_en: (identity.author_key_enabled != 0).into(),
+                auth_key_en: (id_block.author_key_enabled != 0).into(),
                 vcek_disabled: 0,
                 host_data: [0; 32],
                 ..Default::default()
@@ -410,7 +413,12 @@ impl KvmPartitionInner {
     }
 }
 
-fn validate_snp_igvm_vmsa_imports(
+/// Verifies that loader-generated VP-context markers match the contexts
+/// extracted from the IGVM before partition construction.
+///
+/// KVM skips these marked pages during launch updates because it constructs
+/// and measures VMSAs from vCPU state during launch finish.
+fn validate_vp_context_imports(
     pages: &[virt::InitialPageImport],
     config: &virt::SnpConfig,
 ) -> Result<(), SnpError> {
@@ -432,45 +440,49 @@ fn validate_snp_igvm_vmsa_imports(
     Ok(())
 }
 
-fn snp_id_block(identity: &virt::SnpIdentity, policy: u64) -> x86defs::snp::SnpPspIdBlock {
+fn snp_id_block(id_block: &virt::SnpIdBlock, policy: u64) -> x86defs::snp::SnpPspIdBlock {
     x86defs::snp::SnpPspIdBlock {
-        ld: identity.launch_digest,
-        family_id: identity.family_id,
-        image_id: identity.image_id,
-        version: identity.version,
-        guest_svn: identity.guest_svn,
+        ld: id_block.launch_digest,
+        family_id: id_block.family_id,
+        image_id: id_block.image_id,
+        version: id_block.version,
+        guest_svn: id_block.guest_svn,
         policy,
     }
 }
 
-fn snp_id_auth(identity: &virt::SnpIdentity) -> Box<[u8; 4096]> {
+fn snp_id_auth(id_block: &virt::SnpIdBlock) -> Box<[u8; 4096]> {
     const ID_BLOCK_SIGNATURE: usize = 64;
     const ID_KEY: usize = 576;
     const AUTHOR_KEY_SIGNATURE: usize = 1664;
     const AUTHOR_KEY: usize = 2176;
 
-    fn write_signature(page: &mut [u8], offset: usize, signature: &virt::SnpIdBlockSignature) {
+    fn write_signature(
+        page: &mut [u8],
+        offset: usize,
+        signature: &x86defs::snp::SnpIdBlockSignature,
+    ) {
         page[offset..offset + 72].copy_from_slice(&signature.r);
         page[offset + 72..offset + 144].copy_from_slice(&signature.s);
     }
 
-    fn write_public_key(page: &mut [u8], offset: usize, key: &virt::SnpIdBlockPublicKey) {
+    fn write_public_key(page: &mut [u8], offset: usize, key: &x86defs::snp::SnpIdBlockPublicKey) {
         page[offset..offset + 4].copy_from_slice(&key.curve.to_le_bytes());
         page[offset + 4..offset + 76].copy_from_slice(&key.qx);
         page[offset + 76..offset + 148].copy_from_slice(&key.qy);
     }
 
     let mut page = Box::new([0; 4096]);
-    page[0..4].copy_from_slice(&identity.id_key_algorithm.to_le_bytes());
-    page[4..8].copy_from_slice(&identity.author_key_algorithm.to_le_bytes());
-    write_signature(&mut *page, ID_BLOCK_SIGNATURE, &identity.id_key_signature);
-    write_public_key(&mut *page, ID_KEY, &identity.id_public_key);
+    page[0..4].copy_from_slice(&id_block.id_key_algorithm.to_le_bytes());
+    page[4..8].copy_from_slice(&id_block.author_key_algorithm.to_le_bytes());
+    write_signature(&mut *page, ID_BLOCK_SIGNATURE, &id_block.id_key_signature);
+    write_public_key(&mut *page, ID_KEY, &id_block.id_public_key);
     write_signature(
         &mut *page,
         AUTHOR_KEY_SIGNATURE,
-        &identity.author_key_signature,
+        &id_block.author_key_signature,
     );
-    write_public_key(&mut *page, AUTHOR_KEY, &identity.author_public_key);
+    write_public_key(&mut *page, AUTHOR_KEY, &id_block.author_public_key);
     page
 }
 
@@ -498,6 +510,121 @@ fn table_from_vmsa(table: x86defs::snp::SevSelector) -> kvm::kvm_dtable {
         limit: table.limit as u16,
         padding: [0; 3],
     }
+}
+
+/// Rejects VMSA fields that this register-based KVM launch path cannot import.
+///
+/// KVM constructs the measured VMSA from its vCPU state, so silently ignoring
+/// a file-provided field would produce a different initial context.
+fn validate_snp_igvm_vmsa_state(vmsa: &x86defs::snp::SevVmsa) -> Result<(), SnpError> {
+    let mut supported = x86defs::snp::SevVmsa::new_zeroed();
+    supported.es = vmsa.es;
+    supported.cs = vmsa.cs;
+    supported.ss = vmsa.ss;
+    supported.ds = vmsa.ds;
+    supported.fs = vmsa.fs;
+    supported.gs = vmsa.gs;
+    supported.gdtr = vmsa.gdtr;
+    supported.ldtr = vmsa.ldtr;
+    supported.idtr = vmsa.idtr;
+    supported.tr = vmsa.tr;
+    supported.efer = vmsa.efer;
+    supported.xss = vmsa.xss;
+    supported.cr4 = vmsa.cr4;
+    supported.cr3 = vmsa.cr3;
+    supported.cr0 = vmsa.cr0;
+    supported.dr7 = vmsa.dr7;
+    supported.dr6 = vmsa.dr6;
+    supported.rflags = vmsa.rflags;
+    supported.rip = vmsa.rip;
+    supported.dr0 = vmsa.dr0;
+    supported.dr1 = vmsa.dr1;
+    supported.dr2 = vmsa.dr2;
+    supported.dr3 = vmsa.dr3;
+    supported.rsp = vmsa.rsp;
+    supported.rax = vmsa.rax;
+    supported.star = vmsa.star;
+    supported.lstar = vmsa.lstar;
+    supported.cstar = vmsa.cstar;
+    supported.sfmask = vmsa.sfmask;
+    supported.kernel_gs_base = vmsa.kernel_gs_base;
+    supported.sysenter_cs = vmsa.sysenter_cs;
+    supported.sysenter_esp = vmsa.sysenter_esp;
+    supported.sysenter_eip = vmsa.sysenter_eip;
+    supported.cr2 = vmsa.cr2;
+    supported.pat = vmsa.pat;
+    supported.spec_ctrl = vmsa.spec_ctrl;
+    supported.tsc_aux = vmsa.tsc_aux;
+    supported.rcx = vmsa.rcx;
+    supported.rdx = vmsa.rdx;
+    supported.rbx = vmsa.rbx;
+    supported.rbp = vmsa.rbp;
+    supported.rsi = vmsa.rsi;
+    supported.rdi = vmsa.rdi;
+    supported.r8 = vmsa.r8;
+    supported.r9 = vmsa.r9;
+    supported.r10 = vmsa.r10;
+    supported.r11 = vmsa.r11;
+    supported.r12 = vmsa.r12;
+    supported.r13 = vmsa.r13;
+    supported.r14 = vmsa.r14;
+    supported.r15 = vmsa.r15;
+    supported.sev_features = vmsa.sev_features;
+    supported.xcr0 = vmsa.xcr0;
+    supported.x87dp = vmsa.x87dp;
+    supported.mxcsr = vmsa.mxcsr;
+    supported.x87_fsw = vmsa.x87_fsw;
+    supported.x87_fcw = vmsa.x87_fcw;
+    supported.x87_op = vmsa.x87_op;
+    supported.x87_rip = vmsa.x87_rip;
+
+    if &supported != vmsa {
+        return Err(SnpError::InvalidIgvmVmsa(
+            "contains state that KVM cannot import",
+        ));
+    }
+
+    Ok(())
+}
+
+fn snp_igvm_vmsa_msrs(vmsa: &x86defs::snp::SevVmsa) -> Vec<(u32, u64)> {
+    let mut msrs = vec![
+        (x86defs::X86X_MSR_CR_PAT, vmsa.pat),
+        (x86defs::X86X_MSR_XSS, vmsa.xss),
+    ];
+    msrs.extend(
+        [
+            (x86defs::X86X_MSR_STAR, vmsa.star),
+            (x86defs::X86X_MSR_LSTAR, vmsa.lstar),
+            (x86defs::X86X_MSR_CSTAR, vmsa.cstar),
+            (x86defs::X86X_MSR_SFMASK, vmsa.sfmask),
+            (x86defs::X64_MSR_KERNEL_GS_BASE, vmsa.kernel_gs_base),
+            (x86defs::X86X_MSR_SYSENTER_CS, vmsa.sysenter_cs),
+            (x86defs::X86X_MSR_SYSENTER_ESP, vmsa.sysenter_esp),
+            (x86defs::X86X_MSR_SYSENTER_EIP, vmsa.sysenter_eip),
+            (x86defs::X86X_MSR_SPEC_CTRL, vmsa.spec_ctrl),
+            (x86defs::X86X_MSR_TSC_AUX, u64::from(vmsa.tsc_aux)),
+        ]
+        .into_iter()
+        .filter(|(_, value)| *value != 0),
+    );
+    msrs
+}
+
+fn snp_igvm_vmsa_xsave(vmsa: &x86defs::snp::SevVmsa) -> [u8; 4096] {
+    let mut xsave = [0; 4096];
+    xsave[0..2].copy_from_slice(&vmsa.x87_fcw.to_le_bytes());
+    xsave[2..4].copy_from_slice(&vmsa.x87_fsw.to_le_bytes());
+    xsave[4] = vmsa.x87_ftw as u8;
+    xsave[6..8].copy_from_slice(&vmsa.x87_op.to_le_bytes());
+    xsave[8..16].copy_from_slice(&vmsa.x87_rip.to_le_bytes());
+    xsave[16..24].copy_from_slice(&vmsa.x87dp.to_le_bytes());
+    xsave[24..28].copy_from_slice(&vmsa.mxcsr.to_le_bytes());
+
+    let xstate_bv = vmsa.xcr0 & (x86defs::xsave::XFEATURE_X87 | x86defs::xsave::XFEATURE_SSE);
+    let header = x86defs::xsave::XSAVE_LEGACY_LEN;
+    xsave[header..header + size_of::<u64>()].copy_from_slice(&xstate_bv.to_le_bytes());
+    xsave
 }
 
 fn set_snp_igvm_vmsa_state(
@@ -551,19 +678,11 @@ fn set_snp_igvm_vmsa_state(
         dr7: vmsa.dr7,
     })?;
     kvm_vp.set_xcr0(vmsa.xcr0)?;
-    kvm_vp.set_msrs(&[
-        (x86defs::X86X_MSR_CR_PAT, vmsa.pat),
-        (x86defs::X86X_MSR_XSS, vmsa.xss),
-    ])?;
+    kvm_vp.set_msrs(&snp_igvm_vmsa_msrs(vmsa))?;
 
-    let mut xsave = [0; 4096];
-    xsave[0..2].copy_from_slice(&vmsa.x87_fcw.to_le_bytes());
-    xsave[2..4].copy_from_slice(&vmsa.x87_fsw.to_le_bytes());
-    xsave[4] = vmsa.x87_ftw as u8;
-    xsave[6..8].copy_from_slice(&vmsa.x87_op.to_le_bytes());
-    xsave[8..16].copy_from_slice(&vmsa.x87_rip.to_le_bytes());
-    xsave[16..24].copy_from_slice(&vmsa.x87dp.to_le_bytes());
-    xsave[24..28].copy_from_slice(&vmsa.mxcsr.to_le_bytes());
+    // Validation rejects live x87, XMM, YMM, PKRU, and CET state that this
+    // register-based KVM launch path cannot import.
+    let xsave = snp_igvm_vmsa_xsave(vmsa);
     kvm_vp.set_xsave(&xsave)?;
     Ok(())
 }
@@ -718,7 +837,7 @@ mod tests {
     use test_with_tracing::test;
     use zerocopy::FromZeros;
 
-    fn valid_vmsa_page_at_rip(features: x86defs::snp::SevFeatures, rip: u64) -> Arc<[u8; 4096]> {
+    fn valid_vmsa_page_at_rip(features: x86defs::snp::SevFeatures, rip: u64) -> Box<[u8; 4096]> {
         let mut vmsa = x86defs::snp::SevVmsa::new_zeroed();
         vmsa.efer = x86defs::X64_EFER_SVME
             | x86defs::X64_EFER_LME
@@ -738,38 +857,42 @@ mod tests {
 
         let mut page = [0; 4096];
         page[..size_of::<x86defs::snp::SevVmsa>()].copy_from_slice(vmsa.as_bytes());
-        Arc::new(page)
+        Box::new(page)
     }
 
-    fn valid_vmsa_page(features: x86defs::snp::SevFeatures) -> Arc<[u8; 4096]> {
+    fn valid_vmsa_page(features: x86defs::snp::SevFeatures) -> Box<[u8; 4096]> {
         valid_vmsa_page_at_rip(features, 0x100000)
     }
 
-    fn vp_context(vp_index: u32, page: Arc<[u8; 4096]>) -> Arc<virt::SnpVpContext> {
-        Arc::new(virt::SnpVpContext {
+    fn vmsa_mut(page: &mut [u8; 4096]) -> &mut x86defs::snp::SevVmsa {
+        x86defs::snp::SevVmsa::mut_from_prefix(page).unwrap().0
+    }
+
+    fn vp_context(vp_index: u32, page: Box<[u8; 4096]>) -> virt::SnpVpContext {
+        virt::SnpVpContext {
             gpa: KVM_SNP_VMSA_GPA,
             vp_index: virt::VpIndex::new(vp_index),
             page,
-        })
+        }
     }
 
-    fn snp_config_with_contexts(vp_contexts: Vec<Arc<virt::SnpVpContext>>) -> Arc<virt::SnpConfig> {
-        Arc::new(virt::SnpConfig {
+    fn snp_config_with_contexts(vp_contexts: Vec<virt::SnpVpContext>) -> virt::SnpConfig {
+        virt::SnpConfig {
             policy: 0x30000,
             highest_vtl: 0,
             shared_gpa_boundary: 0,
             has_relocation: false,
             vp_contexts,
-            identity: None,
-        })
+            id_block: None,
+        }
     }
 
-    fn snp_config(page: Arc<[u8; 4096]>) -> Arc<virt::SnpConfig> {
+    fn snp_config(page: Box<[u8; 4096]>) -> virt::SnpConfig {
         snp_config_with_contexts(vec![vp_context(0, page)])
     }
 
-    fn test_identity() -> virt::SnpIdentity {
-        virt::SnpIdentity {
+    fn test_id_block() -> virt::SnpIdBlock {
+        virt::SnpIdBlock {
             author_key_enabled: 1,
             launch_digest: [0x11; 48],
             family_id: [0x22; 16],
@@ -778,20 +901,20 @@ mod tests {
             guest_svn: 7,
             id_key_algorithm: 1,
             author_key_algorithm: 2,
-            id_key_signature: virt::SnpIdBlockSignature {
+            id_key_signature: x86defs::snp::SnpIdBlockSignature {
                 r: [0x44; 72],
                 s: [0x55; 72],
             },
-            id_public_key: virt::SnpIdBlockPublicKey {
+            id_public_key: x86defs::snp::SnpIdBlockPublicKey {
                 curve: 2,
                 qx: [0x66; 72],
                 qy: [0x77; 72],
             },
-            author_key_signature: virt::SnpIdBlockSignature {
+            author_key_signature: x86defs::snp::SnpIdBlockSignature {
                 r: [0x88; 72],
                 s: [0x99; 72],
             },
-            author_public_key: virt::SnpIdBlockPublicKey {
+            author_public_key: x86defs::snp::SnpIdBlockPublicKey {
                 curve: 3,
                 qx: [0xaa; 72],
                 qy: [0xbb; 72],
@@ -816,11 +939,11 @@ mod tests {
             page_import(KVM_SNP_VMSA_GPA, InitialPageImportType::VpContext),
         ];
 
-        validate_snp_igvm_vmsa_imports(&pages, &config).unwrap();
+        validate_vp_context_imports(&pages, &config).unwrap();
 
         let missing = [page_import(0x1000, InitialPageImportType::Normal)];
         assert!(matches!(
-            validate_snp_igvm_vmsa_imports(&missing, &config),
+            validate_vp_context_imports(&missing, &config),
             Err(SnpError::InvalidIgvmVmsaImports)
         ));
     }
@@ -834,7 +957,7 @@ mod tests {
             page_import(0x1000, InitialPageImportType::Normal),
         ];
 
-        validate_snp_igvm_vmsa_imports(&pages, &config).unwrap();
+        validate_vp_context_imports(&pages, &config).unwrap();
     }
 
     #[test]
@@ -842,7 +965,7 @@ mod tests {
         let features = x86defs::snp::SevFeatures::new()
             .with_snp(true)
             .with_restrict_injection(true);
-        let supported = u64::from(features) & !1;
+        let supported = u64::from(features.with_snp(false));
         let prepared =
             prepare_snp_config(snp_config(valid_vmsa_page(features)), supported).unwrap();
         assert_eq!(prepared.vmsa_features, supported);
@@ -854,6 +977,89 @@ mod tests {
             ),
             Err(SnpError::UnsupportedVmsaFeatures(bits)) if bits == supported
         ));
+    }
+
+    #[test]
+    fn preserves_supported_vmsa_msrs() {
+        let features = x86defs::snp::SevFeatures::new().with_snp(true);
+        let mut page = valid_vmsa_page(features);
+        {
+            let vmsa = vmsa_mut(&mut page);
+            vmsa.pat = 1;
+            vmsa.xss = 2;
+            vmsa.star = 3;
+            vmsa.lstar = 4;
+            vmsa.cstar = 5;
+            vmsa.sfmask = 6;
+            vmsa.kernel_gs_base = 7;
+            vmsa.sysenter_cs = 8;
+            vmsa.sysenter_esp = 9;
+            vmsa.sysenter_eip = 10;
+            vmsa.spec_ctrl = 11;
+            vmsa.tsc_aux = 12;
+        }
+
+        let prepared = prepare_snp_config(snp_config(page), u64::MAX).unwrap();
+        assert_eq!(
+            snp_igvm_vmsa_msrs(&prepared.bsp.vmsa),
+            vec![
+                (x86defs::X86X_MSR_CR_PAT, 1),
+                (x86defs::X86X_MSR_XSS, 2),
+                (x86defs::X86X_MSR_STAR, 3),
+                (x86defs::X86X_MSR_LSTAR, 4),
+                (x86defs::X86X_MSR_CSTAR, 5),
+                (x86defs::X86X_MSR_SFMASK, 6),
+                (x86defs::X64_MSR_KERNEL_GS_BASE, 7),
+                (x86defs::X86X_MSR_SYSENTER_CS, 8),
+                (x86defs::X86X_MSR_SYSENTER_ESP, 9),
+                (x86defs::X86X_MSR_SYSENTER_EIP, 10),
+                (x86defs::X86X_MSR_SPEC_CTRL, 11),
+                (x86defs::X86X_MSR_TSC_AUX, 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_supported_vmsa_xsave_state() {
+        let mut vmsa = x86defs::snp::SevVmsa::new_zeroed();
+        vmsa.xcr0 = x86defs::xsave::XFEATURE_X87 | x86defs::xsave::XFEATURE_SSE;
+        vmsa.x87_fcw = 0x123;
+        vmsa.x87_fsw = 0x456;
+        vmsa.x87_op = 0x789;
+        vmsa.x87_rip = 0x1234_5678;
+        vmsa.x87dp = 0x8765_4321;
+        vmsa.mxcsr = 0x1f80;
+
+        let xsave = snp_igvm_vmsa_xsave(&vmsa);
+        assert_eq!(&xsave[0..2], &vmsa.x87_fcw.to_le_bytes());
+        assert_eq!(&xsave[2..4], &vmsa.x87_fsw.to_le_bytes());
+        assert_eq!(&xsave[6..8], &vmsa.x87_op.to_le_bytes());
+        assert_eq!(&xsave[8..16], &vmsa.x87_rip.to_le_bytes());
+        assert_eq!(&xsave[16..24], &vmsa.x87dp.to_le_bytes());
+        assert_eq!(&xsave[24..28], &vmsa.mxcsr.to_le_bytes());
+        let header = x86defs::xsave::XSAVE_LEGACY_LEN;
+        assert_eq!(
+            &xsave[header..header + size_of::<u64>()],
+            &vmsa.xcr0.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn rejects_vmsa_state_kvm_cannot_import() {
+        let features = x86defs::snp::SevFeatures::new().with_snp(true);
+        for update in [
+            |vmsa: &mut x86defs::snp::SevVmsa| vmsa.pkru = 1,
+            |vmsa: &mut x86defs::snp::SevVmsa| vmsa.x87_ftw = 1,
+        ] {
+            let mut page = valid_vmsa_page(features);
+            update(vmsa_mut(&mut page));
+            assert!(matches!(
+                prepare_snp_config(snp_config(page), u64::MAX),
+                Err(SnpError::InvalidIgvmVmsa(
+                    "contains state that KVM cannot import"
+                ))
+            ));
+        }
     }
 
     #[test]
@@ -886,22 +1092,22 @@ mod tests {
     #[test]
     fn suppresses_identity_while_kvm_constructs_vmsas() {
         let features = x86defs::snp::SevFeatures::new().with_snp(true);
-        let mut config = (*snp_config(valid_vmsa_page(features))).clone();
-        config.identity = Some(test_identity());
-        let prepared = prepare_snp_config(Arc::new(config), u64::MAX).unwrap();
+        let mut config = snp_config(valid_vmsa_page(features));
+        config.id_block = Some(test_id_block());
+        let prepared = prepare_snp_config(config, u64::MAX).unwrap();
 
-        assert!(launch_identity(&prepared).is_none());
+        assert!(launch_id_block(&prepared).is_none());
     }
 
     #[test]
-    fn converts_snp_identity_without_recomputing_digest() {
-        let identity = test_identity();
-        let id_block = snp_id_block(&identity, 0x1234);
-        assert_eq!(id_block.ld, identity.launch_digest);
+    fn converts_snp_id_block_without_recomputing_digest() {
+        let source = test_id_block();
+        let id_block = snp_id_block(&source, 0x1234);
+        assert_eq!(id_block.ld, source.launch_digest);
         assert_eq!(id_block.policy, 0x1234);
         assert_eq!(id_block.guest_svn, 7);
 
-        let auth = snp_id_auth(&identity);
+        let auth = snp_id_auth(&source);
         assert_eq!(&auth[0..4], &1u32.to_le_bytes());
         assert_eq!(&auth[4..8], &2u32.to_le_bytes());
         assert_eq!(&auth[64..136], &[0x44; 72]);

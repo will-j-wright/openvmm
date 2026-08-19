@@ -34,7 +34,6 @@ use range_map_vec::RangeMap;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Seek;
-use std::sync::Arc;
 use thiserror::Error;
 use vm_loader::InitialLoad;
 use vm_loader::Loader;
@@ -86,14 +85,22 @@ pub enum Error {
     Vtl2MemoryTooSmall(u64, u64),
     #[error("invalid vtl2 relocation alignment {0:#x}")]
     Vtl2RelocationAlignment(u64),
-    #[error("unsupported guest architecture")]
-    UnsupportedGuestArch,
+    #[error("unsupported IGVM isolation type {0:?}")]
+    UnsupportedIgvmIsolationType(igvm::IsolationType),
+    #[error("IGVM loading is not supported for guest architecture {0}")]
+    UnsupportedIgvmGuestArchitecture(&'static str),
     #[error("igvm file does not support vbs")]
     NoVbsSupport,
     #[error("igvm file does not support SNP")]
     NoSnpSupport,
     #[error("SNP IGVM file does not contain a guest policy")]
     MissingSnpGuestPolicy,
+    #[error("unsupported IGVM page data type {0:?}")]
+    UnsupportedPageDataType(IgvmPageDataType),
+    #[error("invalid SNP VMSA page size")]
+    InvalidSnpVmsaSize,
+    #[error("IGVM error range at GPA {gpa:#x} with size {size_bytes:#x} is not 4-KiB aligned")]
+    InvalidErrorRange { gpa: u64, size_bytes: u64 },
     #[error("vp context for lower VTL not supported")]
     LowerVtlContext,
     #[error("missing required memory range {0}")]
@@ -182,7 +189,7 @@ fn selected_platform_header(
     match igvm_isolation_type {
         igvm::IsolationType::Vbs => vbs_platform_header(igvm_file),
         igvm::IsolationType::Snp => snp_platform_header(igvm_file),
-        _ => Err(Error::UnsupportedGuestArch),
+        unsupported => Err(Error::UnsupportedIgvmIsolationType(unsupported)),
     }
 }
 
@@ -214,7 +221,7 @@ pub fn isolation_config(
     });
 
     let mut vp_contexts = Vec::new();
-    let mut identity = None;
+    let mut id_block = None;
     for directive in igvm_file.directives() {
         match directive {
             IgvmDirectiveHeader::SnpVpContext {
@@ -224,12 +231,12 @@ pub fn isolation_config(
                 ..
             } => {
                 let page = <&[u8; 4096]>::try_from(vmsa.as_bytes())
-                    .expect("the parsed SNP VMSA is a 4-KiB page");
-                vp_contexts.push(Arc::new(virt::SnpVpContext {
+                    .map_err(|_| Error::InvalidSnpVmsaSize)?;
+                vp_contexts.push(virt::SnpVpContext {
                     gpa: *gpa,
                     vp_index: virt::VpIndex::new(u32::from(*vp_index)),
-                    page: Arc::new(*page),
-                }));
+                    page: Box::new(*page),
+                });
             }
             IgvmDirectiveHeader::SnpIdBlock {
                 author_key_enabled,
@@ -246,7 +253,7 @@ pub fn isolation_config(
                 author_public_key,
                 ..
             } => {
-                identity = Some(virt::SnpIdentity {
+                id_block = Some(virt::SnpIdBlock {
                     author_key_enabled: *author_key_enabled,
                     launch_digest: *ld,
                     family_id: *family_id,
@@ -255,20 +262,20 @@ pub fn isolation_config(
                     guest_svn: *guest_svn,
                     id_key_algorithm: *id_key_algorithm,
                     author_key_algorithm: *author_key_algorithm,
-                    id_key_signature: virt::SnpIdBlockSignature {
+                    id_key_signature: x86defs::snp::SnpIdBlockSignature {
                         r: id_key_signature.r_comp,
                         s: id_key_signature.s_comp,
                     },
-                    id_public_key: virt::SnpIdBlockPublicKey {
+                    id_public_key: x86defs::snp::SnpIdBlockPublicKey {
                         curve: id_public_key.curve,
                         qx: id_public_key.qx,
                         qy: id_public_key.qy,
                     },
-                    author_key_signature: virt::SnpIdBlockSignature {
+                    author_key_signature: x86defs::snp::SnpIdBlockSignature {
                         r: author_key_signature.r_comp,
                         s: author_key_signature.s_comp,
                     },
-                    author_public_key: virt::SnpIdBlockPublicKey {
+                    author_public_key: x86defs::snp::SnpIdBlockPublicKey {
                         curve: author_public_key.curve,
                         qx: author_public_key.qx,
                         qy: author_public_key.qy,
@@ -279,16 +286,14 @@ pub fn isolation_config(
         }
     }
 
-    Ok(Some(virt::IgvmIsolationConfig::Snp(Arc::new(
-        virt::SnpConfig {
-            policy,
-            highest_vtl: platform.highest_vtl,
-            shared_gpa_boundary: platform.shared_gpa_boundary,
-            has_relocation,
-            vp_contexts,
-            identity,
-        },
-    ))))
+    Ok(Some(virt::IgvmIsolationConfig::Snp(virt::SnpConfig {
+        policy,
+        highest_vtl: platform.highest_vtl,
+        shared_gpa_boundary: platform.shared_gpa_boundary,
+        has_relocation,
+        vp_contexts,
+        id_block,
+    })))
 }
 
 /// Determine if the given `igvm_file` supports relocations or not.
@@ -1006,9 +1011,6 @@ fn load_igvm_x86(
     let mut page_data = PageDataBuffer::new();
     for header in directives {
         debug_assert!(header.compatibility_mask().unwrap_or(mask) & mask == mask);
-        if !matches!(*header, IgvmDirectiveHeader::PageData { .. }) {
-            page_data.flush(&mut loader)?;
-        }
 
         match *header {
             IgvmDirectiveHeader::PageData {
@@ -1048,7 +1050,7 @@ fn load_igvm_x86(
                     IgvmPageDataType::SECRETS => BootPageAcceptance::SecretsPage,
                     IgvmPageDataType::CPUID_DATA => BootPageAcceptance::CpuidPage,
                     IgvmPageDataType::CPUID_XF => BootPageAcceptance::CpuidExtendedStatePage,
-                    _ => todo!("unsupported IgvmPageDataType"),
+                    unsupported => return Err(Error::UnsupportedPageDataType(unsupported)),
                 };
 
                 if data.is_empty() {
@@ -1168,12 +1170,10 @@ fn load_igvm_x86(
                 import_parameter(&mut parameter_areas, info, environment_info.as_bytes())?;
             }
             IgvmDirectiveHeader::SnpVpContext { gpa, .. } => {
-                // Backends need the raw VMSA before partition creation, so its
-                // bytes travel through the pre-build isolation config. Retain
-                // an ordered launch marker here so a backend that imports raw
-                // VMSAs can reproduce the IGVM measurement sequence.
+                // The marker must retain its position relative to measured page
+                // imports, so flush any buffered PageData first.
+                page_data.flush(&mut loader)?;
                 let gpa = relocate_gpa(gpa);
-                debug_assert!(gpa.is_multiple_of(HV_PAGE_SIZE));
                 loader
                     .record_vp_context_import(gpa / HV_PAGE_SIZE, "igvm-vmsa")
                     .map_err(Error::Loader)?;
@@ -1346,15 +1346,22 @@ fn load_igvm_x86(
             }
             IgvmDirectiveHeader::ErrorRange {
                 gpa, size_bytes, ..
-            } => loader
-                .import_pages(
-                    gpa / HV_PAGE_SIZE,
-                    size_bytes as u64 / HV_PAGE_SIZE,
-                    "igvm-error-range",
-                    BootPageAcceptance::Shared,
-                    &[],
-                )
-                .map_err(Error::Loader)?,
+            } => {
+                // Error ranges become shared page imports and must remain in
+                // directive order relative to buffered PageData.
+                page_data.flush(&mut loader)?;
+                let gpa = relocate_gpa(gpa);
+                let (page_base, page_count) = error_range_pages(gpa, size_bytes.into())?;
+                loader
+                    .import_pages(
+                        page_base,
+                        page_count,
+                        "igvm-error-range",
+                        BootPageAcceptance::Shared,
+                        &[],
+                    )
+                    .map_err(Error::Loader)?;
+            }
             IgvmDirectiveHeader::X64NativeVpContext { .. } => {
                 todo!("native vp context not supported")
             }
@@ -1442,7 +1449,15 @@ fn build_memory_map(
 fn load_igvm_aarch64(
     _params: LoadIgvmParams<'_, Aarch64Topology>,
 ) -> Result<InitialLoad<Aarch64Register>, Error> {
-    Err(Error::UnsupportedGuestArch)
+    Err(Error::UnsupportedIgvmGuestArchitecture("aarch64"))
+}
+
+fn error_range_pages(gpa: u64, size_bytes: u64) -> Result<(u64, u64), Error> {
+    if !gpa.is_multiple_of(HV_PAGE_SIZE) || !size_bytes.is_multiple_of(HV_PAGE_SIZE) {
+        return Err(Error::InvalidErrorRange { gpa, size_bytes });
+    }
+
+    Ok((gpa / HV_PAGE_SIZE, size_bytes / HV_PAGE_SIZE))
 }
 
 // Used to reduce calls into `import_pages`.
@@ -1532,5 +1547,25 @@ impl PageDataBuffer {
         self.data.clear();
         self.len = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_range_requires_page_alignment() {
+        assert_eq!(error_range_pages(0x2000, 0x3000).unwrap(), (2, 3));
+
+        for (gpa, size_bytes) in [(0x2001, 0x3000), (0x2000, 0x3001)] {
+            assert!(matches!(
+                error_range_pages(gpa, size_bytes),
+                Err(Error::InvalidErrorRange {
+                    gpa: error_gpa,
+                    size_bytes: error_size,
+                }) if error_gpa == gpa && error_size == size_bytes
+            ));
+        }
     }
 }

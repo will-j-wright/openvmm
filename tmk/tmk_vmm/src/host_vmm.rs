@@ -44,6 +44,7 @@ impl RunContext<'_> {
                 hv_config: None,
                 vmtime: self.vmtime_source,
                 isolation: virt::IsolationType::None,
+                igvm_isolation_config: None,
                 nested_virt: false,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range: None,

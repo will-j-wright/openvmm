@@ -711,7 +711,12 @@ options:
     pub igvm: Option<PathBuf>,
 
     /// select the chipset and device personality for a non-VTL2 IGVM
-    #[clap(long, requires("igvm"), conflicts_with("vtl2"), value_enum)]
+    #[clap(
+        long,
+        requires("igvm"),
+        conflicts_with_all = ["vtl2", "uefi", "pcat"],
+        value_enum
+    )]
     pub igvm_personality: Option<IgvmPersonalityCli>,
 
     /// specify igvm vtl2 relocation type
@@ -5058,6 +5063,23 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_igvm_personality_conflicts_with_external_firmware() {
+        for firmware in ["--uefi", "--pcat"] {
+            assert!(
+                Options::try_parse_from([
+                    "openvmm",
+                    "--igvm",
+                    "guest.igvm",
+                    "--igvm-personality",
+                    "linux-direct",
+                    firmware,
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

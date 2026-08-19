@@ -877,6 +877,10 @@ impl virt::Hypervisor for Whp {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<WhpProtoPartition<'a>, Error> {
+        if config.igvm_isolation_config.is_some() {
+            return Err(Error::IgvmIsolationNotSupported);
+        }
+
         let user_mode_apic = self.user_mode_apic;
         let offload_enlightenments = self.offload_enlightenments;
         let nested_virt = config.nested_virt;
@@ -979,16 +983,6 @@ impl ProtoPartition for WhpProtoPartition<'_> {
         // commit). WHP on aarch64 does not deliver these faults, so the backing
         // must not defer any commit or protection to a fault.
         cfg!(guest_arch = "x86_64")
-    }
-
-    fn configure_isolation(
-        &mut self,
-        config: Option<&virt::IgvmIsolationConfig>,
-    ) -> Result<(), Self::Error> {
-        if config.is_some() {
-            return Err(Error::IgvmIsolationNotSupported);
-        }
-        Ok(())
     }
 
     fn build(
