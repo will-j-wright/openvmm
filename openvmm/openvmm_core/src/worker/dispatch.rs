@@ -1028,17 +1028,17 @@ impl InitializedVm {
         } else {
             None
         };
-        let igvm_isolation_config = igvm_file
-            .as_ref()
-            .map(|file| {
-                super::vm_loaders::igvm::isolation_config(
-                    file,
-                    super::vm_loaders::igvm::igvm_isolation_type(partition_isolation),
-                )
-            })
-            .transpose()
-            .context("reading IGVM isolation configuration failed")?
-            .flatten();
+        let proto_partition_isolation = match partition_isolation {
+            virt::IsolationType::Snp => virt::ProtoPartitionIsolation::Snp(
+                igvm_file
+                    .as_ref()
+                    .map(super::vm_loaders::igvm::snp_isolation_config)
+                    .transpose()
+                    .context("reading IGVM SNP configuration failed")?
+                    .map(Box::new),
+            ),
+            isolation => isolation.into(),
+        };
 
         let hv_config = if cfg.hypervisor.with_hv {
             cfg_if::cfg_if! {
@@ -1117,8 +1117,7 @@ impl InitializedVm {
                 processor_topology: &processor_topology,
                 hv_config,
                 vmtime: &vmtime_source,
-                isolation: partition_isolation,
-                igvm_isolation_config,
+                isolation: proto_partition_isolation,
                 nested_virt: cfg.hypervisor.nested_virt,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,

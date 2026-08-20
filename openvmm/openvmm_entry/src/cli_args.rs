@@ -2818,7 +2818,6 @@ pub enum IsolationCli {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum IgvmPersonalityCli {
-    Pcat,
     Uefi,
     LinuxDirect,
 }
@@ -5024,7 +5023,6 @@ mod tests {
     #[test]
     fn test_igvm_personality_values() {
         for (value, expected) in [
-            ("pcat", IgvmPersonalityCli::Pcat),
             ("uefi", IgvmPersonalityCli::Uefi),
             ("linux-direct", IgvmPersonalityCli::LinuxDirect),
         ] {
@@ -5039,6 +5037,17 @@ mod tests {
             opt.validate_igvm_options().unwrap();
             assert_eq!(opt.igvm_personality, Some(expected));
         }
+
+        assert!(
+            Options::try_parse_from([
+                "openvmm",
+                "--igvm",
+                "guest.igvm",
+                "--igvm-personality",
+                "pcat",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

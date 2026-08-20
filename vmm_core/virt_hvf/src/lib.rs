@@ -115,10 +115,8 @@ impl virt::Hypervisor for HvfHypervisor {
         &'a mut self,
         config: virt::ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.igvm_isolation_config.is_some() {
-            return Err(
-                anyhow::anyhow!("HVF does not support IGVM isolation configuration").into(),
-            );
+        if config.isolation.is_isolated() {
+            return Err(anyhow::anyhow!("HVF does not support isolated partitions").into());
         }
 
         let mut ipa_bit_length = 0;

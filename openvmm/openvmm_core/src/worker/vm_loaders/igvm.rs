@@ -99,7 +99,9 @@ pub enum Error {
     UnsupportedPageDataType(IgvmPageDataType),
     #[error("invalid SNP VMSA page size")]
     InvalidSnpVmsaSize,
-    #[error("IGVM error range at GPA {gpa:#x} with size {size_bytes:#x} is not 4-KiB aligned")]
+    #[error(
+        "IGVM error range at GPA {gpa:#x} with size {size_bytes:#x} must be non-empty and 4-KiB aligned"
+    )]
     InvalidErrorRange { gpa: u64, size_bytes: u64 },
     #[error("vp context for lower VTL not supported")]
     LowerVtlContext,
@@ -193,15 +195,8 @@ fn selected_platform_header(
     }
 }
 
-/// Extract backend-owned isolation configuration from an IGVM file.
-pub fn isolation_config(
-    igvm_file: &IgvmFile,
-    igvm_isolation_type: igvm::IsolationType,
-) -> Result<Option<virt::IgvmIsolationConfig>, Error> {
-    if igvm_isolation_type != igvm::IsolationType::Snp {
-        return Ok(None);
-    }
-
+/// Extract backend-owned SNP configuration from an IGVM file.
+pub fn snp_isolation_config(igvm_file: &IgvmFile) -> Result<virt::SnpConfig, Error> {
     let IgvmPlatformHeader::SupportedPlatform(platform) = snp_platform_header(igvm_file)?;
     let policy = igvm_file
         .initializations()
@@ -286,14 +281,14 @@ pub fn isolation_config(
         }
     }
 
-    Ok(Some(virt::IgvmIsolationConfig::Snp(virt::SnpConfig {
+    Ok(virt::SnpConfig {
         policy,
         highest_vtl: platform.highest_vtl,
         shared_gpa_boundary: platform.shared_gpa_boundary,
         has_relocation,
         vp_contexts,
         id_block,
-    })))
+    })
 }
 
 /// Determine if the given `igvm_file` supports relocations or not.
@@ -1453,7 +1448,10 @@ fn load_igvm_aarch64(
 }
 
 fn error_range_pages(gpa: u64, size_bytes: u64) -> Result<(u64, u64), Error> {
-    if !gpa.is_multiple_of(HV_PAGE_SIZE) || !size_bytes.is_multiple_of(HV_PAGE_SIZE) {
+    if size_bytes == 0
+        || !gpa.is_multiple_of(HV_PAGE_SIZE)
+        || !size_bytes.is_multiple_of(HV_PAGE_SIZE)
+    {
         return Err(Error::InvalidErrorRange { gpa, size_bytes });
     }
 
@@ -1555,10 +1553,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_range_requires_page_alignment() {
+    fn error_range_requires_nonempty_page_aligned_range() {
         assert_eq!(error_range_pages(0x2000, 0x3000).unwrap(), (2, 3));
 
-        for (gpa, size_bytes) in [(0x2001, 0x3000), (0x2000, 0x3001)] {
+        for (gpa, size_bytes) in [(0x2001, 0x3000), (0x2000, 0x3001), (0x2000, 0)] {
             assert!(matches!(
                 error_range_pages(gpa, size_bytes),
                 Err(Error::InvalidErrorRange {

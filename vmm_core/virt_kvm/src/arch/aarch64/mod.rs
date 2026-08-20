@@ -1138,11 +1138,6 @@ impl virt::Hypervisor for Kvm {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.igvm_isolation_config.is_some() {
-            return Err(KvmError::UnsupportedIsolationConfiguration(
-                "IGVM isolation configuration is not supported on aarch64",
-            ));
-        }
         if config.isolation.is_isolated() {
             return Err(KvmError::IsolationNotSupported);
         }

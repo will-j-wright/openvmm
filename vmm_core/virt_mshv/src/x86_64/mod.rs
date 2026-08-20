@@ -74,9 +74,6 @@ impl virt::Hypervisor for LinuxMshv {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
-        if config.igvm_isolation_config.is_some() {
-            return Err(ErrorInner::IsolationNotSupported.into());
-        }
         if config.isolation.is_isolated() {
             return Err(ErrorInner::IsolationNotSupported.into());
         }

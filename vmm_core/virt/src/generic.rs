@@ -290,11 +290,49 @@ pub struct SnpConfig {
     pub id_block: Option<SnpIdBlock>,
 }
 
-/// Isolation configuration extracted from a filtered IGVM file.
+/// Isolation configuration needed before a backend creates a partition.
 #[derive(Eq, PartialEq, Debug, Clone)]
-pub enum IgvmIsolationConfig {
-    /// AMD SEV-SNP launch configuration.
-    Snp(SnpConfig),
+pub enum ProtoPartitionIsolation {
+    /// No isolation.
+    None,
+    /// Hypervisor-based isolation.
+    Vbs,
+    /// AMD SEV-SNP, optionally with launch configuration from an IGVM file.
+    Snp(Option<Box<SnpConfig>>),
+    /// Intel Trust Domain Extensions.
+    Tdx,
+    /// Arm Confidential Compute Architecture.
+    Cca,
+}
+
+impl ProtoPartitionIsolation {
+    /// Returns the simple isolation classification.
+    pub fn isolation_type(&self) -> IsolationType {
+        match self {
+            Self::None => IsolationType::None,
+            Self::Vbs => IsolationType::Vbs,
+            Self::Snp(_) => IsolationType::Snp,
+            Self::Tdx => IsolationType::Tdx,
+            Self::Cca => IsolationType::Cca,
+        }
+    }
+
+    /// Returns whether the partition is isolated.
+    pub fn is_isolated(&self) -> bool {
+        self.isolation_type().is_isolated()
+    }
+}
+
+impl From<IsolationType> for ProtoPartitionIsolation {
+    fn from(value: IsolationType) -> Self {
+        match value {
+            IsolationType::None => Self::None,
+            IsolationType::Vbs => Self::Vbs,
+            IsolationType::Snp => Self::Snp(None),
+            IsolationType::Tdx => Self::Tdx,
+            IsolationType::Cca => Self::Cca,
+        }
+    }
 }
 
 /// Prototype partition creation configuration.
@@ -305,10 +343,8 @@ pub struct ProtoPartitionConfig<'a> {
     pub hv_config: Option<HvConfig>,
     /// VM time access.
     pub vmtime: &'a VmTimeSource,
-    /// Isolation type for this partition.
-    pub isolation: IsolationType,
-    /// Optional backend configuration extracted from an IGVM file.
-    pub igvm_isolation_config: Option<IgvmIsolationConfig>,
+    /// Isolation type and optional backend configuration for this partition.
+    pub isolation: ProtoPartitionIsolation,
     /// Expose hardware virtualization (VMX/SVM) to the guest so that it can run
     /// its own hypervisor.
     ///

@@ -231,7 +231,6 @@ fn base_chipset_type(opt: &Options) -> BaseChipsetType {
     if opt.igvm.is_some() {
         match opt.igvm_personality {
             None => BaseChipsetType::HclHost,
-            Some(IgvmPersonalityCli::Pcat) => BaseChipsetType::HypervGen1,
             Some(IgvmPersonalityCli::Uefi) => BaseChipsetType::HypervGen2Uefi,
             Some(IgvmPersonalityCli::LinuxDirect)
                 if matches!(opt.isolation, Some(cli_args::IsolationCli::Snp)) =>
@@ -1152,12 +1151,7 @@ async fn vm_config_from_command_line(
         None
     };
 
-    let framebuffer = if opt.gfx
-        || opt.vtl2_gfx
-        || opt.vnc.vnc
-        || opt.pcat
-        || matches!(opt.igvm_personality, Some(IgvmPersonalityCli::Pcat))
-    {
+    let framebuffer = if opt.gfx || opt.vtl2_gfx || opt.vnc.vnc || opt.pcat {
         let vram = alloc_shared_memory(FRAMEBUFFER_SIZE, "vram")?;
         let (fb, fba) =
             framebuffer::framebuffer(vram, FRAMEBUFFER_SIZE, 0).context("creating framebuffer")?;
@@ -1278,7 +1272,7 @@ async fn vm_config_from_command_line(
             .into();
         let cmdline = opt.cmdline.join(" ");
         with_hv = match opt.igvm_personality {
-            None | Some(IgvmPersonalityCli::Pcat | IgvmPersonalityCli::Uefi) => true,
+            None | Some(IgvmPersonalityCli::Uefi) => true,
             Some(IgvmPersonalityCli::LinuxDirect) => opt.hv,
         };
 
@@ -3027,16 +3021,6 @@ mod tests {
     #[test]
     fn maps_igvm_personalities_to_chipsets() {
         for (args, expected) in [
-            (
-                vec![
-                    "openvmm",
-                    "--igvm",
-                    "guest.igvm",
-                    "--igvm-personality",
-                    "pcat",
-                ],
-                BaseChipsetType::HypervGen1,
-            ),
             (
                 vec![
                     "openvmm",

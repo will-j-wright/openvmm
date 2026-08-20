@@ -20,7 +20,6 @@ use thiserror::Error;
 use virt::InitialPageImportType;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
-use zerocopy::IntoBytes;
 
 pub(crate) const KVM_SNP_VMSA_GPA: u64 = 0xffff_ffff_f000;
 
@@ -137,7 +136,8 @@ pub(crate) fn prepare_snp_config(
         return Err(SnpError::InvalidIgvmVmsa("vTOM is not supported"));
     }
     // KVM_SEV_INIT2 takes the feature bits that configure the VMSA, excluding
-    // the SNP-active bit stored in the VMSA itself.
+    // the SNP-active bit stored in the VMSA itself. KVM adds that bit when it
+    // initializes an SNP VM.
     let vmsa_features = u64::from(bsp.vmsa.sev_features.with_snp(false));
     let unsupported_features = vmsa_features & !supported_vmsa_features;
     if unsupported_features != 0 {
@@ -150,12 +150,6 @@ pub(crate) fn prepare_snp_config(
         bsp,
         vmsa_features,
     })
-}
-
-fn launch_id_block(_config: &KvmSnpConfig) -> Option<&virt::SnpIdBlock> {
-    // KVM constructs and measures every initial VMSA outside the IGVM
-    // directive stream. The file identity cannot describe that measurement.
-    None
 }
 
 impl virt::AcceptInitialPages for KvmPartition {
@@ -233,6 +227,9 @@ impl KvmPartitionInner {
 
             let kvm_page_type = crate::arch::snp::snp_launch_page_type(page.import_type)?;
 
+            // Each import may cover a coalesced range, so this lock is taken
+            // once per import rather than once per 4-KiB page. Keep it scoped
+            // around the lookup because shared-range handling also takes it.
             let private_range = {
                 let memory = self.memory.lock();
                 private_memory_range_from_slots(page.range, &memory.ranges)
@@ -276,35 +273,8 @@ impl KvmPartitionInner {
         }
         self.prepare_snp_vmsa_register_state()?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
-        let id_block = self.snp_config.as_ref().and_then(launch_id_block);
-        if self
-            .snp_config
-            .as_ref()
-            .is_some_and(|config| config.generic.id_block.is_some())
-            && id_block.is_none()
-        {
-            tracing::warn!(
-                vp_count = self.vps.len(),
-                "ignoring SNP ID block because KVM constructs VMSAs outside the IGVM measurement"
-            );
-        }
-        if let Some(id_block) = id_block {
-            let psp_id_block = snp_id_block(id_block, launch_start.policy);
-            let id_auth = snp_id_auth(id_block);
-            let mut finish = kvm::kvm_sev_snp_launch_finish {
-                id_block_uaddr: psp_id_block.as_bytes().as_ptr() as u64,
-                id_auth_uaddr: id_auth.as_ptr() as u64,
-                id_block_en: 1,
-                auth_key_en: (id_block.author_key_enabled != 0).into(),
-                vcek_disabled: 0,
-                host_data: [0; 32],
-                ..Default::default()
-            };
-            self.kvm.sev_snp_launch_finish(sev.as_fd(), &mut finish)?;
-        } else {
-            self.kvm
-                .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
-        }
+        self.kvm
+            .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
         Ok(())
     }
 
@@ -438,52 +408,6 @@ fn validate_vp_context_imports(
     }
 
     Ok(())
-}
-
-fn snp_id_block(id_block: &virt::SnpIdBlock, policy: u64) -> x86defs::snp::SnpPspIdBlock {
-    x86defs::snp::SnpPspIdBlock {
-        ld: id_block.launch_digest,
-        family_id: id_block.family_id,
-        image_id: id_block.image_id,
-        version: id_block.version,
-        guest_svn: id_block.guest_svn,
-        policy,
-    }
-}
-
-fn snp_id_auth(id_block: &virt::SnpIdBlock) -> Box<[u8; 4096]> {
-    const ID_BLOCK_SIGNATURE: usize = 64;
-    const ID_KEY: usize = 576;
-    const AUTHOR_KEY_SIGNATURE: usize = 1664;
-    const AUTHOR_KEY: usize = 2176;
-
-    fn write_signature(
-        page: &mut [u8],
-        offset: usize,
-        signature: &x86defs::snp::SnpIdBlockSignature,
-    ) {
-        page[offset..offset + 72].copy_from_slice(&signature.r);
-        page[offset + 72..offset + 144].copy_from_slice(&signature.s);
-    }
-
-    fn write_public_key(page: &mut [u8], offset: usize, key: &x86defs::snp::SnpIdBlockPublicKey) {
-        page[offset..offset + 4].copy_from_slice(&key.curve.to_le_bytes());
-        page[offset + 4..offset + 76].copy_from_slice(&key.qx);
-        page[offset + 76..offset + 148].copy_from_slice(&key.qy);
-    }
-
-    let mut page = Box::new([0; 4096]);
-    page[0..4].copy_from_slice(&id_block.id_key_algorithm.to_le_bytes());
-    page[4..8].copy_from_slice(&id_block.author_key_algorithm.to_le_bytes());
-    write_signature(&mut *page, ID_BLOCK_SIGNATURE, &id_block.id_key_signature);
-    write_public_key(&mut *page, ID_KEY, &id_block.id_public_key);
-    write_signature(
-        &mut *page,
-        AUTHOR_KEY_SIGNATURE,
-        &id_block.author_key_signature,
-    );
-    write_public_key(&mut *page, AUTHOR_KEY, &id_block.author_public_key);
-    page
 }
 
 fn segment_from_vmsa(segment: x86defs::snp::SevSelector) -> kvm::kvm_segment {
@@ -836,6 +760,7 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
     use zerocopy::FromZeros;
+    use zerocopy::IntoBytes;
 
     fn valid_vmsa_page_at_rip(features: x86defs::snp::SevFeatures, rip: u64) -> Box<[u8; 4096]> {
         let mut vmsa = x86defs::snp::SevVmsa::new_zeroed();
@@ -889,37 +814,6 @@ mod tests {
 
     fn snp_config(page: Box<[u8; 4096]>) -> virt::SnpConfig {
         snp_config_with_contexts(vec![vp_context(0, page)])
-    }
-
-    fn test_id_block() -> virt::SnpIdBlock {
-        virt::SnpIdBlock {
-            author_key_enabled: 1,
-            launch_digest: [0x11; 48],
-            family_id: [0x22; 16],
-            image_id: [0x33; 16],
-            version: 1,
-            guest_svn: 7,
-            id_key_algorithm: 1,
-            author_key_algorithm: 2,
-            id_key_signature: x86defs::snp::SnpIdBlockSignature {
-                r: [0x44; 72],
-                s: [0x55; 72],
-            },
-            id_public_key: x86defs::snp::SnpIdBlockPublicKey {
-                curve: 2,
-                qx: [0x66; 72],
-                qy: [0x77; 72],
-            },
-            author_key_signature: x86defs::snp::SnpIdBlockSignature {
-                r: [0x88; 72],
-                s: [0x99; 72],
-            },
-            author_public_key: x86defs::snp::SnpIdBlockPublicKey {
-                curve: 3,
-                qx: [0xaa; 72],
-                qy: [0xbb; 72],
-            },
-        }
     }
 
     fn page_import(gpa: u64, import_type: InitialPageImportType) -> virt::InitialPageImport {
@@ -1087,36 +981,6 @@ mod tests {
             ),
             Err(SnpError::InvalidIgvmTopology)
         ));
-    }
-
-    #[test]
-    fn suppresses_identity_while_kvm_constructs_vmsas() {
-        let features = x86defs::snp::SevFeatures::new().with_snp(true);
-        let mut config = snp_config(valid_vmsa_page(features));
-        config.id_block = Some(test_id_block());
-        let prepared = prepare_snp_config(config, u64::MAX).unwrap();
-
-        assert!(launch_id_block(&prepared).is_none());
-    }
-
-    #[test]
-    fn converts_snp_id_block_without_recomputing_digest() {
-        let source = test_id_block();
-        let id_block = snp_id_block(&source, 0x1234);
-        assert_eq!(id_block.ld, source.launch_digest);
-        assert_eq!(id_block.policy, 0x1234);
-        assert_eq!(id_block.guest_svn, 7);
-
-        let auth = snp_id_auth(&source);
-        assert_eq!(&auth[0..4], &1u32.to_le_bytes());
-        assert_eq!(&auth[4..8], &2u32.to_le_bytes());
-        assert_eq!(&auth[64..136], &[0x44; 72]);
-        assert_eq!(&auth[136..208], &[0x55; 72]);
-        assert_eq!(&auth[576..580], &2u32.to_le_bytes());
-        assert_eq!(&auth[580..652], &[0x66; 72]);
-        assert_eq!(&auth[652..724], &[0x77; 72]);
-        assert_eq!(&auth[1664..1736], &[0x88; 72]);
-        assert_eq!(&auth[2176..2180], &3u32.to_le_bytes());
     }
 
     #[test]

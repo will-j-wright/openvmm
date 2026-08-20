@@ -151,7 +151,7 @@ impl virt::Hypervisor for Kvm {
         &mut self,
         mut config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        match config.isolation {
+        match config.isolation.isolation_type() {
             virt::IsolationType::None => {}
             virt::IsolationType::Snp => {
                 if config.hv_config.is_some() {
@@ -371,7 +371,27 @@ impl virt::Hypervisor for Kvm {
             }
         }
 
-        let sev = match config.isolation {
+        let snp_config = match &mut config.isolation {
+            virt::ProtoPartitionIsolation::None => None,
+            virt::ProtoPartitionIsolation::Snp(snp_config) => {
+                if let Some(snp_config) = snp_config.take() {
+                    Some(crate::snp::prepare_snp_config(
+                        *snp_config,
+                        self.kvm.supported_sev_vmsa_features()?,
+                    )?)
+                } else {
+                    None
+                }
+            }
+            virt::ProtoPartitionIsolation::Vbs
+            | virt::ProtoPartitionIsolation::Tdx
+            | virt::ProtoPartitionIsolation::Cca => {
+                return Err(KvmError::IsolationNotSupported);
+            }
+        };
+        let isolation = config.isolation.isolation_type();
+
+        let sev = match isolation {
             virt::IsolationType::Snp => Some(
                 OpenOptions::new()
                     .read(true)
@@ -385,7 +405,7 @@ impl virt::Hypervisor for Kvm {
             }
         };
 
-        let vm = match config.isolation {
+        let vm = match isolation {
             virt::IsolationType::None => self.kvm.new_vm(kvm::VmType::Default)?,
             virt::IsolationType::Snp => {
                 let vm = self.kvm.new_vm(kvm::VmType::Snp)?;
@@ -399,25 +419,6 @@ impl virt::Hypervisor for Kvm {
         vm.enable_split_irqchip(virt::irqcon::IRQ_LINES as u32)?;
         vm.enable_x2apic_api()?;
         vm.enable_unknown_msr_exits()?;
-
-        let snp_config = match (config.isolation, config.igvm_isolation_config.take()) {
-            (virt::IsolationType::None, None) => None,
-            (virt::IsolationType::None, Some(_)) => {
-                return Err(KvmError::UnsupportedIsolationConfiguration(
-                    "IGVM isolation configuration requires an isolated partition",
-                ));
-            }
-            (virt::IsolationType::Snp, None) => None,
-            (virt::IsolationType::Snp, Some(virt::IgvmIsolationConfig::Snp(snp_config))) => {
-                Some(crate::snp::prepare_snp_config(
-                    snp_config,
-                    self.kvm.supported_sev_vmsa_features()?,
-                )?)
-            }
-            (virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca, _) => {
-                return Err(KvmError::IsolationNotSupported);
-            }
-        };
 
         if let Some(sev) = &sev {
             vm.sev_snp_init(
@@ -546,7 +547,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
             .map(|range| range.range)
             .chain(config.mem_layout.vtl2_range())
             .collect();
-        let memory_backing_mode = match self.config.isolation {
+        let memory_backing_mode = match self.config.isolation.isolation_type() {
             virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
             virt::IsolationType::Snp => {
                 KvmMemoryBackingMode::guest_memfd(&self.vm, ram_ranges.iter().copied(), true)?

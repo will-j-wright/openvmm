@@ -88,7 +88,15 @@ impl<R> Loader<'_, R> {
         self.regs.into_values().collect()
     }
 
+    /// Returns initial state with page imports coalesced in GPA order.
+    ///
+    /// VP-context markers require import-call ordering and must be collected
+    /// with [`Self::initial_regs_and_ordered_page_imports`].
     pub fn initial_regs_and_page_imports(mut self) -> InitialLoad<R> {
+        assert!(
+            self.vp_context_imports.is_empty(),
+            "VP context imports require ordered page import collection"
+        );
         // Merge adjacent ranges first to help cut down on the number of entries
         // in the initial page import list. Since we load from an IGVM file,
         // most ranges are a single 4K page which can be merged for easier
@@ -96,7 +104,7 @@ impl<R> Loader<'_, R> {
         self.page_imports
             .merge_adjacent(range_map_vec::u64_is_adjacent);
 
-        let mut page_imports = self
+        let page_imports = self
             .page_imports
             .into_vec()
             .into_iter()
@@ -106,12 +114,6 @@ impl<R> Loader<'_, R> {
                 tag: info.tag,
             })
             .collect::<Vec<_>>();
-        page_imports.extend(
-            self.vp_context_imports
-                .into_iter()
-                .map(|import| import.page_import),
-        );
-
         InitialLoad {
             regs: self.regs.into_values().collect(),
             page_imports,
@@ -615,5 +617,19 @@ mod tests {
             InitialPageImportType::VpContext
         );
         assert_eq!(page_imports[2].range, page_imports[3].range);
+    }
+
+    #[test]
+    #[should_panic(expected = "VP context imports require ordered page import collection")]
+    fn unordered_page_imports_reject_vp_contexts() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .record_vp_context_import(0x000f_ffff_ffff, "vmsa")
+            .unwrap();
+
+        let _ = loader.initial_regs_and_page_imports();
     }
 }
