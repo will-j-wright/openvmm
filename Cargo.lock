@@ -7801,6 +7801,7 @@ dependencies = [
  "pci_core",
  "thiserror 2.0.16",
  "tracelimit",
+ "tracing",
  "vmcore",
  "zerocopy",
 ]
@@ -9342,6 +9343,7 @@ dependencies = [
  "vfio_sys",
  "vm_resource",
  "vmcore",
+ "zerocopy",
 ]
 
 [[package]]
@@ -9367,6 +9369,7 @@ dependencies = [
  "tracelimit",
  "tracing",
  "vfio-bindings",
+ "zerocopy",
 ]
 
 [[package]]
