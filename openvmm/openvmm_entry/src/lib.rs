@@ -1222,7 +1222,7 @@ async fn vm_config_from_command_line(
         (base_template_json, custom_uefi_json)
     };
 
-    if opt.uefi && opt.igvm.is_none() && !opt.pcat
+    if (opt.uefi && opt.igvm.is_none() && !opt.pcat)
         || matches!(opt.igvm_personality, Some(IgvmPersonalityCli::Uefi))
     {
         let log_level = match opt.efi_diagnostics_log_level.unwrap_or_default() {

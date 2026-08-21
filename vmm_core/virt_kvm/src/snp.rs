@@ -431,7 +431,10 @@ fn segment_from_vmsa(segment: x86defs::snp::SevSelector) -> kvm::kvm_segment {
 fn table_from_vmsa(table: x86defs::snp::SevSelector) -> kvm::kvm_dtable {
     kvm::kvm_dtable {
         base: table.base,
-        limit: table.limit as u16,
+        limit: table
+            .limit
+            .try_into()
+            .expect("SNP IGVM VMSA table limits were validated"),
         padding: [0; 3],
     }
 }
@@ -441,6 +444,12 @@ fn table_from_vmsa(table: x86defs::snp::SevSelector) -> kvm::kvm_dtable {
 /// KVM constructs the measured VMSA from its vCPU state, so silently ignoring
 /// a file-provided field would produce a different initial context.
 fn validate_snp_igvm_vmsa_state(vmsa: &x86defs::snp::SevVmsa) -> Result<(), SnpError> {
+    if u16::try_from(vmsa.gdtr.limit).is_err() || u16::try_from(vmsa.idtr.limit).is_err() {
+        return Err(SnpError::InvalidIgvmVmsa(
+            "descriptor table limit exceeds KVM representation",
+        ));
+    }
+
     let mut supported = x86defs::snp::SevVmsa::new_zeroed();
     supported.es = vmsa.es;
     supported.cs = vmsa.cs;
@@ -951,6 +960,24 @@ mod tests {
                 prepare_snp_config(snp_config(page), u64::MAX),
                 Err(SnpError::InvalidIgvmVmsa(
                     "contains state that KVM cannot import"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_vmsa_table_limit_kvm_cannot_represent() {
+        let features = x86defs::snp::SevFeatures::new().with_snp(true);
+        for update in [
+            |vmsa: &mut x86defs::snp::SevVmsa| vmsa.gdtr.limit = u32::from(u16::MAX) + 1,
+            |vmsa: &mut x86defs::snp::SevVmsa| vmsa.idtr.limit = u32::from(u16::MAX) + 1,
+        ] {
+            let mut page = valid_vmsa_page(features);
+            update(vmsa_mut(&mut page));
+            assert!(matches!(
+                prepare_snp_config(snp_config(page), u64::MAX),
+                Err(SnpError::InvalidIgvmVmsa(
+                    "descriptor table limit exceeds KVM representation"
                 ))
             ));
         }

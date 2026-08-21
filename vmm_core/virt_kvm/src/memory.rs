@@ -320,8 +320,10 @@ impl KvmPartitionInner {
     /// before launch updates begin.
     #[cfg(guest_arch = "x86_64")]
     pub(crate) fn set_initial_shared_memory(&self, range: MemoryRange) -> Result<(), MemoryError> {
-        let state = self.memory.lock();
-        let segments = guest_memfd_range_segments(range, &state.ranges)?;
+        let segments = {
+            let state = self.memory.lock();
+            guest_memfd_range_segments(range, &state.ranges)?
+        };
         self.kvm
             .set_memory_attributes(range.start(), range.len(), 0)?;
         self.discard_stale_private_memory_backing(&segments, false, "SNP")
