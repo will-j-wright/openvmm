@@ -305,9 +305,16 @@ pub struct MapFile {
     required_memory: Vec<RequiredMemory>,
     accepted_ranges: Vec<(MemoryRange, RangeInfo)>,
     relocatable_regions: Vec<(MemoryRange, RelocationType)>,
+    reported_ranges: Vec<(MemoryRange, String)>,
 }
 
 impl MapFile {
+    /// Adds a range that is relevant to the generated image but is not an IGVM
+    /// directive.
+    pub fn report_range(&mut self, range: MemoryRange, tag: impl Into<String>) {
+        self.reported_ranges.push((range, tag.into()));
+    }
+
     /// Emit this map file information to tracing::info.
     pub fn emit_tracing(&self) {
         tracing::info!(isolation = ?self.isolation, "IGVM file isolation");
@@ -362,6 +369,19 @@ impl MapFile {
                         );
                     }
                 }
+            }
+        }
+
+        if !self.reported_ranges.is_empty() {
+            tracing::info!("IGVM file reported ranges:");
+            for (range, tag) in &self.reported_ranges {
+                tracing::info!(
+                    size_bytes = range.len(),
+                    "{:#x} - {:#x} {}",
+                    range.start(),
+                    range.end(),
+                    tag,
+                );
             }
         }
     }
@@ -427,6 +447,20 @@ impl Display for MapFile {
             }
         }
 
+        if !self.reported_ranges.is_empty() {
+            writeln!(f, "IGVM file reported ranges:")?;
+            for (range, tag) in &self.reported_ranges {
+                writeln!(
+                    f,
+                    "  {:016x} - {:016x} ({:#x} bytes) {}",
+                    range.start(),
+                    range.end(),
+                    range.len(),
+                    tag
+                )?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -435,7 +469,7 @@ impl Display for MapFile {
 #[derive(Debug)]
 pub struct IgvmOutput {
     pub guest: IgvmFile,
-    pub map: String,
+    pub map: MapFile,
 }
 
 impl IgvmLoader<X86Register> {
@@ -848,6 +882,7 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                     )
                 })
                 .collect(),
+            reported_ranges: Vec::new(),
         };
 
         map_file.emit_tracing();
@@ -863,7 +898,7 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
 
         let output = IgvmOutput {
             guest: igvm_file,
-            map: map_file.to_string(),
+            map: map_file,
         };
         Ok(output)
     }

@@ -229,11 +229,11 @@ mod arch {
     pub fn accept_range(range: SnpBootShimRange) -> Result<(), AcceptError> {
         let pages_per_large_page = LARGE_PAGE_SIZE / PAGE_SIZE;
         let mut page_base = range.start_gpn;
-        let mut page_count = range.page_count;
+        let mut pages_remaining = range.page_count;
 
-        while page_count != 0 {
+        while pages_remaining != 0 {
             if page_base.is_multiple_of(pages_per_large_page)
-                && page_count >= pages_per_large_page
+                && pages_remaining >= pages_per_large_page
                 && set_page_private(page_base, true).is_ok()
             {
                 let va = page_base * PAGE_SIZE;
@@ -241,20 +241,22 @@ mod arch {
                     PvalidateStatus::Success => {
                         fixup_range_cache_state(va, pages_per_large_page);
                         page_base += pages_per_large_page;
-                        page_count -= pages_per_large_page;
+                        pages_remaining -= pages_per_large_page;
                         continue;
                     }
                     PvalidateStatus::SizeMismatch => {}
                 }
             }
 
+            // Fall back to 4-KiB acceptance when a 2-MiB PVALIDATE is not
+            // supported for this range.
             let va = page_base * PAGE_SIZE;
             set_page_private(page_base, false)?;
             match pvalidate(va, false)? {
                 PvalidateStatus::Success => {
                     fixup_range_cache_state(va, 1);
                     page_base += 1;
-                    page_count -= 1;
+                    pages_remaining -= 1;
                 }
                 PvalidateStatus::SizeMismatch => return Err(AcceptError),
             }
@@ -274,6 +276,8 @@ struct Stack([u8; STACK_SIZE]);
 #[cfg(minimal_rt)]
 static mut STACK: Stack = Stack([0; STACK_SIZE]);
 
+// Assembly needs fixed symbols for the final indirect handoff. These start in
+// zeroed BSS and `start` writes the validated parameter values before use.
 #[cfg(minimal_rt)]
 static mut LINUX_ENTRY: u64 = 0;
 

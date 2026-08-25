@@ -484,6 +484,25 @@ mod test {
     }
 
     #[test]
+    fn parse_multi_vp_snp_linux_direct_manifest() {
+        let config: Config = serde_json::from_str(include_str!(
+            "../../manifests/snp-linux-direct-multi-vp.json"
+        ))
+        .unwrap();
+        let [guest] = config.guest_configs.as_slice() else {
+            panic!("expected one guest config");
+        };
+        let Image::SnpLinuxDirect {
+            processor_count, ..
+        } = &guest.image
+        else {
+            panic!("expected SNP Linux-direct image");
+        };
+        assert_eq!(*processor_count, 2);
+        guest.image.validate().unwrap();
+    }
+
+    #[test]
     fn snp_linux_direct_required_resources_with_initrd() {
         let image = snp_linux_direct_image(true, 1, 40960, 51);
 

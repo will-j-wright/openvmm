@@ -6,7 +6,8 @@ resource file and run `igvmfilegen manifest` directly.
 `snp-linux-direct.json` is a bring-up profile with these assumptions:
 
 - x64 and one VTL0 SEV-SNP guest that boots Linux directly
-- a simple `processor_count`; the default profile uses one virtual processor
+- a simple `processor_count`; the default profile uses one virtual processor,
+  while `snp-linux-direct-multi-vp.json` uses two
 - 160 MiB of contiguous RAM (40,960 4-KiB pages)
 - COM1 serial ACPI and the fixed, no-PCIe platform profile
 - no shared GPA boundary, normal interrupt injection, and secure AVIC disabled
@@ -23,11 +24,6 @@ included as IGVM `PageData`. After SNP launch, the bootshim accepts the remainin
 private RAM with `PVALIDATE` and then enters Linux. This avoids loading and
 measuring every configured RAM page, but still accepts all RAM before Linux
 starts.
-
-The manifest is a standalone image contract. It does not use OpenVMM runtime
-layout plans, Petri, or Flowey. It supports contiguous RAM from GPA 0, a fixed
-PC-compatible chipset profile, and no PCIe devices, VTL2, VMBus, framebuffer,
-virtio-mmio, disks, or VPCI.
 
 The IGVM contains only the BSP VMSA, regardless of processor count. Backends
 are responsible for any AP launch state they require. Current KVM constructs

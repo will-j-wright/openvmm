@@ -24,4 +24,4 @@ _start:
     call    {relocate}                             // Apply static-PIE relocation entries
     sub     rsp, 8                                 // Match the SysV function-entry stack alignment
     mov     rdi, r12                               // Pass the parameter-page GPA to start()
-    jmp     {start}                                // Enter Rust; start() never returns
+    jmp     {start}                                // Enter Rust
