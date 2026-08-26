@@ -30,7 +30,6 @@ use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDepsLinu
 use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDepsWindows;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use target_lexicon::Triple;
 use vmm_test_images::KnownTestArtifacts;
 
@@ -61,10 +60,6 @@ pub struct CheckinGatesCli {
 
     #[clap(flatten)]
     local_run_args: Option<crate::pipelines_shared::cfg_common_params::LocalRunArgs>,
-
-    /// Set custom path to search for / download VMM tests disk-images
-    #[clap(long)]
-    vmm_tests_disk_cache_dir: Option<PathBuf>,
 }
 
 impl IntoPipeline for CheckinGatesCli {
@@ -72,7 +67,6 @@ impl IntoPipeline for CheckinGatesCli {
         let Self {
             config,
             local_run_args,
-            vmm_tests_disk_cache_dir,
         } = self;
 
         let release = match config {
@@ -1751,15 +1745,6 @@ impl IntoPipeline for CheckinGatesCli {
                     done: ctx.new_done_handle(),
                 }
             });
-
-            if let Some(vmm_tests_disk_cache_dir) = vmm_tests_disk_cache_dir.clone() {
-                vmm_tests_run_job = vmm_tests_run_job.config(
-                    flowey_lib_hvlite::download_openvmm_vmm_tests_artifacts::Config {
-                        custom_cache_dir: Some(vmm_tests_disk_cache_dir),
-                        ..Default::default()
-                    },
-                );
-            }
 
             let vmm_tests_run_job = vmm_tests_run_job.finish();
             if !label.contains("snp") {
