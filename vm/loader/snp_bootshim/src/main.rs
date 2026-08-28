@@ -7,20 +7,17 @@
 // UNSAFETY: The bootshim issues PVALIDATE, reads freshly accepted pages, and
 // transfers control directly to the measured Linux entrypoint.
 #![cfg_attr(minimal_rt, expect(unsafe_code))]
+// Keep shared code visible to host tooling even though only tests and the
+// minimal-runtime entry point call it.
+#![cfg_attr(not(any(minimal_rt, test)), allow(dead_code))]
 
-#[cfg(any(minimal_rt, test))]
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
-#[cfg(any(minimal_rt, test))]
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
-#[cfg(any(minimal_rt, test))]
 use loader_defs::linux::SnpBootShimParams;
-#[cfg(any(minimal_rt, test))]
 use loader_defs::linux::SnpBootShimRange;
 
-#[cfg(any(minimal_rt, test))]
 const PAGE_SIZE: u64 = 4096;
 
-#[cfg(any(minimal_rt, test))]
 #[derive(Debug, Eq, PartialEq)]
 enum ParamsError {
     UnalignedParams,
@@ -38,7 +35,12 @@ enum ParamsError {
     ParamsRangeOverlap,
 }
 
-#[cfg(any(minimal_rt, test))]
+/// Validates the measured generator-to-bootshim handoff before using it.
+///
+/// The IGVM generator measures both this parameter page and the initial RSI
+/// that points to it. A validation failure therefore indicates an incompatible
+/// or corrupt image, or a generator bug. The runtime faults instead of using
+/// an invalid address or accepting an invalid RAM range.
 fn validate_params(
     params: &SnpBootShimParams,
     params_gpa: u64,
@@ -288,9 +290,12 @@ static mut LINUX_ZERO_PAGE: u64 = 0;
 struct NoAllocator;
 
 #[cfg(minimal_rt)]
-// SAFETY: The bootshim performs no dynamic allocation. Returning null makes an
-// accidental allocation fail immediately through the normal allocation error
-// path instead of consuming untracked guest memory.
+// `loader_defs::shim::save_restore` links `alloc::vec::Vec`, although this
+// bootshim does not allocate. Returning null makes an accidental allocation
+// fail immediately instead of consuming untracked guest memory.
+//
+// SAFETY: The implementation never returns storage, so it creates no memory
+// that a caller can access or deallocate.
 unsafe impl core::alloc::GlobalAlloc for NoAllocator {
     unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
         core::ptr::null_mut()

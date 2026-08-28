@@ -238,7 +238,17 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
     Ok(output)
 }
 
-/// Places the bootshim and parameters, then transfers the BSP handoff to it.
+/// Places the bootshim and its measured handoff page.
+///
+/// The Linux loader first imports the kernel, initrd, boot metadata, and SNP
+/// special pages. The bootshim is placed at the first page after both those
+/// imports and the kernel's runtime image. Its parameter page follows the
+/// bootshim. The BSP starts at the bootshim entry point with RSI pointing to
+/// that parameter page.
+///
+/// The parameter page lists every gap in configured RAM that has no measured
+/// page-data directive. The bootshim makes those pages private, validates
+/// them, and then enters Linux with RSI restored to the Linux zero page.
 fn load_bootshim_and_handoff(
     loader: &mut IgvmLoader<X86Register>,
     resources: &Resources,
@@ -247,7 +257,7 @@ fn load_bootshim_and_handoff(
     memory_page_count: u64,
     kernel_runtime_end: u64,
 ) -> anyhow::Result<Vec<SnpBootShimRange>> {
-    let shim_base = checked_align_up_to_page(loader.next_available_gpa()?.max(kernel_runtime_end))?;
+    let shim_base = align_up_to_page(loader.next_available_gpa()?.max(kernel_runtime_end));
 
     let bootshim_path = resources
         .get(ResourceType::SnpBootshim)
@@ -265,7 +275,7 @@ fn load_bootshim_and_handoff(
     )
     .context("loading SNP bootshim")?;
 
-    let params_gpa = checked_align_up_to_page(shim_load_info.next_available_address)?;
+    let params_gpa = align_up_to_page(shim_load_info.next_available_address);
     let params_page = params_gpa / PAGE_SIZE;
     ensure!(
         params_page < memory_page_count,
@@ -305,11 +315,11 @@ fn load_bootshim_and_handoff(
     Ok(bootshim_ranges)
 }
 
-fn checked_align_up_to_page(value: u64) -> anyhow::Result<u64> {
+fn align_up_to_page(value: u64) -> u64 {
     value
         .checked_add(PAGE_SIZE - 1)
-        .map(|value| value & !(PAGE_SIZE - 1))
-        .context("page alignment overflow")
+        .expect("page alignment overflow")
+        & !(PAGE_SIZE - 1)
 }
 
 fn kernel_runtime_end(
@@ -753,7 +763,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unaligned_bootshim_placement() {
-        assert!(checked_align_up_to_page(u64::MAX).is_err());
+    #[should_panic(expected = "page alignment overflow")]
+    fn bootshim_placement_overflow_panics() {
+        align_up_to_page(u64::MAX);
     }
 }

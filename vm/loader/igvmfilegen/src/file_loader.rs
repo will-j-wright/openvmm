@@ -309,8 +309,11 @@ pub struct MapFile {
 }
 
 impl MapFile {
-    /// Adds a range that is relevant to the generated image but is not an IGVM
-    /// directive.
+    /// Adds a map-only annotation for a range that is not represented by an
+    /// IGVM directive.
+    ///
+    /// Reported ranges appear under `IGVM file reported ranges` in tracing and
+    /// the written map file. They do not change the generated IGVM file.
     pub fn report_range(&mut self, range: MemoryRange, tag: impl Into<String>) {
         self.reported_ranges.push((range, tag.into()));
     }
@@ -884,8 +887,6 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                 .collect(),
             reported_ranges: Vec::new(),
         };
-
-        map_file.emit_tracing();
 
         // Create an IGVM file with the loader's internal state.
         let igvm_file = IgvmFile::new(
@@ -1530,6 +1531,27 @@ mod tests {
     use loader::importer::BootPageAcceptance;
     use loader::importer::ImageLoad;
     use loader_defs::paravisor::ImportedRegionDescriptor;
+
+    #[test]
+    fn reported_ranges_appear_in_map_output() {
+        let mut map = MapFile {
+            isolation: LoaderIsolationType::None,
+            required_memory: Vec::new(),
+            accepted_ranges: Vec::new(),
+            relocatable_regions: Vec::new(),
+            reported_ranges: Vec::new(),
+        };
+        map.report_range(
+            MemoryRange::new(0x1000..0x3000),
+            "snp-bootshim-accepted-ram [PVALIDATE]",
+        );
+
+        assert!(map.to_string().contains(concat!(
+            "IGVM file reported ranges:\n",
+            "  0000000000001000 - 0000000000003000 (0x2000 bytes) ",
+            "snp-bootshim-accepted-ram [PVALIDATE]\n",
+        )));
+    }
 
     #[test]
     fn test_snp_measurement() {
