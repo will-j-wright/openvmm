@@ -7,8 +7,8 @@
 // UNSAFETY: The bootshim issues PVALIDATE, reads freshly accepted pages, and
 // transfers control directly to the measured Linux entrypoint.
 #![cfg_attr(minimal_rt, expect(unsafe_code))]
-// Keep shared code visible to host tooling even though only tests and the
-// minimal-runtime entry point call it.
+// Keep shared code visible to rust-analyzer in normal host builds even though
+// only tests and the minimal-runtime entry point call it.
 #![cfg_attr(not(any(minimal_rt, test)), allow(dead_code))]
 
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
@@ -285,28 +285,6 @@ static mut LINUX_ENTRY: u64 = 0;
 
 #[cfg(minimal_rt)]
 static mut LINUX_ZERO_PAGE: u64 = 0;
-
-#[cfg(minimal_rt)]
-struct NoAllocator;
-
-#[cfg(minimal_rt)]
-// `loader_defs::shim::save_restore` links `alloc::vec::Vec`, although this
-// bootshim does not allocate. Returning null makes an accidental allocation
-// fail immediately instead of consuming untracked guest memory.
-//
-// SAFETY: The implementation never returns storage, so it creates no memory
-// that a caller can access or deallocate.
-unsafe impl core::alloc::GlobalAlloc for NoAllocator {
-    unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
-        core::ptr::null_mut()
-    }
-
-    unsafe fn dealloc(&self, _: *mut u8, _: core::alloc::Layout) {}
-}
-
-#[cfg(minimal_rt)]
-#[global_allocator]
-static ALLOCATOR: NoAllocator = NoAllocator;
 
 #[cfg(minimal_rt)]
 fn jump_to_linux() -> ! {
