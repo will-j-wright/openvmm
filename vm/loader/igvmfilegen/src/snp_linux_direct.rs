@@ -44,7 +44,8 @@ const PAGE_SIZE: u64 = igvm_defs::PAGE_SIZE_4K;
 /// finish, after all userspace-provided launch-update pages.
 ///
 /// Keep the BSP context at this address until KVM supports userspace-supplied
-/// VMSA pages. MSHV can import the same context at this fixed address.
+/// VMSA pages. The MSHV path validates this address against the partition's
+/// physical address width and maps separate userspace backing for the VMSA.
 const KVM_VMSA_GPA: u64 = 0xffff_ffff_f000;
 
 /// Inputs for the deterministic SNP Linux-direct guest layout.

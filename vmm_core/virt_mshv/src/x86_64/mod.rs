@@ -99,12 +99,12 @@ impl virt::Hypervisor for LinuxMshv {
 
     fn new_partition<'a>(
         &mut self,
-        mut config: ProtoPartitionConfig<'a>,
+        config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
         // An IGVM supplies SNP state that MSHV needs before partition build.
-        let igvm_snp_config = match &mut config.isolation {
+        let igvm_snp_config = match &config.isolation {
             virt::ProtoPartitionIsolation::None => None,
-            virt::ProtoPartitionIsolation::Snp(snp_config) => snp_config.take(),
+            virt::ProtoPartitionIsolation::Snp(snp_config) => snp_config.as_deref(),
             _ => return Err(ErrorInner::IsolationNotSupported.into()),
         };
         let isolation = config.isolation.isolation_type();
@@ -187,7 +187,7 @@ impl virt::Hypervisor for LinuxMshv {
                 vmfd.get_partition_property(HvPartitionPropertyCode::PhysicalAddressWidth.0)
                     .map_err(|e| ErrorInner::GetPartitionProperty(e.into()))? as u8;
             Some(Box::new(prepare_snp_config(
-                *snp_config,
+                snp_config,
                 physical_address_width,
             )?))
         } else {
@@ -418,6 +418,9 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             MshvProtoPartitionIsolation::Snp { config, .. } => config.as_deref(),
         };
         if let Some(snp_config) = snp_config {
+            // The IGVM VMSA has separate stable userspace backing. It cannot
+            // overlap the normal RAM mapping because that would register two
+            // different host mappings for the same GPA with MSHV.
             let vmsa_range =
                 MemoryRange::new(snp_config.vmsa_gpa..snp_config.vmsa_gpa + hvdef::HV_PAGE_SIZE);
             if config

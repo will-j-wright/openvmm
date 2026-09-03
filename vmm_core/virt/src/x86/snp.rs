@@ -60,40 +60,22 @@ pub fn snp_id_block(id_block: &crate::SnpIdBlock, policy: u64) -> x86defs::snp::
     }
 }
 
-/// Serializes the PSP ID authentication data for `id_block`.
-pub fn snp_id_auth(id_block: &crate::SnpIdBlock) -> Box<[u8; 4096]> {
-    const ID_BLOCK_SIGNATURE: usize = 64;
-    const ID_KEY: usize = 576;
-    const AUTHOR_KEY_SIGNATURE: usize = 1664;
-    const AUTHOR_KEY: usize = 2176;
-
-    fn write_signature(
-        page: &mut [u8],
-        offset: usize,
-        signature: &x86defs::snp::SnpIdBlockSignature,
-    ) {
-        page[offset..offset + 72].copy_from_slice(&signature.r);
-        page[offset + 72..offset + 144].copy_from_slice(&signature.s);
-    }
-
-    fn write_public_key(page: &mut [u8], offset: usize, key: &x86defs::snp::SnpIdBlockPublicKey) {
-        page[offset..offset + 4].copy_from_slice(&key.curve.to_le_bytes());
-        page[offset + 4..offset + 76].copy_from_slice(&key.qx);
-        page[offset + 76..offset + 148].copy_from_slice(&key.qy);
-    }
-
-    let mut page = Box::new([0; 4096]);
-    page[0..4].copy_from_slice(&id_block.id_key_algorithm.to_le_bytes());
-    page[4..8].copy_from_slice(&id_block.author_key_algorithm.to_le_bytes());
-    write_signature(&mut *page, ID_BLOCK_SIGNATURE, &id_block.id_key_signature);
-    write_public_key(&mut *page, ID_KEY, &id_block.id_public_key);
-    write_signature(
-        &mut *page,
-        AUTHOR_KEY_SIGNATURE,
-        &id_block.author_key_signature,
-    );
-    write_public_key(&mut *page, AUTHOR_KEY, &id_block.author_public_key);
-    page
+/// Builds the PSP ID authentication page for `id_block`.
+pub fn snp_id_auth(id_block: &crate::SnpIdBlock) -> Box<x86defs::snp::SnpPspIdAuth> {
+    let mut auth = Box::new(x86defs::snp::SnpPspIdAuth::new_zeroed());
+    auth.id_key_algorithm = id_block.id_key_algorithm;
+    auth.author_key_algorithm = id_block.author_key_algorithm;
+    auth.id_block_signature.r = id_block.id_key_signature.r;
+    auth.id_block_signature.s = id_block.id_key_signature.s;
+    auth.id_key.curve = id_block.id_public_key.curve;
+    auth.id_key.qx = id_block.id_public_key.qx;
+    auth.id_key.qy = id_block.id_public_key.qy;
+    auth.id_key_signature.r = id_block.author_key_signature.r;
+    auth.id_key_signature.s = id_block.author_key_signature.s;
+    auth.author_key.curve = id_block.author_public_key.curve;
+    auth.author_key.qx = id_block.author_public_key.qx;
+    auth.author_key.qy = id_block.author_public_key.qy;
+    auth
 }
 
 /// Builds the direct-boot SNP VMSA corresponding to `initial`.
@@ -291,40 +273,50 @@ mod tests {
         let id_block = test_id_block();
         let id_auth = snp_id_auth(&id_block);
 
-        assert_eq!(&id_auth[0..4], &id_block.id_key_algorithm.to_le_bytes());
-        assert_eq!(&id_auth[4..8], &id_block.author_key_algorithm.to_le_bytes());
+        assert_eq!(id_auth.id_key_algorithm, id_block.id_key_algorithm);
+        assert_eq!(id_auth.author_key_algorithm, id_block.author_key_algorithm);
     }
 
     #[test]
-    fn snp_id_auth_serializes_signatures_and_keys_at_psp_offsets() {
+    fn snp_id_auth_serializes_signatures_and_keys() {
         let id_block = test_id_block();
         let id_auth = snp_id_auth(&id_block);
 
-        assert_eq!(&id_auth[64..136], &id_block.id_key_signature.r);
-        assert_eq!(&id_auth[136..208], &id_block.id_key_signature.s);
-        assert_eq!(
-            &id_auth[576..580],
-            &id_block.id_public_key.curve.to_le_bytes()
-        );
-        assert_eq!(&id_auth[580..652], &id_block.id_public_key.qx);
-        assert_eq!(&id_auth[652..724], &id_block.id_public_key.qy);
-        assert_eq!(&id_auth[1664..1736], &id_block.author_key_signature.r);
-        assert_eq!(&id_auth[1736..1808], &id_block.author_key_signature.s);
-        assert_eq!(
-            &id_auth[2176..2180],
-            &id_block.author_public_key.curve.to_le_bytes()
-        );
-        assert_eq!(&id_auth[2180..2252], &id_block.author_public_key.qx);
-        assert_eq!(&id_auth[2252..2324], &id_block.author_public_key.qy);
+        assert_eq!(id_auth.id_block_signature.r, id_block.id_key_signature.r);
+        assert_eq!(id_auth.id_block_signature.s, id_block.id_key_signature.s);
+        assert_eq!(id_auth.id_key.curve, id_block.id_public_key.curve);
+        assert_eq!(id_auth.id_key.qx, id_block.id_public_key.qx);
+        assert_eq!(id_auth.id_key.qy, id_block.id_public_key.qy);
+        assert_eq!(id_auth.id_key_signature.r, id_block.author_key_signature.r);
+        assert_eq!(id_auth.id_key_signature.s, id_block.author_key_signature.s);
+        assert_eq!(id_auth.author_key.curve, id_block.author_public_key.curve);
+        assert_eq!(id_auth.author_key.qx, id_block.author_public_key.qx);
+        assert_eq!(id_auth.author_key.qy, id_block.author_public_key.qy);
     }
 
     #[test]
     fn snp_id_auth_zero_pads_reserved_bytes() {
         let id_auth = snp_id_auth(&test_id_block());
 
-        for reserved in [8..64, 208..576, 724..1664, 1808..2176, 2324..4096] {
-            assert!(id_auth[reserved].iter().all(|&byte| byte == 0));
-        }
+        assert!(id_auth.reserved0.iter().all(|&byte| byte == 0));
+        assert!(
+            id_auth
+                .id_block_signature
+                .reserved
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert!(id_auth.id_key.reserved.iter().all(|&byte| byte == 0));
+        assert!(id_auth.reserved1.iter().all(|&byte| byte == 0));
+        assert!(
+            id_auth
+                .id_key_signature
+                .reserved
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert!(id_auth.author_key.reserved.iter().all(|&byte| byte == 0));
+        assert!(id_auth.reserved2.iter().all(|&byte| byte == 0));
     }
 
     #[test]

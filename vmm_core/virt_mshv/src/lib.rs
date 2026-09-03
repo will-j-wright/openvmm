@@ -765,8 +765,16 @@ enum ErrorInner {
     #[error("SNP IGVM must contain exactly one BSP VP context")]
     InvalidSnpIgvmTopology,
     #[cfg(guest_arch = "x86_64")]
-    #[error("invalid SNP IGVM VMSA")]
+    #[error("failed to parse the SNP IGVM VMSA")]
     InvalidSnpIgvmVmsa,
+    #[cfg(guest_arch = "x86_64")]
+    #[error(
+        "unsupported SNP IGVM VMSA state: SEV features {sev_features:#x}, virtual TOM {virtual_tom:#x}"
+    )]
+    UnsupportedSnpIgvmVmsa { sev_features: u64, virtual_tom: u64 },
+    #[cfg(guest_arch = "x86_64")]
+    #[error("SNP IGVM VMSA backing memory is not contiguous")]
+    InvalidSnpVmsaBacking,
     #[cfg(guest_arch = "x86_64")]
     #[error("SNP IGVM VMSA GPA {0:#x} is invalid")]
     InvalidSnpVmsaGpa(u64),

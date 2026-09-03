@@ -21,8 +21,8 @@ resource file and run `igvmfilegen manifest` directly.
 The normal-injection output is a shared artifact: the same binary is intended
 to boot on KVM and MSHV. Its `SnpVpContext` uses the SNP initial-VMSA GPA
 `0xffff_ffff_f000`. KVM synthesizes its measured VMSA at that GPA, while MSHV
-maps and imports the file-provided VMSA there. Both backends submit the policy
-and SNP ID block encoded in the file.
+maps and imports the file-provided VMSA there. Both backends use the policy
+encoded in the file, but only MSHV submits its SNP ID block.
 
 The `snp-linux-direct-restricted.json` profile encodes restricted interrupt
 injection in its IGVM VMSA. It is intended only for MSHV bring-up.
