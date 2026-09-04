@@ -21,7 +21,7 @@ The guide is published out of this repo via [Markdown files](Guide/src/SUMMARY.m
 Please keep them up-to-date.
 
 The maintainers of this project use Discord to collaborate with external contributors and users.
-Please [join](https://aka.ms/openvmmdiscord] if you have any questions about contributing to or using OpenVMM/OpenHCL.
+Please [join](https://aka.ms/openvmmdiscord) if you have any questions about contributing to or using OpenVMM/OpenHCL.
 
 [The OpenVMM Guide]: https://aka.ms/openvmmguide
 
