@@ -7691,6 +7691,7 @@ version = "0.0.0"
 dependencies = [
  "mesh",
  "vm_resource",
+ "x86defs",
 ]
 
 [[package]]
