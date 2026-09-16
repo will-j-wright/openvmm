@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 pub use crate::aml::*;
+use alloc::vec;
+use alloc::vec::Vec;
 use memory_range::MemoryRange;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -213,7 +215,7 @@ impl Ssdt {
         });
 
         // If (LEqual(Arg0, ToUUID("33DB4D5B-1FF7-401C-9657-7441C03DD766")))
-        let pcie_osc_uuid = guid::guid!("33DB4D5B-1FF7-401C-9657-7441C03DD766");
+        let pcie_osc_uuid = guid_core::guid!("33DB4D5B-1FF7-401C-9657-7441C03DD766");
         let uuid_buffer = Buffer(pcie_osc_uuid.as_bytes()).to_bytes();
         let lequal = LEqualOp {
             left: encode_arg(0),
@@ -223,7 +225,7 @@ impl Ssdt {
         let else_body = if cxl {
             // CXL _OSC UUID: 68f2d50b-c469-4d8a-bd3d-941a103fd3fc
             // Rev 1 is currently supported; unsupported revisions set STS0 bit 1.
-            let cxl_osc_uuid = guid::guid!("68f2d50b-c469-4d8a-bd3d-941a103fd3fc");
+            let cxl_osc_uuid = guid_core::guid!("68f2d50b-c469-4d8a-bd3d-941a103fd3fc");
             let cxl_uuid_buffer = Buffer(cxl_osc_uuid.as_bytes()).to_bytes();
             let cxl_uuid_match = LEqualOp {
                 left: encode_arg(0),
@@ -329,7 +331,7 @@ impl Ssdt {
             let mut dsm_method = Method::new(b"_DSM");
             dsm_method.set_arg_count(4);
 
-            let dsm_uuid = guid::guid!("E5C937D0-3553-4D7A-9117-EA4D19C3434D");
+            let dsm_uuid = guid_core::guid!("E5C937D0-3553-4D7A-9117-EA4D19C3434D");
             let dsm_uuid_buffer = Buffer(dsm_uuid.as_bytes()).to_bytes();
 
             // If (LEqual(Arg0, UUID))
@@ -582,7 +584,7 @@ mod tests {
 
         // The PCI firmware _DSM UUID must appear in mixed-endian form
         // (GUID wire format).
-        let uuid = guid::guid!("E5C937D0-3553-4D7A-9117-EA4D19C3434D");
+        let uuid = guid_core::guid!("E5C937D0-3553-4D7A-9117-EA4D19C3434D");
         assert!(contains_bytes(&bytes, uuid.as_bytes()));
 
         // The supported-functions bitmask byte (0x21 = bits 0+5) must
@@ -605,7 +607,7 @@ mod tests {
         assert!(!contains_name(&bytes, b"_DSM"));
 
         // The PCI firmware _DSM UUID must NOT appear.
-        let uuid = guid::guid!("E5C937D0-3553-4D7A-9117-EA4D19C3434D");
+        let uuid = guid_core::guid!("E5C937D0-3553-4D7A-9117-EA4D19C3434D");
         assert!(!contains_bytes(&bytes, uuid.as_bytes()));
     }
 }
