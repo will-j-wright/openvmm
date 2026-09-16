@@ -39,6 +39,7 @@ use vm_loader::InitialLoad;
 use vm_loader::Loader;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::memory::MemoryRangeWithNode;
+use vm_topology::pcie::PcieHostBridge;
 use vm_topology::processor::ArchTopology;
 use vm_topology::processor::ProcessorTopology;
 use vm_topology::processor::aarch64::Aarch64Topology;
@@ -412,6 +413,39 @@ struct BuildDeviceTreeParams<'a> {
     com_serial: Option<SerialInformation>,
     entropy: Option<&'a [u8]>,
     chipset_mmio: ChipsetMmioRanges,
+    pcie_host_bridges: &'a [PcieHostBridge],
+}
+
+/// Encodes the identity-mapped MMIO windows of a PCIe host bridge as a
+/// device-tree `ranges` property.
+///
+/// Each entry is 7 cells: [pci-phys.hi, pci-phys.mid, pci-phys.lo,
+/// cpu-phys.hi, cpu-phys.lo, size.hi, size.lo].
+fn pcie_ranges(bridge: &PcieHostBridge) -> Vec<u32> {
+    // PCI address space type bits (phys.hi bits 25:24).
+    const PCI_SPACE_MEM32: u32 = 0x02000000; // 32-bit non-prefetchable MMIO
+    const PCI_SPACE_MEM64: u32 = 0x03000000; // 64-bit prefetchable MMIO
+
+    let mut ranges = Vec::with_capacity(14);
+    for (space, window) in [
+        (PCI_SPACE_MEM32, bridge.low_mmio),
+        (PCI_SPACE_MEM64, bridge.high_mmio),
+    ] {
+        if !window.is_empty() {
+            let start = window.start();
+            let len = window.len();
+            ranges.extend_from_slice(&[
+                space,
+                (start >> 32) as u32,
+                start as u32,
+                (start >> 32) as u32,
+                start as u32,
+                (len >> 32) as u32,
+                len as u32,
+            ]);
+        }
+    }
+    ranges
 }
 
 /// Build a device tree representing the whole guest partition.
@@ -426,6 +460,7 @@ fn build_device_tree(params: BuildDeviceTreeParams<'_>) -> Result<Vec<u8>, fdt::
         com_serial,
         entropy,
         chipset_mmio,
+        pcie_host_bridges,
     } = params;
 
     let ChipsetMmioRanges {
@@ -495,6 +530,31 @@ fn build_device_tree(params: BuildDeviceTreeParams<'_>) -> Result<Vec<u8>, fdt::
         mem = mem.add_u32(p_igvm_type, entry.entry_type.0 as u32)?;
         mem = mem.add_u32(p_numa_node_id, *vnode)?;
         root = mem.end_node()?;
+    }
+
+    if !pcie_host_bridges.is_empty() {
+        let p_bus_range = root.add_string("bus-range")?;
+        let p_linux_pci_domain = root.add_string("linux,pci-domain")?;
+        for bridge in pcie_host_bridges {
+            let name = format!("pcie@{:x}", bridge.ecam_range.start());
+            // reg names the actual first bus, not the bus-zero MCFG base.
+            // Native APIC MSI/MSI-X needs no ARM interrupt-parent phandle.
+            root = root
+                .start_node(&name)?
+                .add_str(p_compatible, "pci-host-ecam-generic")?
+                .add_str(p_device_type, "pci")?
+                .add_u64_array(p_reg, &[bridge.ecam_range.start(), bridge.ecam_range.len()])?
+                .add_u32_array(
+                    p_bus_range,
+                    &[u32::from(bridge.start_bus), u32::from(bridge.end_bus)],
+                )?
+                .add_u32(p_linux_pci_domain, u32::from(bridge.segment))?
+                .add_u32(p_address_cells, 3)?
+                .add_u32(p_size_cells, 2)?
+                .add_u32_array(p_ranges, &pcie_ranges(bridge))?
+                .add_u32(p_numa_node_id, bridge.vnode.unwrap_or(0))?
+                .end_node()?;
+        }
     }
 
     // Linux requires vmbus to be under a simple-bus node.
@@ -677,6 +737,8 @@ pub struct LoadIgvmParams<'a, T: ArchTopology> {
     pub entropy: Option<&'a [u8]>,
     /// Resolved chipset MMIO ranges for device tree and UEFI config.
     pub chipset_mmio: ChipsetMmioRanges,
+    /// Resolved host bridges to describe for images requesting a device tree.
+    pub pcie_host_bridges: &'a [PcieHostBridge],
 }
 
 pub fn load_igvm(
@@ -715,6 +777,7 @@ fn load_igvm_x86(
         com_serial,
         entropy,
         chipset_mmio,
+        pcie_host_bridges,
     } = params;
 
     let ChipsetMmioRanges {
@@ -1135,6 +1198,7 @@ fn load_igvm_x86(
                     com_serial,
                     entropy,
                     chipset_mmio,
+                    pcie_host_bridges,
                 })
                 .map_err(Error::DeviceTree)?;
                 import_parameter(&mut parameter_areas, info, &dt)?;
