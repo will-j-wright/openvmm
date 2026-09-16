@@ -10888,6 +10888,8 @@ version = "0.0.0"
 dependencies = [
  "inspect",
  "mesh",
+ "serial_16550_resources",
+ "test_with_tracing",
  "virt",
 ]
 
