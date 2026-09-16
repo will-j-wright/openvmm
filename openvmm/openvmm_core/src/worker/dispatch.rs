@@ -76,6 +76,8 @@ use openvmm_defs::config::PcieRootComplexConfig;
 use openvmm_defs::config::PcieSwitchConfig;
 use openvmm_defs::config::PmuGsivConfig;
 use openvmm_defs::config::ProcessorTopologyConfig;
+use openvmm_defs::config::UartId;
+use openvmm_defs::config::UartInventory;
 use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpciDeviceConfig;
@@ -238,6 +240,7 @@ impl Manifest {
             pci_chipset_devices: config.pci_chipset_devices,
             isa_dma_controller: config.isa_dma_controller,
             chipset_capabilities: config.chipset_capabilities,
+            dt_uarts: config.dt_uarts,
             layout: config.layout,
             rtc_delta_milliseconds: config.rtc_delta_milliseconds,
         }
@@ -282,6 +285,7 @@ pub struct Manifest {
     pci_chipset_devices: Vec<LegacyPciChipsetDeviceHandle>,
     isa_dma_controller: Option<Resource<vm_resource::kind::IsaDmaControllerHandleKind>>,
     chipset_capabilities: VmChipsetCapabilities,
+    dt_uarts: UartInventory,
     layout: vmm_core_defs::LayoutConfig,
     rtc_delta_milliseconds: i64,
 }
@@ -916,6 +920,7 @@ struct LoadedVmInner {
 
     chipset_cfg: BaseChipsetManifest,
     chipset_capabilities: VmChipsetCapabilities,
+    dt_uarts: Vec<UartId>,
     #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
     virtio_mmio_region: MemoryRange,
     #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
@@ -3178,6 +3183,7 @@ impl InitializedVm {
         ))
         .await?;
 
+        let UartInventory::Devices(dt_uarts) = cfg.dt_uarts;
         let mut this = LoadedVm {
             state_units,
             running: false,
@@ -3208,6 +3214,7 @@ impl InitializedVm {
                 vmbus_devices,
                 chipset_cfg: cfg.chipset,
                 chipset_capabilities: cfg.chipset_capabilities,
+                dt_uarts,
                 firmware_event_send: cfg.firmware_event_send,
                 load_mode: cfg.load_mode,
                 virtio_mmio_region,
@@ -3487,7 +3494,8 @@ impl LoadedVmInner {
                 super::vm_loaders::linux::load_linux_arm64(
                     &kernel_config,
                     &self.gm,
-                    enable_serial,
+                    &self.dt_uarts,
+                    linux_arm64_console(&self.dt_uarts, enable_serial),
                     &self.processor_topology,
                     &self.pcie_host_bridges,
                     smmu_configs,
@@ -3614,7 +3622,8 @@ impl LoadedVmInner {
                     vtl2_framebuffer_gpa_base: self.vtl2_framebuffer_gpa_base,
                     vtl2_only,
                     with_vmbus_redirect: self.vmbus_redirect,
-                    com_serial,
+                    dt_uarts: &self.dt_uarts,
+                    console: com_serial,
                     entropy: Some(&entropy),
                     chipset_mmio: self.chipset_mmio,
                     pcie_host_bridges: &self.pcie_host_bridges,
@@ -4357,6 +4366,7 @@ impl LoadedVm {
             pci_chipset_devices: vec![], // TODO
             isa_dma_controller: None,    // TODO
             chipset_capabilities: self.inner.chipset_capabilities,
+            dt_uarts: UartInventory::Devices(self.inner.dt_uarts),
             layout: vmm_core_defs::LayoutConfig {
                 chipset_low_mmio_size: 0,
                 chipset_high_mmio_size: 0,
@@ -4472,13 +4482,14 @@ fn add_devices_to_dsdt_arm64(
 ) {
     // VMBus GIC INTID (PPI 2 = INTID 16 + 2 = 18), matching the DT path.
     const VMBUS_INTID: u32 = openvmm_defs::config::DEFAULT_VMBUS_PPI;
-    // SBSA UART MMIO bases and sizes.
-    const PL011_SERIAL0_BASE: u64 = 0xEFFEC000;
-    const PL011_SERIAL1_BASE: u64 = 0xEFFEB000;
-    const PL011_SERIAL_SIZE: u64 = 0x1000;
+    use serial_pl011_resources::PL011_SERIAL_SIZE;
+    use serial_pl011_resources::PL011_SERIAL0_BASE;
+    use serial_pl011_resources::PL011_SERIAL0_SPI;
+    use serial_pl011_resources::PL011_SERIAL1_BASE;
+    use serial_pl011_resources::PL011_SERIAL1_SPI;
     // UART GSIVs (SPI 1 = INTID 33, SPI 2 = INTID 34).
-    const PL011_SERIAL0_GSIV: u32 = 33;
-    const PL011_SERIAL1_GSIV: u32 = 34;
+    const PL011_SERIAL0_GSIV: u32 = 32 + PL011_SERIAL0_SPI;
+    const PL011_SERIAL1_GSIV: u32 = 32 + PL011_SERIAL1_SPI;
 
     if with_hv {
         dsdt.add_mmio_module(chipset_mmio.low, chipset_mmio.high);
@@ -4506,6 +4517,30 @@ fn add_devices_to_dsdt_arm64(
             PL011_SERIAL_SIZE,
             PL011_SERIAL1_GSIV,
         );
+    }
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn linux_arm64_console(dt_uarts: &[UartId], enable_serial: bool) -> Option<UartId> {
+    (enable_serial && dt_uarts.contains(&UartId::Pl0110)).then_some(UartId::Pl0110)
+}
+
+#[cfg(test)]
+mod uart_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn native_arm_console_requires_opt_in() {
+        let dt_uarts = [UartId::Pl0110, UartId::Pl0111];
+        assert_eq!(linux_arm64_console(&dt_uarts, false), None);
+        assert_eq!(linux_arm64_console(&dt_uarts, true), Some(UartId::Pl0110));
+    }
+
+    #[test]
+    fn native_arm_console_requires_first_uart() {
+        assert_eq!(linux_arm64_console(&[], true), None);
+        assert_eq!(linux_arm64_console(&[UartId::Pl0111], true), None);
     }
 }
 
