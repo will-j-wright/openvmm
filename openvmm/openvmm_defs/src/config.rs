@@ -6,6 +6,8 @@
 pub use smbios_defs::SmbiosBiosOverrides;
 pub use smbios_defs::SmbiosConfig;
 pub use smbios_defs::SmbiosSystemOverrides;
+pub use vmm_core_defs::uart::UartId;
+pub use vmm_core_defs::uart::UartInventory;
 
 use guid::Guid;
 use input_core::InputData;
@@ -61,6 +63,8 @@ pub struct Config {
     pub pci_chipset_devices: Vec<LegacyPciChipsetDeviceHandle>,
     pub isa_dma_controller: Option<Resource<vm_resource::kind::IsaDmaControllerHandleKind>>,
     pub chipset_capabilities: VmChipsetCapabilities,
+    /// UARTs to describe in the device tree. Required even when empty.
+    pub dt_uarts: UartInventory,
     /// Memory layout sizing for the layout engine. Determines chipset MMIO
     /// range sizes; addresses are allocated dynamically by the resolver.
     pub layout: vmm_core_defs::LayoutConfig,
@@ -183,7 +187,7 @@ pub enum LoadMode {
         file: File,
         cmdline: String,
         vtl2_base_address: Vtl2BaseAddressType,
-        com_serial: Option<SerialInformation>,
+        com_serial: Option<UartId>,
     },
     None,
 }
