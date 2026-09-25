@@ -13,6 +13,7 @@ use crate::build_openvmm::OpenvmmOutput;
 use crate::build_openvmm_vhost::OpenvmmVhostOutput;
 use crate::build_pipette::PipetteOutput;
 use crate::build_prep_steps::PrepStepsOutput;
+use crate::build_snp_linux_direct_igvm::SnpLinuxDirectIgvmOutput;
 use crate::build_test_igvm_agent_rpc_server::TestIgvmAgentRpcServerOutput;
 use crate::build_tmk_vmm::TmkVmmOutput;
 use crate::build_tmks::TmksOutput;
@@ -415,6 +416,12 @@ define_vmm_tests_built_artifacts!(
             openhcl_igvm::LATEST_LINUX_DIRECT_TEST_X64
         ),
     ) => OpenhclIgvmOutput,
+    snp_linux_direct_igvm(
+        x64(
+            (SnpLinuxDirectIgvmOutput { igvm_bin, igvm_map }, igvm_bin, igvm_map),
+            snp_igvm::SNP_LINUX_DIRECT_IGVM_X64
+        ),
+    ) => SnpLinuxDirectIgvmOutput,
     tmks(
         x64(
             (TmksOutput { bin, dbg}, bin, dbg),
@@ -888,6 +895,7 @@ pub mod vmm_tests_artifact_builders {
             pipette_linux_musl_x64 => PipetteOutput,
             pipette_linux_musl_aarch64 => PipetteOutput,
             prep_steps_linux_musl_x64 => PrepStepsOutput,
+            snp_linux_direct_igvm_x64 => SnpLinuxDirectIgvmOutput,
             tmk_vmm_linux_musl_x64 => TmkVmmOutput,
             // any machine
             guest_test_uefi_x64 => GuestTestUefiOutput,
@@ -907,6 +915,7 @@ pub mod vmm_tests_artifact_builders {
             pipette_linux_musl_x64 => PipetteOutput,
             pipette_linux_musl_aarch64 => PipetteOutput,
             prep_steps_linux_musl_x64 => PrepStepsOutput,
+            snp_linux_direct_igvm_x64 => SnpLinuxDirectIgvmOutput,
             tmk_vmm_linux_musl_x64 => TmkVmmOutput,
             // any machine
             guest_test_uefi_x64 => GuestTestUefiOutput,
