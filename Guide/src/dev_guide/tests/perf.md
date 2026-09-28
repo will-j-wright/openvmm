@@ -11,20 +11,21 @@ self-contained remote runs.
 ## Prerequisites
 
 - Linux host with `/dev/kvm` access (or Windows with Hyper-V)
-- Built `openvmm`, `pipette`, and test kernel/initrd artifacts
+- Built `openvmm` and `burette` built for the host target, and `pipette`
+built for `<arch>-unknown-linux-musl`.
+- Test kernel/initrd artifacts for the appropriate architecture installed
+to their magic paths.
+- `iperf3` package installed (for networking tests).
 
-Build everything:
+For example, to download and build everything on an x64 Ubuntu system:
 
 ```bash
-cargo build --release \
-  -p burette -p openvmm -p pipette
+cargo xflowey restore-packages
+sudo apt update
+sudo apt install iperf3
+cargo build --release -p burette -p openvmm
+cargo build --release --target x86_64-unknown-linux-musl -p pipette
 ```
-
-Burette resolves guest kernels, initrds, tools, OpenVMM, and Pipette through
-Petri's known artifact paths. If a selected benchmark reports a missing
-artifact, use `cargo xflowey vmm-tests-run --build-only` with a related test to
-populate the test-content directory, or use `burette package` from a machine
-where all artifacts resolve.
 
 ## Architecture
 
@@ -46,6 +47,12 @@ warm VM and run repeated guest workloads. Read the benchmark description when
 comparing first-run and steady-state results.
 
 ## Running Tests
+
+```admonish note
+In all of the below commands, replace `burette` with the path to your built
+burette executable, or `cargo run --release -p burette` to build and run
+burette within a local clone.
+```
 
 ### Boot time
 
