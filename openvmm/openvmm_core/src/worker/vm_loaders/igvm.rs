@@ -30,6 +30,7 @@ use loader::importer::ImageLoad;
 use loader::importer::StartupMemoryType;
 use loader::importer::TableRegister;
 use loader::importer::X86Register;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_PCIE_BRIDGES;
 use memory_range::MemoryRange;
 use memory_range::subtract_ranges;
 use openvmm_defs::config::Vtl2BaseAddressType;
@@ -84,6 +85,8 @@ pub enum Error {
     Vtl2MemorySource,
     #[error("building device tree for partition failed")]
     DeviceTree(#[source] DeviceTreeError),
+    #[error("unsupported SNP PCIe device tree configuration")]
+    SnpPcieDeviceTree(#[from] SnpPcieDeviceTreeError),
     #[error("supplied vtl2 memory {0} is not aligned to 2MB")]
     Vtl2MemoryAligned(u64),
     #[error("supplied vtl2 memory {0} is smaller than igvm file VTL2 range {1}")]
@@ -112,6 +115,73 @@ pub enum Error {
     LowerVtlContext,
     #[error("missing required memory range {0}")]
     MissingRequiredMemory(MemoryRange),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SnpPcieDeviceTreeError {
+    #[error("at most {SNP_BOOT_SHIM_MAX_PCIE_BRIDGES} PCIe host bridges are supported")]
+    TooManyBridges,
+    #[error("PCIe segment {0} is not unique")]
+    DuplicateSegment(u16),
+    #[error("PCIe segment {0} has CXL metadata")]
+    Cxl(u16),
+    #[error("PCIe segment {0} requests preservation of BARs or boot configuration")]
+    PreserveConfig(u16),
+    #[error("PCIe segment {0} is not on NUMA node zero")]
+    NumaNode(u16),
+    #[error("PCIe segment {0} has an invalid ECAM or bus range")]
+    EcamRange(u16),
+    #[error("PCIe segment {0} has a low MMIO window above 4 GiB")]
+    LowMmio(u16),
+    #[error("IOMMU or interrupt remapping is not supported")]
+    Iommu,
+}
+
+/// Checks that the SNP boot shim supports the PCIe host bridges in the device
+/// tree.
+///
+/// The shim rejects the same configurations, but this check fails the launch
+/// on the host instead of inside the guest.
+fn check_snp_pcie(
+    bridges: &[PcieHostBridge],
+    has_iommu: bool,
+) -> Result<(), SnpPcieDeviceTreeError> {
+    if has_iommu {
+        return Err(SnpPcieDeviceTreeError::Iommu);
+    }
+    if bridges.len() > SNP_BOOT_SHIM_MAX_PCIE_BRIDGES {
+        return Err(SnpPcieDeviceTreeError::TooManyBridges);
+    }
+    for (index, bridge) in bridges.iter().enumerate() {
+        let segment = bridge.segment;
+        if bridges[..index].iter().any(|b| b.segment == segment) {
+            return Err(SnpPcieDeviceTreeError::DuplicateSegment(segment));
+        }
+        // The shim supports native APIC MSI/MSI-X only, with no INTx or
+        // IOMMU map, and it has no CXL support.
+        if bridge.cxl.is_some() {
+            return Err(SnpPcieDeviceTreeError::Cxl(segment));
+        }
+        // No firmware assigns PCI resources before the shim, so Linux must
+        // assign all BARs.
+        if bridge.preserve_bars || bridge.preserve_boot_config {
+            return Err(SnpPcieDeviceTreeError::PreserveConfig(segment));
+        }
+        if bridge.vnode.unwrap_or(0) != 0 {
+            return Err(SnpPcieDeviceTreeError::NumaNode(segment));
+        }
+        if bridge.start_bus > bridge.end_bus
+            || bridge.ecam_range.len()
+                != (u64::from(bridge.end_bus) + 1 - u64::from(bridge.start_bus)) << 20
+            || !bridge.ecam_range.start().is_multiple_of(1 << 20)
+        {
+            return Err(SnpPcieDeviceTreeError::EcamRange(segment));
+        }
+        if !bridge.low_mmio.is_empty() && bridge.low_mmio.end() > 1 << 32 {
+            return Err(SnpPcieDeviceTreeError::LowMmio(segment));
+        }
+    }
+    Ok(())
 }
 
 /// The largest device tree that the loader builds, whatever the size of the
@@ -459,6 +529,8 @@ pub struct LoadIgvmParams<'a, T: ArchTopology> {
     pub chipset_mmio: ChipsetMmioRanges,
     /// Resolved host bridges to describe for images requesting a device tree.
     pub pcie_host_bridges: &'a [PcieHostBridge],
+    /// Whether the runtime configured an IOMMU or interrupt remapping.
+    pub pcie_has_iommu: bool,
 }
 
 pub fn load_igvm(
@@ -499,6 +571,7 @@ fn load_igvm_x86(
         entropy,
         chipset_mmio,
         pcie_host_bridges,
+        pcie_has_iommu,
     } = params;
 
     let ChipsetMmioRanges {
@@ -529,6 +602,8 @@ fn load_igvm_x86(
         return Err(Error::CommandLineContainsNul(pos));
     }
 
+    // `selected_platform_header` consumes the isolation type.
+    let is_snp = igvm_isolation_type == igvm::IsolationType::Snp;
     let (mask, max_vtl) = match selected_platform_header(igvm_file, igvm_isolation_type)? {
         IgvmPlatformHeader::SupportedPlatform(info) => (info.compatibility_mask, info.highest_vtl),
     };
@@ -911,6 +986,9 @@ fn load_igvm_x86(
                 import_parameter(&mut parameter_areas, info, &bytes)?;
             }
             IgvmDirectiveHeader::DeviceTree(ref info) => {
+                if is_snp {
+                    check_snp_pcie(pcie_host_bridges, pcie_has_iommu)?;
+                }
                 let max_size = match parameter_areas.get(&info.parameter_area_index) {
                     Some(ParameterAreaState::Allocated { max_size, .. }) => *max_size,
                     _ => return Err(Error::ParameterTooLarge),
@@ -1351,6 +1429,165 @@ impl PageDataBuffer {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+    use vm_topology::processor::TopologyBuilder;
+
+    fn snp_bridge(segment: u16) -> PcieHostBridge {
+        PcieHostBridge {
+            index: u32::from(segment),
+            segment,
+            start_bus: 32,
+            end_bus: 47,
+            ecam_range: MemoryRange::new(0x8000_0000..0x8100_0000),
+            low_mmio: MemoryRange::new(0x9000_0000..0xa000_0000),
+            high_mmio: MemoryRange::new(0x12_0000_0000..0x14_0000_0000),
+            cxl: None,
+            vnode: None,
+            preserve_bars: false,
+            preserve_boot_config: false,
+        }
+    }
+
+    #[test]
+    fn snp_rejects_unsupported_pcie() {
+        assert_eq!(check_snp_pcie(&[snp_bridge(7)], false), Ok(()));
+        assert_eq!(
+            check_snp_pcie(&[snp_bridge(7)], true),
+            Err(SnpPcieDeviceTreeError::Iommu)
+        );
+        let too_many: Vec<_> = (0..=SNP_BOOT_SHIM_MAX_PCIE_BRIDGES as u16)
+            .map(snp_bridge)
+            .collect();
+        assert_eq!(
+            check_snp_pcie(&too_many, false),
+            Err(SnpPcieDeviceTreeError::TooManyBridges)
+        );
+        assert_eq!(
+            check_snp_pcie(&[snp_bridge(7), snp_bridge(7)], false),
+            Err(SnpPcieDeviceTreeError::DuplicateSegment(7))
+        );
+
+        let cases: [(fn(&mut PcieHostBridge), SnpPcieDeviceTreeError); 7] = [
+            (
+                |b| {
+                    b.cxl = Some(vm_topology::pcie::PcieHostBridgeCxlInfo {
+                        chbcr_range: MemoryRange::EMPTY,
+                        hdm_range: MemoryRange::EMPTY,
+                        hdm_window_restrictions: Default::default(),
+                    })
+                },
+                SnpPcieDeviceTreeError::Cxl(7),
+            ),
+            (
+                |b| b.preserve_bars = true,
+                SnpPcieDeviceTreeError::PreserveConfig(7),
+            ),
+            (
+                |b| b.preserve_boot_config = true,
+                SnpPcieDeviceTreeError::PreserveConfig(7),
+            ),
+            (|b| b.vnode = Some(1), SnpPcieDeviceTreeError::NumaNode(7)),
+            (|b| b.start_bus = 48, SnpPcieDeviceTreeError::EcamRange(7)),
+            (
+                |b| b.ecam_range = MemoryRange::new(0x8000_1000..0x8100_1000),
+                SnpPcieDeviceTreeError::EcamRange(7),
+            ),
+            (
+                |b| b.low_mmio = MemoryRange::new(0xffff_f000..0x1_0000_1000),
+                SnpPcieDeviceTreeError::LowMmio(7),
+            ),
+        ];
+        for (change, expected) in cases {
+            let mut bridge = snp_bridge(7);
+            change(&mut bridge);
+            assert_eq!(check_snp_pcie(&[bridge], false), Err(expected));
+        }
+    }
+
+    #[test]
+    fn snp_pcie_checks_require_device_tree_request() {
+        for request_device_tree in [false, true] {
+            let mut directives = vec![IgvmDirectiveHeader::PageData {
+                gpa: 0,
+                compatibility_mask: 1,
+                flags: igvm_defs::IgvmPageDataFlags::new(),
+                data_type: IgvmPageDataType::NORMAL,
+                data: vec![0xab; HV_PAGE_SIZE as usize],
+            }];
+            if request_device_tree {
+                directives.extend([
+                    IgvmDirectiveHeader::ParameterArea {
+                        number_of_bytes: 0x10000,
+                        parameter_area_index: 0,
+                        initial_data: vec![],
+                    },
+                    IgvmDirectiveHeader::DeviceTree(IGVM_VHS_PARAMETER {
+                        parameter_area_index: 0,
+                        byte_offset: 0,
+                    }),
+                    IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+                        gpa: 0x10000,
+                        compatibility_mask: 1,
+                        parameter_area_index: 0,
+                    }),
+                ]);
+            }
+            let igvm_file = IgvmFile::new(
+                igvm::IgvmRevision::V1,
+                vec![IgvmPlatformHeader::SupportedPlatform(
+                    igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM {
+                        compatibility_mask: 1,
+                        highest_vtl: 0,
+                        platform_type: IgvmPlatformType::SEV_SNP,
+                        platform_version: 1,
+                        shared_gpa_boundary: 0,
+                    },
+                )],
+                vec![IgvmInitializationHeader::GuestPolicy {
+                    policy: 0x30000,
+                    compatibility_mask: 1,
+                }],
+                directives,
+            )
+            .unwrap();
+            let gm = GuestMemory::allocate(0x20000);
+            let result = load_igvm_x86(LoadIgvmParams {
+                igvm_file: &igvm_file,
+                igvm_isolation_type: igvm::IsolationType::Snp,
+                gm: &gm,
+                processor_topology: &TopologyBuilder::new_x86().build(1).unwrap(),
+                mem_layout: &MemoryLayout::new(0x20000, &[], &[], &[], None).unwrap(),
+                cmdline: "",
+                acpi_tables: AcpiTables {
+                    madt: &[],
+                    srat: &[],
+                    slit: None,
+                    pptt: None,
+                },
+                vtl2_base_address: Vtl2BaseAddressType::File,
+                vtl2_framebuffer_gpa_base: None,
+                vtl2_only: false,
+                with_vmbus_redirect: false,
+                dt_uarts: &[],
+                console: None,
+                entropy: None,
+                chipset_mmio: ChipsetMmioRanges {
+                    low: MemoryRange::EMPTY,
+                    high: MemoryRange::EMPTY,
+                    vtl2: MemoryRange::EMPTY,
+                },
+                pcie_host_bridges: &[snp_bridge(7)],
+                pcie_has_iommu: true,
+            });
+            if request_device_tree {
+                assert!(matches!(
+                    result,
+                    Err(Error::SnpPcieDeviceTree(SnpPcieDeviceTreeError::Iommu))
+                ));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
 
     #[test]
     fn device_tree_parameter_capacity_uses_remaining_area() {

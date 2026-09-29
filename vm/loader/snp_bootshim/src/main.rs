@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Measured SEV-SNP boot stage that accepts sparse guest RAM before entering a
-//! direct-boot Linux kernel.
+//! Measured SEV-SNP boot stage that validates host topology, accepts sparse
+//! guest RAM, and enters a direct-boot Linux kernel.
 //!
 //! The IGVM generator starts this x86_64 bare-metal payload with `RSI` pointing
 //! to a measured [`SnpBootShimParams`] page. After validating that complete
@@ -22,9 +22,48 @@
 // only tests and the minimal-runtime entry point call it.
 #![cfg_attr(not(any(minimal_rt, test)), allow(dead_code))]
 
+#[cfg(test)]
+extern crate alloc;
+
+mod pcie;
+mod topology;
+
+/// Global allocator that fails every allocation.
+///
+/// The `acpi` crate links `alloc`, so the bare-metal shim needs a global
+/// allocator. Device-tree validation does not allocate.
+// TODO: Replace this with a heap in host-provided, accepted memory when the
+// shim generates complete ACPI tables from the host device tree.
+#[cfg(minimal_rt)]
+mod no_alloc {
+    use core::alloc::GlobalAlloc;
+    use core::alloc::Layout;
+
+    struct NoAlloc;
+
+    // SAFETY: `alloc` always returns null, which reports allocation failure.
+    // `dealloc` can never receive a pointer from this allocator.
+    unsafe impl GlobalAlloc for NoAlloc {
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+            unreachable!("the null allocator never allocates")
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: NoAlloc = NoAlloc;
+}
+
+use loader_defs::linux::SNP_BOOT_SHIM_DT_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
+use loader_defs::linux::SNP_BOOT_SHIM_PLATFORM_MAGIC;
+use loader_defs::linux::SNP_BOOT_SHIM_PLATFORM_VERSION;
 use loader_defs::linux::SnpBootShimParams;
+use loader_defs::linux::SnpBootShimPlatformParams;
 use loader_defs::linux::SnpBootShimRange;
 
 const PAGE_SIZE: u64 = 4096;
@@ -38,12 +77,14 @@ enum ParamsError {
     InvalidRamEnd,
     InvalidLinuxEntry,
     InvalidLinuxZeroPage,
-    ReservedNotZero,
     EmptyRange,
     RangeOverflow,
     RangeOutsideRam,
     UnorderedRanges,
     ParamsRangeOverlap,
+    InvalidPlatform,
+    InvalidPlatformRegion,
+    PlatformRangeOverlap,
 }
 
 /// Validates the measured generator-to-bootshim handoff before using it.
@@ -74,14 +115,20 @@ fn validate_params(
     if params.ram_end == 0 || !params.ram_end.is_multiple_of(PAGE_SIZE) {
         return Err(ParamsError::InvalidRamEnd);
     }
-    if params.reserved != 0 {
-        return Err(ParamsError::ReservedNotZero);
-    }
     let params_end = params_gpa
         .checked_add(PAGE_SIZE)
         .ok_or(ParamsError::RangeOverflow)?;
     if params_end > params.ram_end {
         return Err(ParamsError::RangeOutsideRam);
+    }
+    if params.platform_gpa < params_end
+        || !params.platform_gpa.is_multiple_of(PAGE_SIZE)
+        || params
+            .platform_gpa
+            .checked_add(PAGE_SIZE)
+            .is_none_or(|end| end > params.ram_end)
+    {
+        return Err(ParamsError::InvalidPlatform);
     }
     if params.linux_entry == 0
         || params.linux_entry >= params.ram_end
@@ -124,10 +171,91 @@ fn validate_params(
         if start < params_end && params_gpa < end {
             return Err(ParamsError::ParamsRangeOverlap);
         }
+        if start < params.platform_gpa + PAGE_SIZE && params.platform_gpa < end {
+            return Err(ParamsError::ParamsRangeOverlap);
+        }
         previous_end = end;
     }
 
     Ok(ranges)
+}
+
+fn platform_region(
+    start: u64,
+    size: u64,
+    ram_end: u64,
+) -> Result<core::ops::Range<u64>, ParamsError> {
+    let end = start.checked_add(size).ok_or(ParamsError::RangeOverflow)?;
+    if start == 0
+        || size == 0
+        || !start.is_multiple_of(PAGE_SIZE)
+        || !size.is_multiple_of(PAGE_SIZE)
+        || end > ram_end
+    {
+        return Err(ParamsError::InvalidPlatformRegion);
+    }
+    Ok(start..end)
+}
+
+fn validate_platform(
+    params: &SnpBootShimParams,
+    params_gpa: u64,
+    platform: &SnpBootShimPlatformParams,
+) -> Result<(), ParamsError> {
+    let ranges = validate_params(params, params_gpa)?;
+    if platform.magic != SNP_BOOT_SHIM_PLATFORM_MAGIC
+        || platform.version != SNP_BOOT_SHIM_PLATFORM_VERSION
+        || platform.size != size_of::<SnpBootShimPlatformParams>() as u32
+        || !(1..=loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS as u32)
+            .contains(&platform.expected_cpu_count)
+        || platform.reserved != 0
+        || platform.dt_size != SNP_BOOT_SHIM_DT_SIZE
+        || !platform.c_bit_mask.is_power_of_two()
+        || !(32..52).contains(&platform.c_bit_mask.trailing_zeros())
+        || params.ram_end > 1u64 << 32
+    {
+        return Err(ParamsError::InvalidPlatform);
+    }
+
+    let dt = platform_region(platform.dt_gpa, platform.dt_size, params.ram_end)?;
+    let extension = platform_region(params.platform_gpa, PAGE_SIZE, params.ram_end)?;
+
+    // The generator places the platform extension and then the DT directly
+    // after the parameter page. Keep that ordering explicit so malformed
+    // handoffs cannot alias the measured pages.
+    if params_gpa + PAGE_SIZE > extension.start || extension.end > dt.start {
+        return Err(ParamsError::PlatformRangeOverlap);
+    }
+
+    let zero_page = params.linux_zero_page..params.linux_zero_page + PAGE_SIZE;
+    for range in ranges {
+        let start = range.start_gpn * PAGE_SIZE;
+        let end = start + range.page_count * PAGE_SIZE;
+        for protected in [&extension, &dt, &zero_page] {
+            if start < protected.end && protected.start < end {
+                return Err(ParamsError::PlatformRangeOverlap);
+            }
+        }
+        if (start..end).contains(&params.linux_entry) {
+            return Err(ParamsError::PlatformRangeOverlap);
+        }
+    }
+    Ok(())
+}
+
+/// Stop using the architected GHCB MSR termination protocol.
+///
+/// TODO: add a detailed, allocation-free SNP diagnostic channel. The current
+/// wire notification is a general termination request. Do not use port I/O
+/// here: the shim has no #VC handler.
+#[cfg(minimal_rt)]
+fn terminate() -> ! {
+    // SAFETY: GHCB MSR protocol accesses do not require a shared GHCB page.
+    unsafe {
+        minimal_rt::arch::msr::write_msr(x86defs::X86X_AMD_MSR_GHCB, 0x100);
+        core::arch::asm!("rep vmmcall", options(nostack));
+    }
+    minimal_rt::arch::fault()
 }
 
 #[cfg(minimal_rt)]
@@ -280,7 +408,7 @@ mod arch {
 }
 
 #[cfg(minimal_rt)]
-const STACK_SIZE: usize = 16 * 1024;
+const STACK_SIZE: usize = 32 * 1024;
 
 #[cfg(minimal_rt)]
 #[repr(C, align(16))]
@@ -352,6 +480,30 @@ extern "C" fn start(params_gpa: u64) -> ! {
         Ok(ranges) => ranges,
         Err(_) => minimal_rt::arch::fault(),
     };
+    {
+        // SAFETY: validate_params checked the measured extension page address
+        // and bounds. It is imported before the BSP starts, not accepted here.
+        let platform = unsafe { &*(params.platform_gpa as *const SnpBootShimPlatformParams) };
+        if validate_platform(params, params_gpa, platform).is_err() {
+            terminate();
+        }
+        // SAFETY: The measured descriptor bounds this already-imported private
+        // parameter area. Validation rejects MMIO/RAM collisions before any
+        // omitted RAM is accepted.
+        let dt = unsafe {
+            core::slice::from_raw_parts(platform.dt_gpa as *const u8, platform.dt_size as usize)
+        };
+        if pcie::validate_device_tree(
+            dt,
+            platform.expected_cpu_count,
+            params.ram_end,
+            platform.c_bit_mask,
+        )
+        .is_err()
+        {
+            terminate();
+        }
+    }
 
     for &range in ranges {
         if arch::accept_range(range).is_err() {
@@ -391,6 +543,84 @@ fn main() {}
 mod tests {
     use super::*;
     use loader_defs::linux::SNP_BOOT_SHIM_MAX_RANGES;
+    use test_with_tracing::test;
+    use zerocopy::FromZeros;
+
+    fn platform_params() -> (SnpBootShimParams, SnpBootShimPlatformParams) {
+        let mut params = valid_params();
+        params.platform_gpa = 0x203000;
+        params.ram_end = 0x800000;
+        params.range_count = 1;
+        params.ranges[0] = SnpBootShimRange {
+            start_gpn: 0x214000 / PAGE_SIZE,
+            page_count: 0x100,
+        };
+        let platform = SnpBootShimPlatformParams {
+            magic: SNP_BOOT_SHIM_PLATFORM_MAGIC,
+            version: SNP_BOOT_SHIM_PLATFORM_VERSION,
+            dt_gpa: 0x204000,
+            dt_size: SNP_BOOT_SHIM_DT_SIZE,
+            size: size_of::<SnpBootShimPlatformParams>() as u32,
+            expected_cpu_count: 2,
+            c_bit_mask: 1 << 51,
+            ..FromZeros::new_zeroed()
+        };
+        (params, platform)
+    }
+
+    #[test]
+    fn validates_platform_handoff() {
+        let (params, platform) = platform_params();
+        validate_platform(&params, 0x202000, &platform).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_platform_regions() {
+        let (params, platform) = platform_params();
+        let changes: &[fn(&mut SnpBootShimPlatformParams)] = &[
+            |p| p.magic = 0,
+            |p| p.version += 1,
+            |p| p.reserved = 1,
+            |p| p.dt_gpa += 1,
+            |p| p.dt_gpa = 0x203000,
+            |p| p.dt_size += PAGE_SIZE,
+            |p| p.size += 1,
+            |p| p.expected_cpu_count = 0,
+            |p| p.expected_cpu_count = 256,
+            |p| p.c_bit_mask = 1 << 31,
+            |p| p.c_bit_mask = 3 << 50,
+        ];
+        for change in changes {
+            let mut bad = platform;
+            change(&mut bad);
+            assert!(
+                validate_platform(&params, 0x202000, &bad).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_accepting_imported_platform_pages() {
+        let (mut params, platform) = platform_params();
+        params.range_count = 2;
+        params.ranges[1] = params.ranges[0];
+        for start in [params.platform_gpa, platform.dt_gpa] {
+            params.ranges[0] = SnpBootShimRange {
+                start_gpn: start / PAGE_SIZE,
+                page_count: 1,
+            };
+            let expected = if start == params.platform_gpa {
+                ParamsError::ParamsRangeOverlap
+            } else {
+                ParamsError::PlatformRangeOverlap
+            };
+            assert_eq!(
+                validate_platform(&params, 0x202000, &platform),
+                Err(expected)
+            );
+        }
+    }
 
     fn valid_params() -> SnpBootShimParams {
         SnpBootShimParams {
@@ -400,7 +630,7 @@ mod tests {
             linux_entry: 0x10_0000,
             linux_zero_page: 0x2000,
             ram_end: 0x20_0000,
-            reserved: 0,
+            platform_gpa: 0x3000,
             ranges: {
                 let mut ranges = [SnpBootShimRange {
                     start_gpn: 0,
@@ -444,12 +674,14 @@ mod tests {
             Err(ParamsError::InvalidMagic)
         );
 
-        params = valid_params();
-        params.version += 1;
-        assert_eq!(
-            validate_params(&params, 0x1000),
-            Err(ParamsError::UnsupportedVersion)
-        );
+        for version in [1, SNP_BOOT_SHIM_PARAMS_VERSION + 1] {
+            params = valid_params();
+            params.version = version;
+            assert_eq!(
+                validate_params(&params, 0x1000),
+                Err(ParamsError::UnsupportedVersion)
+            );
+        }
     }
 
     #[test]
@@ -596,10 +828,10 @@ mod tests {
         );
 
         params = valid_params();
-        params.reserved = 1;
+        params.platform_gpa = 1;
         assert_eq!(
             validate_params(&params, 0x1000),
-            Err(ParamsError::ReservedNotZero)
+            Err(ParamsError::InvalidPlatform)
         );
     }
 }

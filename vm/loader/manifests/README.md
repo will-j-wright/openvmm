@@ -29,11 +29,20 @@ The `snp-linux-direct-restricted.json` profile encodes restricted interrupt
 injection in its IGVM VMSA. It is intended only for MSHV bring-up.
 
 The image contains a small measured bootshim. Only pages containing the kernel,
-initrd, boot metadata, SNP special pages, bootshim, or bootshim parameters are
-included as IGVM `PageData`. After SNP launch, the bootshim accepts the
+initrd, boot metadata, SNP special pages, bootshim, or bootshim handoff pages
+are included as IGVM `PageData`. After SNP launch, the bootshim accepts the
 remaining private RAM with `PVALIDATE` and then enters Linux. This avoids
 loading and measuring every configured RAM page, but still accepts all RAM
 before Linux starts.
+
+The image also reserves a 64-KiB unmeasured IGVM device-tree parameter area.
+OpenVMM fills it at launch. A measured platform page records the location of
+the tree, the expected CPU count, and the C-bit. Before the bootshim accepts
+RAM, it checks that the tree describes exactly that CPU count, all of the
+measured RAM, fixed COM1 through COM4 serial ports, and at most eight PCIe host
+bridges with ECAM and MMIO windows outside RAM and below the C-bit. If a check
+fails, the bootshim stops the guest. The measured ACPI tables remain the only
+hardware description passed to Linux.
 
 The IGVM contains only the BSP VMSA, regardless of processor count. Backends
 are responsible for any AP launch state they require. Current KVM constructs
@@ -94,7 +103,8 @@ logic; existing images retain their old tables and launch measurements.
 
 Use one memory node and match both the VP count and memory size to the image:
 
-- `--processors` must equal the manifest's `processor_count`.
+- `--processors` must equal the manifest's `processor_count`, which must be
+  in 1 through 255.
 - `--memory` must equal `memory_page_count * 4096` bytes.
 - Use `--vps-per-socket` equal to the VP count for a single-socket launch with
   the image's contiguous APIC IDs starting at 0. Leave the APIC ID offset at

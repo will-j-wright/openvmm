@@ -33,6 +33,7 @@ dependencies = [
  "cxl_spec",
  "guid",
  "memory_range",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "x86defs",
  "zerocopy",
@@ -5917,6 +5918,7 @@ dependencies = [
  "intel_vtd",
  "iommu_common",
  "loader",
+ "loader_defs",
  "membacking",
  "memory_range",
  "mesh",
@@ -8031,10 +8033,17 @@ dependencies = [
 name = "snp_bootshim"
 version = "0.0.0"
 dependencies = [
+ "acpi",
+ "fdt",
+ "igvm_defs",
  "loader_defs",
+ "memory_range",
  "minimal_rt",
  "minimal_rt_build",
+ "test_with_tracing",
+ "thiserror 2.0.16",
  "x86defs",
+ "zerocopy",
 ]
 
 [[package]]
