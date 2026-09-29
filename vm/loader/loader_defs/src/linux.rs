@@ -299,7 +299,19 @@ pub struct cc_setup_data {
 /// Magic value for a measured [`SnpBootShimParams`] page.
 pub const SNP_BOOT_SHIM_PARAMS_MAGIC: u64 = u64::from_le_bytes(*b"SNPBSHIM");
 /// Version of the [`SnpBootShimParams`] handoff ABI.
-pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 1;
+pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 2;
+/// Magic value for the measured platform extension.
+pub const SNP_BOOT_SHIM_PLATFORM_MAGIC: u64 = u64::from_le_bytes(*b"SNPPLAT2");
+/// Version of the platform extension.
+pub const SNP_BOOT_SHIM_PLATFORM_VERSION: u32 = 1;
+/// Maximum host device-tree size accepted by the fixed SNP profile.
+pub const SNP_BOOT_SHIM_DT_SIZE: u64 = 64 * 1024;
+/// Maximum number of PCIe host bridges supported by the SNP bootshim.
+pub const SNP_BOOT_SHIM_MAX_PCIE_BRIDGES: usize = 8;
+/// Maximum CPU count, with contiguous APIC IDs starting at zero.
+pub const SNP_BOOT_SHIM_MAX_CPUS: usize = 255;
+/// Maximum number of host RAM records before normalization.
+pub const SNP_BOOT_SHIM_MAX_RAM_RECORDS: usize = 32;
 const SNP_BOOT_SHIM_PARAMS_HEADER_SIZE: usize = 48;
 /// Maximum number of RAM ranges that fit in one [`SnpBootShimParams`] page.
 pub const SNP_BOOT_SHIM_MAX_RANGES: usize = (hvdef::HV_PAGE_SIZE as usize
@@ -336,11 +348,32 @@ pub struct SnpBootShimParams {
     pub linux_zero_page: u64,
     /// Exclusive end of the configured, contiguous guest RAM.
     pub ram_end: u64,
-    /// Reserved for future ABI versions and must be zero.
-    pub reserved: u64,
+    /// Page-aligned GPA of the mandatory [`SnpBootShimPlatformParams`].
+    pub platform_gpa: u64,
     /// Sorted, non-overlapping RAM ranges omitted from measured page data.
     pub ranges: [SnpBootShimRange; SNP_BOOT_SHIM_MAX_RANGES],
 }
+
+/// Measured locations and limits for validating the host device tree.
+///
+/// The device-tree contents are unmeasured host input. These bounds, unlike
+/// those contents, are part of the measured image and cannot be supplied by DT.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct SnpBootShimPlatformParams {
+    pub magic: u64,
+    pub version: u32,
+    /// Must equal the size of this structure.
+    pub size: u32,
+    pub dt_gpa: u64,
+    pub dt_size: u64,
+    pub expected_cpu_count: u32,
+    pub reserved: u32,
+    /// SNP page-table encryption bit; PCIe addresses must lie below this bit.
+    pub c_bit_mask: u64,
+}
+
+const_assert_eq!(size_of::<SnpBootShimPlatformParams>(), 48);
 
 const_assert_eq!(size_of::<SnpBootShimRange>(), 16);
 const_assert_eq!(align_of::<SnpBootShimRange>(), 8);

@@ -17,14 +17,19 @@ use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SnpInjectionType;
 use loader::importer::BootPageAcceptance;
+use loader::importer::IgvmParameterType;
 use loader::importer::ImageLoad;
 use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
+use loader_defs::linux::SNP_BOOT_SHIM_DT_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_MAX_RANGES;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
+use loader_defs::linux::SNP_BOOT_SHIM_PLATFORM_MAGIC;
+use loader_defs::linux::SNP_BOOT_SHIM_PLATFORM_VERSION;
 use loader_defs::linux::SnpBootShimParams;
+use loader_defs::linux::SnpBootShimPlatformParams;
 use loader_defs::linux::SnpBootShimRange;
 use memory_range::MemoryRange;
 use serial_16550_resources::ComPort;
@@ -75,6 +80,10 @@ struct FixedGuestLayout {
 
 impl FixedGuestLayout {
     fn new(memory_page_count: u64, processor_count: u32) -> anyhow::Result<Self> {
+        ensure!(
+            (1..=loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS as u32).contains(&processor_count),
+            "SNP CPU count must be in 1 through 255"
+        );
         let memory_size = memory_page_count
             .checked_mul(PAGE_SIZE)
             .context("RAM size overflow")?;
@@ -237,6 +246,8 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
         loader::linux::ZERO_PAGE_BASE,
         memory_page_count,
         kernel_runtime_end,
+        processor_count,
+        1u64 << c_bit_position,
     )?;
 
     let mut output = loader.finalize().context("finalizing SNP IGVM")?;
@@ -249,17 +260,18 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
     Ok(output)
 }
 
-/// Places the bootshim and its measured handoff page.
+/// Places the bootshim and its measured handoff pages.
 ///
 /// The Linux loader first imports the kernel, initrd, boot metadata, and SNP
 /// special pages. The bootshim is placed at the first page after both those
-/// imports and the kernel's runtime image. Its parameter page follows the
-/// bootshim. The BSP starts at the bootshim entry point with RSI pointing to
-/// that parameter page.
+/// imports and the kernel's runtime image. Its parameter page, platform page,
+/// and host device-tree area follow the bootshim in that order. The BSP starts
+/// at the bootshim entry point with RSI pointing to the parameter page.
 ///
-/// The parameter page lists every gap in configured RAM that has no measured
-/// page-data directive. The bootshim makes those pages private, validates
-/// them, and then enters Linux with RSI restored to the Linux zero page.
+/// The parameter page lists gaps that contain neither imported data nor the
+/// host-supplied device tree. The bootshim validates the tree against the
+/// measured platform page before it accepts RAM, and still uses the measured
+/// ACPI tables when it enters Linux.
 fn load_bootshim_and_handoff(
     loader: &mut IgvmLoader<X86Register>,
     resources: &Resources,
@@ -267,6 +279,8 @@ fn load_bootshim_and_handoff(
     linux_zero_page: u64,
     memory_page_count: u64,
     kernel_runtime_end: u64,
+    processor_count: u32,
+    c_bit_mask: u64,
 ) -> anyhow::Result<Vec<SnpBootShimRange>> {
     let shim_base = align_up_to_page(loader.next_available_gpa()?.max(kernel_runtime_end));
 
@@ -292,6 +306,15 @@ fn load_bootshim_and_handoff(
         params_page < memory_page_count,
         "SNP bootshim parameter page lies outside configured RAM"
     );
+    let platform_gpa = import_bootshim_platform(
+        loader,
+        params_gpa,
+        memory_page_count
+            .checked_mul(PAGE_SIZE)
+            .context("RAM size overflow")?,
+        processor_count,
+        c_bit_mask,
+    )?;
 
     let bootshim_ranges = loader
         .unimported_ram_ranges([params_page])?
@@ -306,6 +329,7 @@ fn load_bootshim_and_handoff(
         linux_entry,
         linux_zero_page,
         memory_page_count * PAGE_SIZE,
+        platform_gpa,
         &bootshim_ranges,
     )?;
     {
@@ -324,6 +348,69 @@ fn load_bootshim_and_handoff(
     }
 
     Ok(bootshim_ranges)
+}
+
+/// Imports the measured platform page and requests the host device tree.
+///
+/// The platform page directly follows the parameter page, and the device-tree
+/// area directly follows the platform page. Returns the platform page GPA.
+fn import_bootshim_platform(
+    loader: &mut IgvmLoader<X86Register>,
+    params_gpa: u64,
+    ram_end: u64,
+    processor_count: u32,
+    c_bit_mask: u64,
+) -> anyhow::Result<u64> {
+    ensure!(
+        params_gpa.is_multiple_of(PAGE_SIZE),
+        "unaligned SNP bootshim parameter page"
+    );
+    let platform_gpa = params_gpa
+        .checked_add(PAGE_SIZE)
+        .context("SNP bootshim platform page address overflow")?;
+    let dt_gpa = platform_gpa
+        .checked_add(PAGE_SIZE)
+        .context("SNP device tree address overflow")?;
+    let dt_end = dt_gpa
+        .checked_add(SNP_BOOT_SHIM_DT_SIZE)
+        .context("SNP device tree end overflow")?;
+    ensure!(
+        dt_end <= ram_end,
+        "SNP device tree lies outside configured RAM"
+    );
+    let platform = SnpBootShimPlatformParams {
+        magic: SNP_BOOT_SHIM_PLATFORM_MAGIC,
+        version: SNP_BOOT_SHIM_PLATFORM_VERSION,
+        size: size_of::<SnpBootShimPlatformParams>() as u32,
+        dt_gpa,
+        dt_size: SNP_BOOT_SHIM_DT_SIZE,
+        expected_cpu_count: processor_count,
+        c_bit_mask,
+        ..FromZeros::new_zeroed()
+    };
+    let mut importer = loader.loader();
+    importer
+        .import_pages(
+            platform_gpa / PAGE_SIZE,
+            1,
+            "snp-bootshim-platform",
+            BootPageAcceptance::Exclusive,
+            platform.as_bytes(),
+        )
+        .context("importing SNP bootshim platform parameters")?;
+    let area = importer
+        .create_parameter_area(
+            dt_gpa / PAGE_SIZE,
+            (SNP_BOOT_SHIM_DT_SIZE / PAGE_SIZE)
+                .try_into()
+                .context("SNP device tree page count overflow")?,
+            "snp-bootshim-device-tree",
+        )
+        .context("reserving SNP device tree")?;
+    importer
+        .import_parameter(area, 0, IgvmParameterType::DeviceTree)
+        .context("requesting SNP device tree")?;
+    Ok(platform_gpa)
 }
 
 fn align_up_to_page(value: u64) -> u64 {
@@ -350,6 +437,7 @@ fn build_bootshim_params(
     linux_entry: u64,
     linux_zero_page: u64,
     ram_end: u64,
+    platform_gpa: u64,
     ranges: &[SnpBootShimRange],
 ) -> anyhow::Result<SnpBootShimParams> {
     ensure!(
@@ -368,6 +456,7 @@ fn build_bootshim_params(
     params.linux_entry = linux_entry;
     params.linux_zero_page = linux_zero_page;
     params.ram_end = ram_end;
+    params.platform_gpa = platform_gpa;
     params.ranges[..ranges.len()].copy_from_slice(ranges);
     Ok(params)
 }
@@ -381,7 +470,6 @@ mod tests {
     use acpi_spec::srat::SratApic;
     use acpi_spec::srat::SratHeader;
     use acpi_spec::srat::SratMemory;
-    use acpi_spec::srat::SratX2Apic;
     use igvm::IgvmDirectiveHeader;
     use igvm::IgvmFile;
     use igvm::IgvmInitializationHeader;
@@ -545,7 +633,7 @@ mod tests {
 
     #[test]
     fn fixed_layout_srat_assigns_all_cpus_and_memory_to_node_zero() {
-        for processor_count in [1, 2, 4, 8, 256] {
+        for processor_count in [1, 2, 4, 8, 255] {
             let layout = FixedGuestLayout::new(64, processor_count).unwrap();
             assert_eq!(layout.processors.vp_count(), processor_count);
             assert_eq!(layout.memory.ram().len(), 1);
@@ -562,15 +650,9 @@ mod tests {
             let (_, mut entries) = SratHeader::read_from_prefix(data).unwrap();
 
             for apic_id in 0..processor_count {
-                if apic_id <= 0xfe {
-                    let (entry, rest) = SratApic::read_from_prefix(entries).unwrap();
-                    assert_eq!(entry.as_bytes(), SratApic::new(apic_id as u8, 0).as_bytes());
-                    entries = rest;
-                } else {
-                    let (entry, rest) = SratX2Apic::read_from_prefix(entries).unwrap();
-                    assert_eq!(entry.as_bytes(), SratX2Apic::new(apic_id, 0).as_bytes());
-                    entries = rest;
-                }
+                let (entry, rest) = SratApic::read_from_prefix(entries).unwrap();
+                assert_eq!(entry.as_bytes(), SratApic::new(apic_id as u8, 0).as_bytes());
+                entries = rest;
             }
             for range in layout.memory.ram() {
                 let (entry, rest) = SratMemory::read_from_prefix(entries).unwrap();
@@ -582,6 +664,8 @@ mod tests {
             }
             assert!(entries.is_empty());
         }
+        assert!(FixedGuestLayout::new(64, 0).is_err());
+        assert!(FixedGuestLayout::new(64, 256).is_err());
     }
 
     #[test]
@@ -705,6 +789,7 @@ mod tests {
             0x200000,
             loader::linux::ZERO_PAGE_BASE,
             RAM_PAGE_COUNT * PAGE_SIZE,
+            params_gpa + PAGE_SIZE,
             &ranges,
         )
         .unwrap();
@@ -773,6 +858,106 @@ mod tests {
     }
 
     #[test]
+    fn snp_platform_page_and_device_tree_follow_the_parameter_page() {
+        const RAM_PAGES: u64 = 64;
+        const PARAMS_PAGE: u64 = 32;
+        const PLATFORM_GPA: u64 = (PARAMS_PAGE + 1) * PAGE_SIZE;
+        const DT_GPA: u64 = (PARAMS_PAGE + 2) * PAGE_SIZE;
+        let mut loader = test_loader(RAM_PAGES);
+        let platform_gpa = import_bootshim_platform(
+            &mut loader,
+            PARAMS_PAGE * PAGE_SIZE,
+            RAM_PAGES * PAGE_SIZE,
+            2,
+            TEST_C_BIT_MASK,
+        )
+        .unwrap();
+        assert_eq!(platform_gpa, PLATFORM_GPA);
+        assert_eq!(
+            loader.unimported_ram_ranges([PARAMS_PAGE]).unwrap(),
+            [
+                0..PARAMS_PAGE,
+                PARAMS_PAGE + 2 + SNP_BOOT_SHIM_DT_SIZE / PAGE_SIZE..RAM_PAGES
+            ]
+        );
+
+        let params = build_bootshim_params(
+            PAGE_SIZE * 16,
+            loader::linux::ZERO_PAGE_BASE,
+            RAM_PAGES * PAGE_SIZE,
+            platform_gpa,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(params.version, SNP_BOOT_SHIM_PARAMS_VERSION);
+        assert_eq!(params.platform_gpa, PLATFORM_GPA);
+        import_test_registers(&mut loader.loader(), PARAMS_PAGE * PAGE_SIZE);
+        let output = loader.finalize().unwrap();
+        let directives = output.guest.directives();
+        let platform = directives
+            .iter()
+            .find_map(|directive| match directive {
+                IgvmDirectiveHeader::PageData { gpa, data, .. } if *gpa == PLATFORM_GPA => {
+                    Some(SnpBootShimPlatformParams::read_from_prefix(data).unwrap().0)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            platform,
+            SnpBootShimPlatformParams {
+                magic: SNP_BOOT_SHIM_PLATFORM_MAGIC,
+                version: SNP_BOOT_SHIM_PLATFORM_VERSION,
+                size: size_of::<SnpBootShimPlatformParams>() as u32,
+                dt_gpa: DT_GPA,
+                dt_size: SNP_BOOT_SHIM_DT_SIZE,
+                expected_cpu_count: 2,
+                reserved: 0,
+                c_bit_mask: TEST_C_BIT_MASK,
+            }
+        );
+        let area = directives
+            .iter()
+            .find_map(|directive| match directive {
+                IgvmDirectiveHeader::ParameterArea {
+                    number_of_bytes,
+                    parameter_area_index,
+                    initial_data,
+                } if *number_of_bytes == SNP_BOOT_SHIM_DT_SIZE && initial_data.is_empty() => {
+                    Some(*parameter_area_index)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(directives.iter().any(|directive| matches!(
+            directive,
+            IgvmDirectiveHeader::DeviceTree(info)
+                if info.parameter_area_index == area && info.byte_offset == 0
+        )));
+        assert!(directives.iter().any(|directive| matches!(
+            directive,
+            IgvmDirectiveHeader::ParameterInsert(info)
+                if info.parameter_area_index == area && info.gpa == DT_GPA
+        )));
+        assert!(!directives.iter().any(|directive| matches!(
+            directive,
+            IgvmDirectiveHeader::PageData { gpa, .. }
+                if (DT_GPA..DT_GPA + SNP_BOOT_SHIM_DT_SIZE).contains(gpa)
+        )));
+    }
+
+    #[test]
+    fn snp_device_tree_must_fit_in_ram() {
+        let mut loader = test_loader(64);
+        for (params_gpa, ram_end) in [(62 * PAGE_SIZE, 64 * PAGE_SIZE), (u64::MAX, u64::MAX)] {
+            assert!(
+                import_bootshim_platform(&mut loader, params_gpa, ram_end, 1, TEST_C_BIT_MASK)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn sparse_image_emits_only_the_bsp_vmsa() {
         let mut loader = test_loader(1);
         import_test_registers(&mut loader.loader(), 0x2000);
@@ -834,7 +1019,7 @@ mod tests {
             SNP_BOOT_SHIM_MAX_RANGES + 1
         ];
         assert!(
-            build_bootshim_params(0x100000, 0x2000, 0x200000, &ranges)
+            build_bootshim_params(0x100000, 0x2000, 0x200000, 0x3000, &ranges)
                 .unwrap_err()
                 .to_string()
                 .contains("supports at most")
