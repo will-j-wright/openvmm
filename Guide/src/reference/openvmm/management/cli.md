@@ -162,6 +162,14 @@ describes the source definitions.
 
   With `--igvm --vtl2`, omit `--igvm-personality`. OpenVMM retains the
   existing HCL-host device shape and VBS-compatible IGVM behavior.
+
+  On x86, the IGVM device tree publishes COM1 and COM2 when any serial backend
+  is configured. It publishes COM3 and COM4 only when each port's backend is
+  configured. OpenHCL continues to select a published COM3 as its console.
+  COM1 defaults to a console backend; use `--com1 none` to disable it.
+  These publication rules do not remove disconnected emulated UARTs. Native
+  x86 Linux-direct ACPI still describes all four ports when serial is enabled;
+  ARM64 DT and ACPI still describe both PL011 UARTs.
 * `--tpm [VERSION]`: Add a vTPM device. Supported versions are `138` and
   `185`; a bare `--tpm` uses version `185`. The dotted forms `1.38` and `1.85`
   are also accepted.
