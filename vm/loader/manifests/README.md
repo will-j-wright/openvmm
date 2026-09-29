@@ -35,6 +35,10 @@ remaining private RAM with `PVALIDATE` and then enters Linux. This avoids
 loading and measuring every configured RAM page, but still accepts all RAM
 before Linux starts.
 
+The image also reserves a 64-KiB unmeasured IGVM device-tree parameter area.
+OpenVMM fills it at launch, but this bootshim does not read it yet. The
+measured ACPI tables remain the only hardware description passed to Linux.
+
 The IGVM contains only the BSP VMSA, regardless of processor count. Backends
 are responsible for any AP launch state they require. Current KVM constructs
 and measures the initial VMSAs itself rather than accepting the IGVM VMSA page.

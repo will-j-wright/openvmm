@@ -17,10 +17,12 @@ use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SnpInjectionType;
 use loader::importer::BootPageAcceptance;
+use loader::importer::IgvmParameterType;
 use loader::importer::ImageLoad;
 use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
+use loader_defs::linux::SNP_BOOT_SHIM_DT_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_MAX_RANGES;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
@@ -257,9 +259,9 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
 /// bootshim. The BSP starts at the bootshim entry point with RSI pointing to
 /// that parameter page.
 ///
-/// The parameter page lists every gap in configured RAM that has no measured
-/// page-data directive. The bootshim makes those pages private, validates
-/// them, and then enters Linux with RSI restored to the Linux zero page.
+/// The parameter page lists gaps that contain neither imported data nor the
+/// host-supplied device tree. The bootshim ignores the tree for now and still
+/// uses the measured ACPI tables when it enters Linux.
 fn load_bootshim_and_handoff(
     loader: &mut IgvmLoader<X86Register>,
     resources: &Resources,
@@ -292,6 +294,13 @@ fn load_bootshim_and_handoff(
         params_page < memory_page_count,
         "SNP bootshim parameter page lies outside configured RAM"
     );
+    request_bootshim_device_tree(
+        loader,
+        params_gpa,
+        memory_page_count
+            .checked_mul(PAGE_SIZE)
+            .context("RAM size overflow")?,
+    )?;
 
     let bootshim_ranges = loader
         .unimported_ram_ranges([params_page])?
@@ -324,6 +333,40 @@ fn load_bootshim_and_handoff(
     }
 
     Ok(bootshim_ranges)
+}
+
+fn request_bootshim_device_tree(
+    loader: &mut IgvmLoader<X86Register>,
+    params_gpa: u64,
+    ram_end: u64,
+) -> anyhow::Result<()> {
+    ensure!(
+        params_gpa.is_multiple_of(PAGE_SIZE),
+        "unaligned SNP bootshim parameter page"
+    );
+    let dt_gpa = params_gpa
+        .checked_add(PAGE_SIZE)
+        .context("SNP device tree address overflow")?;
+    let dt_end = dt_gpa
+        .checked_add(SNP_BOOT_SHIM_DT_SIZE)
+        .context("SNP device tree end overflow")?;
+    ensure!(
+        dt_end <= ram_end,
+        "SNP device tree lies outside configured RAM"
+    );
+    let mut importer = loader.loader();
+    let area = importer
+        .create_parameter_area(
+            dt_gpa / PAGE_SIZE,
+            (SNP_BOOT_SHIM_DT_SIZE / PAGE_SIZE)
+                .try_into()
+                .context("SNP device tree page count overflow")?,
+            "snp-bootshim-device-tree",
+        )
+        .context("reserving SNP device tree")?;
+    importer
+        .import_parameter(area, 0, IgvmParameterType::DeviceTree)
+        .context("requesting SNP device tree")
 }
 
 fn align_up_to_page(value: u64) -> u64 {
@@ -770,6 +813,73 @@ mod tests {
             &[1, 2, PARAMS_PAGE],
             (TEST_SHIM_ENTRY, params_gpa),
         );
+    }
+
+    #[test]
+    fn snp_device_tree_is_imported_without_changing_the_static_handoff() {
+        const RAM_PAGES: u64 = 64;
+        const PARAMS_PAGE: u64 = 32;
+        let mut loader = test_loader(RAM_PAGES);
+        request_bootshim_device_tree(&mut loader, PARAMS_PAGE * PAGE_SIZE, RAM_PAGES * PAGE_SIZE)
+            .unwrap();
+        assert_eq!(
+            loader.unimported_ram_ranges([PARAMS_PAGE]).unwrap(),
+            [
+                0..PARAMS_PAGE,
+                PARAMS_PAGE + 1 + SNP_BOOT_SHIM_DT_SIZE / PAGE_SIZE..RAM_PAGES
+            ]
+        );
+
+        let params = build_bootshim_params(
+            PAGE_SIZE * 16,
+            loader::linux::ZERO_PAGE_BASE,
+            RAM_PAGES * PAGE_SIZE,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(params.version, SNP_BOOT_SHIM_PARAMS_VERSION);
+        assert_eq!(params.reserved, 0);
+        import_test_registers(&mut loader.loader(), PARAMS_PAGE * PAGE_SIZE);
+        let output = loader.finalize().unwrap();
+        let directives = output.guest.directives();
+        let area = directives
+            .iter()
+            .find_map(|directive| match directive {
+                IgvmDirectiveHeader::ParameterArea {
+                    number_of_bytes,
+                    parameter_area_index,
+                    initial_data,
+                } if *number_of_bytes == SNP_BOOT_SHIM_DT_SIZE && initial_data.is_empty() => {
+                    Some(*parameter_area_index)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(directives.iter().any(|directive| matches!(
+            directive,
+            IgvmDirectiveHeader::DeviceTree(info)
+                if info.parameter_area_index == area && info.byte_offset == 0
+        )));
+        assert!(directives.iter().any(|directive| matches!(
+            directive,
+            IgvmDirectiveHeader::ParameterInsert(info)
+                if info.parameter_area_index == area
+                    && info.gpa == (PARAMS_PAGE + 1) * PAGE_SIZE
+        )));
+        assert!(!directives.iter().any(|directive| matches!(
+            directive,
+            IgvmDirectiveHeader::PageData { gpa, .. }
+                if ((PARAMS_PAGE + 1) * PAGE_SIZE
+                    ..(PARAMS_PAGE + 1) * PAGE_SIZE + SNP_BOOT_SHIM_DT_SIZE)
+                    .contains(gpa)
+        )));
+    }
+
+    #[test]
+    fn snp_device_tree_must_fit_in_ram() {
+        let mut loader = test_loader(64);
+        assert!(request_bootshim_device_tree(&mut loader, 63 * PAGE_SIZE, 64 * PAGE_SIZE).is_err());
+        assert!(request_bootshim_device_tree(&mut loader, u64::MAX, u64::MAX).is_err());
     }
 
     #[test]

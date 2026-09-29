@@ -300,6 +300,8 @@ pub struct cc_setup_data {
 pub const SNP_BOOT_SHIM_PARAMS_MAGIC: u64 = u64::from_le_bytes(*b"SNPBSHIM");
 /// Version of the [`SnpBootShimParams`] handoff ABI.
 pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 1;
+/// Size of the host-populated, unmeasured SNP Linux-direct device tree.
+pub const SNP_BOOT_SHIM_DT_SIZE: u64 = 64 * 1024;
 const SNP_BOOT_SHIM_PARAMS_HEADER_SIZE: usize = 48;
 /// Maximum number of RAM ranges that fit in one [`SnpBootShimParams`] page.
 pub const SNP_BOOT_SHIM_MAX_RANGES: usize = (hvdef::HV_PAGE_SIZE as usize
