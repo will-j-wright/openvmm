@@ -184,6 +184,9 @@ impl Image {
             if processor_count == 0 {
                 return Err(ImageValidationError::ZeroProcessorCount);
             }
+            if processor_count > 255 {
+                return Err(ImageValidationError::TooManyProcessors);
+            }
             if memory_page_count == 0 {
                 return Err(ImageValidationError::ZeroMemoryPageCount);
             }
@@ -216,6 +219,9 @@ pub enum ImageValidationError {
     /// The image requests no virtual processors.
     #[error("processor_count must be nonzero")]
     ZeroProcessorCount,
+    /// The initial SNP ACPI contract uses legacy APIC IDs 0 through 254.
+    #[error("processor_count must not exceed 255")]
+    TooManyProcessors,
     /// The image requests no guest memory.
     #[error("memory_page_count must be nonzero")]
     ZeroMemoryPageCount,
@@ -484,6 +490,32 @@ mod test {
     }
 
     #[test]
+    fn parse_pcie_snp_linux_direct_manifest() {
+        let config: Config =
+            serde_json::from_str(include_str!("../../manifests/snp-linux-direct-pcie.json"))
+                .unwrap();
+        let [guest] = config.guest_configs.as_slice() else {
+            panic!("expected one guest config");
+        };
+        assert!(matches!(
+            guest.image,
+            Image::SnpLinuxDirect {
+                processor_count: 2,
+                memory_page_count: 40960,
+                ..
+            }
+        ));
+        assert!(matches!(
+            guest.isolation_type,
+            ConfigIsolationType::Snp {
+                injection_type: SnpInjectionType::Normal,
+                ..
+            }
+        ));
+        guest.image.validate().unwrap();
+    }
+
+    #[test]
     fn parse_multi_vp_snp_linux_direct_manifest() {
         let config: Config = serde_json::from_str(include_str!(
             "../../manifests/snp-linux-direct-multi-vp.json"
@@ -608,6 +640,13 @@ mod test {
             image.validate(),
             Err(ImageValidationError::ZeroProcessorCount)
         );
+        assert_eq!(
+            snp_linux_direct_image(false, 256, 40960, 51).validate(),
+            Err(ImageValidationError::TooManyProcessors)
+        );
+        snp_linux_direct_image(false, 255, 40960, 51)
+            .validate()
+            .unwrap();
     }
 
     #[test]
