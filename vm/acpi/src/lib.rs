@@ -3,8 +3,8 @@
 
 //! Crate for dynamically creating ACPI tables.
 //!
-//! [`snp`] validates the hardware topology for the fixed x86 SNP Linux base
-//! tables.
+//! [`snp`] constructs the fixed x86 SNP Linux base tables from a bounded,
+//! validated topology.
 
 #![no_std]
 #![expect(missing_docs)]

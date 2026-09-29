@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 //! Measured SEV-SNP boot stage that validates host topology, accepts sparse
-//! guest RAM, and enters a direct-boot Linux kernel.
+//! guest RAM, builds complete ACPI, and enters a direct-boot Linux kernel.
 //!
 //! The IGVM generator starts this x86_64 bare-metal payload with `RSI` pointing
 //! to a measured [`SnpBootShimParams`] page. After validating that complete
@@ -22,42 +22,15 @@
 // only tests and the minimal-runtime entry point call it.
 #![cfg_attr(not(any(minimal_rt, test)), allow(dead_code))]
 
-#[cfg(test)]
 extern crate alloc;
 
+mod heap;
 mod pcie;
 mod topology;
 
-/// Global allocator that fails every allocation.
-///
-/// The `acpi` crate links `alloc`, so the bare-metal shim needs a global
-/// allocator. Device-tree validation does not allocate.
-// TODO: Replace this with a heap in host-provided, accepted memory when the
-// shim generates complete ACPI tables from the host device tree.
-#[cfg(minimal_rt)]
-mod no_alloc {
-    use core::alloc::GlobalAlloc;
-    use core::alloc::Layout;
-
-    struct NoAlloc;
-
-    // SAFETY: `alloc` always returns null, which reports allocation failure.
-    // `dealloc` can never receive a pointer from this allocator.
-    unsafe impl GlobalAlloc for NoAlloc {
-        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-            core::ptr::null_mut()
-        }
-
-        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-            unreachable!("the null allocator never allocates")
-        }
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: NoAlloc = NoAlloc;
-}
-
+use loader_defs::linux::SNP_BOOT_SHIM_ACPI_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_DT_SIZE;
+use loader_defs::linux::SNP_BOOT_SHIM_HEAP_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
 use loader_defs::linux::SNP_BOOT_SHIM_PLATFORM_MAGIC;
@@ -85,6 +58,7 @@ enum ParamsError {
     InvalidPlatform,
     InvalidPlatformRegion,
     PlatformRangeOverlap,
+    HeapNotAccepted,
 }
 
 /// Validates the measured generator-to-bootshim handoff before using it.
@@ -209,7 +183,10 @@ fn validate_platform(
         || !(1..=loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS as u32)
             .contains(&platform.expected_cpu_count)
         || platform.reserved != 0
+        || platform.reserved2 != 0
         || platform.dt_size != SNP_BOOT_SHIM_DT_SIZE
+        || platform.heap_size != SNP_BOOT_SHIM_HEAP_SIZE
+        || platform.acpi_output_size != SNP_BOOT_SHIM_ACPI_SIZE
         || !platform.c_bit_mask.is_power_of_two()
         || !(32..52).contains(&platform.c_bit_mask.trailing_zeros())
         || params.ram_end > 1u64 << 32
@@ -218,20 +195,38 @@ fn validate_platform(
     }
 
     let dt = platform_region(platform.dt_gpa, platform.dt_size, params.ram_end)?;
+    let heap = platform_region(platform.heap_gpa, platform.heap_size, params.ram_end)?;
+    let output = platform_region(
+        platform.acpi_output_gpa,
+        platform.acpi_output_size,
+        params.ram_end,
+    )?;
+    let rsdp = platform_region(platform.rsdp_gpa, PAGE_SIZE, params.ram_end)?;
+    let shim = platform_region(platform.shim_gpa, platform.shim_size, params.ram_end)?;
     let extension = platform_region(params.platform_gpa, PAGE_SIZE, params.ram_end)?;
 
-    // The generator places the platform extension and then the DT directly
-    // after the parameter page. Keep that ordering explicit so malformed
-    // handoffs cannot alias the measured pages.
-    if params_gpa + PAGE_SIZE > extension.start || extension.end > dt.start {
+    // The generator places permanent ACPI below the legacy RSDP, and
+    // temporary DT/heap storage after the loaded shim. Keep that ordering
+    // explicit so malformed handoffs cannot alias code or published tables.
+    if params.linux_zero_page + PAGE_SIZE > output.start
+        || output.end > rsdp.start
+        || rsdp.end > params.linux_entry
+        || params.linux_entry >= shim.start
+        || shim.start < 0x10_0000
+        || shim.end > params_gpa
+        || params_gpa + PAGE_SIZE > extension.start
+        || extension.end > dt.start
+        || dt.end > heap.start
+    {
         return Err(ParamsError::PlatformRangeOverlap);
     }
 
-    let zero_page = params.linux_zero_page..params.linux_zero_page + PAGE_SIZE;
+    let mut heap_accepted = false;
     for range in ranges {
         let start = range.start_gpn * PAGE_SIZE;
         let end = start + range.page_count * PAGE_SIZE;
-        for protected in [&extension, &dt, &zero_page] {
+        let zero_page = params.linux_zero_page..params.linux_zero_page + PAGE_SIZE;
+        for protected in [&output, &rsdp, &shim, &extension, &dt, &zero_page] {
             if start < protected.end && protected.start < end {
                 return Err(ParamsError::PlatformRangeOverlap);
             }
@@ -239,6 +234,10 @@ fn validate_platform(
         if (start..end).contains(&params.linux_entry) {
             return Err(ParamsError::PlatformRangeOverlap);
         }
+        heap_accepted |= start <= heap.start && end >= heap.end;
+    }
+    if !heap_accepted {
+        return Err(ParamsError::HeapNotAccepted);
     }
     Ok(())
 }
@@ -246,8 +245,8 @@ fn validate_platform(
 /// Stop using the architected GHCB MSR termination protocol.
 ///
 /// TODO: add a detailed, allocation-free SNP diagnostic channel. The current
-/// wire notification is a general termination request. Do not use port I/O
-/// here: the shim has no #VC handler.
+/// wire notification is a general termination request, never a silent fallback
+/// to stale ACPI. Do not use port I/O here: the shim has no #VC handler.
 #[cfg(minimal_rt)]
 fn terminate() -> ! {
     // SAFETY: GHCB MSR protocol accesses do not require a shared GHCB page.
@@ -256,6 +255,51 @@ fn terminate() -> ! {
         core::arch::asm!("rep vmmcall", options(nostack));
     }
     minimal_rt::arch::fault()
+}
+
+#[cfg(minimal_rt)]
+fn install_platform_acpi(params: &SnpBootShimParams, platform: &SnpBootShimPlatformParams) {
+    // SAFETY: validate_platform checked these disjoint, bounded regions.
+    // RAM acceptance completed before heap initialization and any writes.
+    let initialized =
+        unsafe { heap::HEAP.init(platform.heap_gpa as usize, platform.heap_size as usize) };
+    if !initialized {
+        terminate();
+    }
+    // SAFETY: The measured platform descriptor fixes these mapped regions;
+    // only the bytes inside the validated DT region are host-controlled.
+    let dt = unsafe {
+        core::slice::from_raw_parts(platform.dt_gpa as *const u8, platform.dt_size as usize)
+    };
+    let (rsdp, tables) = match pcie::build_acpi(
+        dt,
+        platform.expected_cpu_count,
+        platform.acpi_output_gpa,
+        platform.acpi_output_size as usize,
+        params.ram_end,
+        platform.c_bit_mask,
+    ) {
+        Ok(output) => output,
+        Err(_) => terminate(),
+    };
+    if tables.len() > platform.acpi_output_size as usize
+        || rsdp.len() != size_of::<acpi_spec::Rsdp>()
+    {
+        terminate();
+    }
+
+    // SAFETY: The output and pinned RSDP regions are disjoint from the heap
+    // owning these Vec buffers. Publish discovery only after all tables exist.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            tables.as_ptr(),
+            platform.acpi_output_gpa as *mut u8,
+            tables.len(),
+        );
+        core::ptr::copy_nonoverlapping(rsdp.as_ptr(), platform.rsdp_gpa as *mut u8, rsdp.len());
+        let zero_page = &mut *(params.linux_zero_page as *mut loader_defs::linux::boot_params);
+        zero_page.acpi_rsdp_addr = platform.rsdp_gpa;
+    }
 }
 
 #[cfg(minimal_rt)]
@@ -480,7 +524,7 @@ extern "C" fn start(params_gpa: u64) -> ! {
         Ok(ranges) => ranges,
         Err(_) => minimal_rt::arch::fault(),
     };
-    {
+    let platform = {
         // SAFETY: validate_params checked the measured extension page address
         // and bounds. It is imported before the BSP starts, not accepted here.
         let platform = unsafe { &*(params.platform_gpa as *const SnpBootShimPlatformParams) };
@@ -488,8 +532,8 @@ extern "C" fn start(params_gpa: u64) -> ! {
             terminate();
         }
         // SAFETY: The measured descriptor bounds this already-imported private
-        // parameter area. Validation rejects MMIO/RAM collisions before any
-        // omitted RAM is accepted.
+        // parameter area. Preflight is allocation-free and rejects MMIO/RAM
+        // collisions before any omitted RAM (including the heap) is accepted.
         let dt = unsafe {
             core::slice::from_raw_parts(platform.dt_gpa as *const u8, platform.dt_size as usize)
         };
@@ -503,13 +547,16 @@ extern "C" fn start(params_gpa: u64) -> ! {
         {
             terminate();
         }
-    }
+        platform
+    };
 
     for &range in ranges {
         if arch::accept_range(range).is_err() {
             minimal_rt::arch::fault();
         }
     }
+
+    install_platform_acpi(params, platform);
 
     // SAFETY: These statics are single-threaded bootshim handoff state. Their
     // values came from the measured parameter page and are consumed
@@ -553,15 +600,22 @@ mod tests {
         params.range_count = 1;
         params.ranges[0] = SnpBootShimRange {
             start_gpn: 0x214000 / PAGE_SIZE,
-            page_count: 0x100,
+            page_count: SNP_BOOT_SHIM_HEAP_SIZE / PAGE_SIZE,
         };
         let platform = SnpBootShimPlatformParams {
             magic: SNP_BOOT_SHIM_PLATFORM_MAGIC,
             version: SNP_BOOT_SHIM_PLATFORM_VERSION,
             dt_gpa: 0x204000,
             dt_size: SNP_BOOT_SHIM_DT_SIZE,
+            heap_gpa: 0x214000,
+            heap_size: SNP_BOOT_SHIM_HEAP_SIZE,
             size: size_of::<SnpBootShimPlatformParams>() as u32,
             expected_cpu_count: 2,
+            acpi_output_gpa: 0x1a000,
+            acpi_output_size: SNP_BOOT_SHIM_ACPI_SIZE,
+            rsdp_gpa: 0xe0000,
+            shim_gpa: 0x200000,
+            shim_size: 2 * PAGE_SIZE,
             c_bit_mask: 1 << 51,
             ..FromZeros::new_zeroed()
         };
@@ -569,9 +623,14 @@ mod tests {
     }
 
     #[test]
-    fn validates_platform_handoff() {
-        let (params, platform) = platform_params();
+    fn validates_platform_handoff_and_accepted_heap() {
+        let (mut params, platform) = platform_params();
         validate_platform(&params, 0x202000, &platform).unwrap();
+        params.range_count = 0;
+        assert_eq!(
+            validate_platform(&params, 0x202000, &platform),
+            Err(ParamsError::HeapNotAccepted)
+        );
     }
 
     #[test]
@@ -582,11 +641,16 @@ mod tests {
             |p| p.version += 1,
             |p| p.reserved = 1,
             |p| p.dt_gpa += 1,
-            |p| p.dt_gpa = 0x203000,
             |p| p.dt_size += PAGE_SIZE,
+            |p| p.heap_gpa = p.dt_gpa,
+            |p| p.heap_size += PAGE_SIZE,
+            |p| p.acpi_output_gpa = 0x1000,
             |p| p.size += 1,
             |p| p.expected_cpu_count = 0,
             |p| p.expected_cpu_count = 256,
+            |p| p.rsdp_gpa = p.acpi_output_gpa,
+            |p| p.shim_gpa = 0x100000,
+            |p| p.shim_size = u64::MAX,
             |p| p.c_bit_mask = 1 << 31,
             |p| p.c_bit_mask = 3 << 50,
         ];
@@ -605,7 +669,11 @@ mod tests {
         let (mut params, platform) = platform_params();
         params.range_count = 2;
         params.ranges[1] = params.ranges[0];
-        for start in [params.platform_gpa, platform.dt_gpa] {
+        for start in [
+            params.platform_gpa,
+            platform.dt_gpa,
+            platform.acpi_output_gpa,
+        ] {
             params.ranges[0] = SnpBootShimRange {
                 start_gpn: start / PAGE_SIZE,
                 page_count: 1,
@@ -674,7 +742,7 @@ mod tests {
             Err(ParamsError::InvalidMagic)
         );
 
-        for version in [1, SNP_BOOT_SHIM_PARAMS_VERSION + 1] {
+        for version in [1, 2, SNP_BOOT_SHIM_PARAMS_VERSION + 1] {
             params = valid_params();
             params.version = version;
             assert_eq!(
