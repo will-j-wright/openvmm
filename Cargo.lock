@@ -5414,6 +5414,7 @@ dependencies = [
 name = "nvme_test"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chipset_device",
  "device_emulators",
@@ -5434,6 +5435,7 @@ dependencies = [
  "scsi_buffers",
  "task_control",
  "tdisp",
+ "tdisp_proto",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
@@ -5664,8 +5666,14 @@ name = "openhcl_tdisp"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "futures",
+ "hvdef",
+ "inspect",
+ "parking_lot",
  "tdisp",
  "tdisp_proto",
+ "tracing",
+ "virt",
 ]
 
 [[package]]
@@ -11132,6 +11140,7 @@ dependencies = [
  "futures-concurrency",
  "guestmem",
  "guid",
+ "hvdef",
  "inspect",
  "mesh",
  "openhcl_tdisp",
@@ -11145,6 +11154,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
+ "virt",
  "vmbus_async",
  "vmbus_channel",
  "vmbus_ring",
@@ -11170,22 +11180,31 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "chipset_device",
+ "closeable_mutex",
  "fs-err",
  "futures",
+ "guestmem",
+ "guid",
  "hcl",
  "hvdef",
  "inspect",
  "memory_range",
  "mesh",
  "openhcl_tdisp",
+ "pal_async",
+ "parking_lot",
  "pci_core",
  "slab",
  "sparse_mmap",
  "state_unit",
+ "task_control",
  "tdisp",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "user_driver",
+ "virt",
+ "vmbus_channel",
  "vmbus_client",
  "vmbus_server",
  "vmcore",
