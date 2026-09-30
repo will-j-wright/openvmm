@@ -5667,13 +5667,18 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "futures",
+ "hcl",
  "hvdef",
  "inspect",
+ "memory_range",
  "parking_lot",
+ "sev_guest_device",
  "tdisp",
  "tdisp_proto",
+ "tracelimit",
  "tracing",
  "virt",
+ "x86defs",
 ]
 
 [[package]]
