@@ -33,7 +33,6 @@ dependencies = [
  "cxl_spec",
  "guid",
  "memory_range",
- "test_with_tracing",
  "thiserror 2.0.16",
  "x86defs",
  "zerocopy",

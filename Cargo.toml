@@ -139,8 +139,7 @@ debug_ptr = { path = "support/debug_ptr" }
 fast_memcpy = { path = "support/fast_memcpy" }
 fast_select = { path = "support/fast_select" }
 fdt = { path = "support/fdt" }
-guid = { path = "support/guid" }
-guid_core = { package = "guid", path = "support/guid", default-features = false }
+guid = { path = "support/guid", default-features = false }
 headervec = { path = "support/headervec" }
 hybrid_vsock = { path = "support/hybrid_vsock" }
 hvs_file = { path = "support/hvs_file" }
@@ -241,7 +240,7 @@ tmk_tests = { path = "tmk/tmk_tests" }
 
 aarch64defs = { path = "vm/aarch64/aarch64defs" }
 aarch64emu = { path = "vm/aarch64/aarch64emu" }
-acpi = { path = "vm/acpi" }
+acpi = { path = "vm/acpi", default-features = false }
 acpi_spec = { path = "vm/acpi_spec" }
 amd_iommu = { path = "vm/devices/iommu/amd_iommu" }
 intel_vtd = { path = "vm/devices/iommu/intel_vtd" }

@@ -2,16 +2,9 @@
 // Licensed under the MIT License.
 
 //! Provides the [`Guid`] type with the same layout as the Windows type `GUID`.
-//!
-//! Disable default features for allocation-free, `no_std` parsing and formatting.
-//! The default `getrandom` feature enables random GUID generation. The default
-//! `std` feature enables Windows type conversions on Windows.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
-
-#[cfg(test)]
-extern crate std;
 
 use core::str::FromStr;
 use thiserror::Error;
@@ -285,7 +278,7 @@ impl From<Guid> for [u8; 16] {
 }
 
 mod windows {
-    #![cfg(all(windows, feature = "std"))]
+    #![cfg(windows)]
     use super::Guid;
 
     impl From<Guid> for win_etw_provider::GUID {
@@ -347,7 +340,6 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::Guid;
-    use std::format;
 
     #[test]
     fn test_display_guid() {
