@@ -20,7 +20,5 @@ x86defs.workspace = true
 
 zerocopy.workspace = true
 
-[dev-dependencies]
-
 [lints]
 workspace = true

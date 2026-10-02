@@ -2,9 +2,6 @@
 // Licensed under the MIT License.
 
 //! Crate for dynamically creating ACPI tables.
-//!
-//! The core builders use `no_std` with `alloc`. The optional `cxl` feature adds
-//! CEDT support and its hosted device-definition dependency.
 
 #![no_std]
 #![expect(missing_docs)]
