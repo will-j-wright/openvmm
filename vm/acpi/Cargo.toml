@@ -6,16 +6,12 @@ name = "acpi"
 edition.workspace = true
 rust-version.workspace = true
 
-[features]
-default = []
-cxl = ["dep:cxl_spec", "dep:thiserror"]
-
 [dependencies]
 acpi_spec.workspace = true
-cxl_spec = { workspace = true, optional = true }
+cxl_spec.workspace = true
 guid.workspace = true
 memory_range.workspace = true
-thiserror = { workspace = true, optional = true }
+thiserror.workspace = true
 x86defs.workspace = true
 
 zerocopy.workspace = true

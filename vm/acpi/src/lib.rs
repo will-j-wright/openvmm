@@ -11,7 +11,6 @@ extern crate alloc;
 
 mod aml;
 pub mod builder;
-#[cfg(feature = "cxl")]
 pub mod cedt;
 pub mod dsdt;
 pub mod ssdt;
