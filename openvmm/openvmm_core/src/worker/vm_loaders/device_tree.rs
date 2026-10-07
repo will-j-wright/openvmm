@@ -863,6 +863,12 @@ mod tests {
     use super::*;
     use fdt::parser::Node;
     use fdt::parser::Parser;
+    use host_fdt_parser::ComInfo;
+    use host_fdt_parser::CpuEntry;
+    use host_fdt_parser::MemoryAllocationMode;
+    use host_fdt_parser::MemoryEntry;
+    use host_fdt_parser::ParsedDeviceTree;
+    use igvm_defs::MemoryMapEntryType;
     use serial_16550_resources::ComPort;
     use test_with_tracing::test;
     use vm_topology::processor::TopologyBuilder;
@@ -901,6 +907,33 @@ mod tests {
             pmu_gsiv: Some(23),
             virt_timer_ppi: 20,
             gic_nr_irqs: 256,
+        }
+    }
+
+    fn pcie_bridge() -> PcieHostBridge {
+        PcieHostBridge {
+            index: 4,
+            segment: 7,
+            start_bus: 32,
+            end_bus: 47,
+            ecam_range: MemoryRange::new(0x8000_0000..0x8100_0000),
+            low_mmio: MemoryRange::new(0x9000_0000..0xa000_0000),
+            high_mmio: MemoryRange::new(0x12_0000_0000..0x14_0000_0000),
+            cxl: None,
+            vnode: None,
+            preserve_bars: false,
+            preserve_boot_config: true,
+        }
+    }
+
+    fn smmu() -> AcpiSmmuConfig {
+        AcpiSmmuConfig {
+            rc_index: 4,
+            segment: 7,
+            base: 0x7000_0000,
+            event_gsiv: 35,
+            gerr_gsiv: 36,
+            reserved_iova_ranges: vec![],
         }
     }
 
@@ -1052,27 +1085,8 @@ mod tests {
         let topology = TopologyBuilder::new_aarch64(arm_platform())
             .build(2)
             .unwrap();
-        let bridges = [PcieHostBridge {
-            index: 4,
-            segment: 7,
-            start_bus: 32,
-            end_bus: 47,
-            ecam_range: MemoryRange::new(0x8000_0000..0x8100_0000),
-            low_mmio: MemoryRange::new(0x9000_0000..0xa000_0000),
-            high_mmio: MemoryRange::new(0x12_0000_0000..0x14_0000_0000),
-            cxl: None,
-            vnode: None,
-            preserve_bars: false,
-            preserve_boot_config: true,
-        }];
-        let smmus = [AcpiSmmuConfig {
-            rc_index: 4,
-            segment: 7,
-            base: 0x7000_0000,
-            event_gsiv: 35,
-            gerr_gsiv: 36,
-            reserved_iova_ranges: vec![],
-        }];
+        let bridges = [pcie_bridge()];
+        let smmus = [smmu()];
         let dt = linux(&topology, &bridges, &smmus).build().unwrap();
 
         let pcie = node(&dt, "/pcie@80000000");
@@ -1108,5 +1122,151 @@ mod tests {
             [0, u32_property(&smmu, "phandle")[0], 0, 0x10000]
         );
         assert_eq!(u32_property(&pcie, "linux,pci-probe-only"), [1]);
+    }
+
+    #[test]
+    fn igvm_tree_parses_with_openhcl_parser() {
+        let topology = TopologyBuilder::new_x86().build(2).unwrap();
+        let protectable = [MemoryRange::new(0x2000..0x4000)];
+        let entropy = [1, 2, 3, 4];
+        let command_line = "console=ttyS2 root=/dev/ram0";
+        let dt = DeviceTreeBuilder::new(
+            RAM,
+            COMS,
+            &[pcie_bridge()],
+            0x10000,
+            DeviceTreeBootType::Igvm(IgvmBoot {
+                vtl2_base_address: Vtl2BaseAddressType::Vtl2Allocate {
+                    size: Some(0x2000_0000),
+                },
+                protectable_ram: &protectable,
+                vmbus_redirect: true,
+                entropy: Some(&entropy),
+                ..igvm_boot(&topology)
+            }),
+        )
+        .with_command_line(command_line)
+        .with_console(Some(UartId::Com(ComPort::Com3)))
+        .build()
+        .unwrap();
+
+        let mut storage = ParsedDeviceTree::<8, 8, 128, 64>::new();
+        let parsed = ParsedDeviceTree::parse(&dt, &mut storage).unwrap();
+        let expected_cpus: Vec<_> = topology
+            .vps_arch()
+            .map(|vp| CpuEntry {
+                reg: vp.apic_id.into(),
+                vnode: vp.base.vnode,
+            })
+            .collect();
+        assert_eq!(parsed.cpus.as_slice(), expected_cpus);
+        assert_eq!(
+            parsed.memory.as_slice(),
+            [
+                MemoryEntry {
+                    range: MemoryRange::new(0..0x2000),
+                    mem_type: MemoryMapEntryType::MEMORY,
+                    vnode: 0,
+                },
+                MemoryEntry {
+                    range: protectable[0],
+                    mem_type: MemoryMapEntryType::VTL2_PROTECTABLE,
+                    vnode: 0,
+                },
+                MemoryEntry {
+                    range: MemoryRange::new(0x4000..0x4000_0000),
+                    mem_type: MemoryMapEntryType::MEMORY,
+                    vnode: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            parsed.vmbus_vtl0.as_ref().unwrap().mmio.as_slice(),
+            [mmio().low, mmio().high]
+        );
+        let vtl2 = parsed.vmbus_vtl2.as_ref().unwrap();
+        assert_eq!(vtl2.mmio.as_slice(), [mmio().vtl2]);
+        assert_eq!(vtl2.connection_id, 0x800074);
+        assert_eq!(parsed.command_line.as_str(), command_line);
+        assert_eq!(
+            parsed.memory_allocation_mode,
+            MemoryAllocationMode::Vtl2 {
+                memory_size: Some(0x2000_0000),
+                mmio_size: Some(128 * 1024 * 1024),
+            }
+        );
+        assert_eq!(
+            parsed.entropy.as_ref().map(|bytes| bytes.as_slice()),
+            Some(entropy.as_slice())
+        );
+        assert_eq!(
+            parsed.com3_serial,
+            ComInfo::Ns16550 {
+                base: ComPort::Com3.io_port().into(),
+                current_speed: 115200,
+            }
+        );
+    }
+
+    #[test]
+    fn arm_rejects_invalid_configuration() {
+        let overlapping_gic = Aarch64PlatformConfig {
+            gic_distributor_base: 0xeff0_0000,
+            ..arm_platform()
+        };
+        let platforms = [
+            (
+                Aarch64PlatformConfig {
+                    virt_timer_ppi: 15,
+                    ..arm_platform()
+                },
+                DeviceTreeError::Interrupt,
+            ),
+            (
+                Aarch64PlatformConfig {
+                    pmu_gsiv: Some(32),
+                    ..arm_platform()
+                },
+                DeviceTreeError::Interrupt,
+            ),
+            (overlapping_gic, DeviceTreeError::GicRange),
+        ];
+        for (platform, expected) in platforms {
+            // Supply VPs directly so that the topology builder's own platform
+            // checks do not hide the device-tree validation.
+            let valid = TopologyBuilder::new_aarch64(arm_platform())
+                .build(2)
+                .unwrap();
+            let topology = TopologyBuilder::new_aarch64(platform)
+                .build_with_vp_info(valid.vps_arch())
+                .unwrap();
+            let error = linux(&topology, &[], &[]).build().unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected),
+                "{error:?}"
+            );
+        }
+
+        let topology = TopologyBuilder::new_aarch64(arm_platform())
+            .build(2)
+            .unwrap();
+        let bridges = [pcie_bridge()];
+        // An SMMU needs an SPI and a matching host bridge.
+        for smmu in [
+            AcpiSmmuConfig {
+                event_gsiv: 31,
+                ..smmu()
+            },
+            AcpiSmmuConfig {
+                rc_index: 5,
+                ..smmu()
+            },
+        ] {
+            assert!(matches!(
+                linux(&topology, &bridges, &[smmu]).build(),
+                Err(DeviceTreeError::Smmu)
+            ));
+        }
     }
 }
