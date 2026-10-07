@@ -942,14 +942,14 @@ impl VmChipsetResult {
         debugger_mode: [bool; 4],
         backends: [Option<Resource<SerialBackendHandle>>; 4],
     ) -> &mut Self {
-        // TODO: Decide whether the device tree should describe each COM port
-        // only when it has a backend, rather than COM1/COM2 as a pair.
+        // Describe COM1/COM2 as a pair when any COM backend is configured.
+        // Device attachment does not depend on this device-tree rule.
         if backends.iter().any(Option::is_some) {
             self.dt_uarts
                 .extend([UartId::Com(ComPort::Com1), UartId::Com(ComPort::Com2)]);
         }
-        // TODO: Resolve whether COM3/COM4 should keep this per-port backend
-        // requirement or follow the same device-tree rule as COM1/COM2.
+        // Additional ports require their own backend. In particular, OpenHCL
+        // selects COM3 as its console whenever the device tree describes it.
         for (port, backend) in zip([ComPort::Com3, ComPort::Com4], &backends[2..]) {
             if backend.is_some() {
                 self.dt_uarts.push(UartId::Com(port));

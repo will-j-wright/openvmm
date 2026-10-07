@@ -192,12 +192,6 @@ pub enum LoadMode {
     None,
 }
 
-#[derive(Debug, Clone, Copy, MeshPayload)]
-pub struct SerialInformation {
-    pub io_port: u16,
-    pub irq: u32,
-}
-
 /// Different types to specify the base address for the VTL2 region of the IGVM
 /// file.
 #[derive(Debug, Clone, Copy, MeshPayload)]

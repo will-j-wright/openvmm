@@ -5905,6 +5905,7 @@ dependencies = [
  "getrandom 0.4.2",
  "guestmem",
  "guid",
+ "host_fdt_parser",
  "hvdef",
  "hyperv_dump",
  "hypervisor_resources",
