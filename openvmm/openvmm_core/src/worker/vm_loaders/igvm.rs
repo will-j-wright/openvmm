@@ -114,10 +114,14 @@ pub enum Error {
     MissingRequiredMemory(MemoryRange),
 }
 
+/// The largest device tree that the loader builds, whatever the size of the
+/// IGVM parameter area.
+const MAX_DEVICE_TREE_SIZE: u64 = HV_PAGE_SIZE * 256;
+
 fn device_tree_capacity(max_size: u64, byte_offset: u32) -> Result<usize, Error> {
     max_size
         .checked_sub(u64::from(byte_offset))
-        .and_then(|available| usize::try_from(available).ok())
+        .and_then(|available| usize::try_from(available.min(MAX_DEVICE_TREE_SIZE)).ok())
         .ok_or(Error::ParameterTooLarge)
 }
 
@@ -1352,6 +1356,10 @@ mod tests {
     fn device_tree_parameter_capacity_uses_remaining_area() {
         assert_eq!(device_tree_capacity(0x10000, 0x1000).unwrap(), 0xf000);
         assert_eq!(device_tree_capacity(100, 100).unwrap(), 0);
+        assert_eq!(
+            device_tree_capacity(u64::MAX, 0).unwrap(),
+            MAX_DEVICE_TREE_SIZE as usize
+        );
         assert!(matches!(
             device_tree_capacity(100, 101),
             Err(Error::ParameterTooLarge)
