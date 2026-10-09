@@ -34,6 +34,7 @@ use memory_range::MemoryRange;
 use memory_range::subtract_ranges;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use range_map_vec::RangeMap;
+use serial_uart_resources::UartId;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Seek;
@@ -47,7 +48,6 @@ use vm_topology::processor::ArchTopology;
 use vm_topology::processor::ProcessorTopology;
 use vm_topology::processor::aarch64::Aarch64Topology;
 use vm_topology::processor::x86::X86Topology;
-use vmm_core_defs::uart::UartId;
 use zerocopy::IntoBytes;
 
 #[derive(Debug, Error)]

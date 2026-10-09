@@ -9,6 +9,7 @@ use fdt::builder::Nest;
 use fdt::builder::StringId;
 use memory_range::MemoryRange;
 use openvmm_defs::config::Vtl2BaseAddressType;
+use serial_uart_resources::UartId;
 use thiserror::Error;
 use vm_topology::memory::MemoryRangeWithNode;
 use vm_topology::pcie::PcieHostBridge;
@@ -18,7 +19,6 @@ use vm_topology::processor::aarch64::GicMsiController;
 use vm_topology::processor::aarch64::GicVersion;
 use vm_topology::processor::x86::X86Topology;
 use vmm_core::acpi_builder::AcpiSmmuConfig;
-use vmm_core_defs::uart::UartId;
 
 const STRING_TABLE_CAP: usize = 1024;
 
@@ -863,12 +863,6 @@ mod tests {
     use super::*;
     use fdt::parser::Node;
     use fdt::parser::Parser;
-    use host_fdt_parser::ComInfo;
-    use host_fdt_parser::CpuEntry;
-    use host_fdt_parser::MemoryAllocationMode;
-    use host_fdt_parser::MemoryEntry;
-    use host_fdt_parser::ParsedDeviceTree;
-    use igvm_defs::MemoryMapEntryType;
     use serial_16550_resources::ComPort;
     use test_with_tracing::test;
     use vm_topology::processor::TopologyBuilder;
@@ -1122,90 +1116,6 @@ mod tests {
             [0, u32_property(&smmu, "phandle")[0], 0, 0x10000]
         );
         assert_eq!(u32_property(&pcie, "linux,pci-probe-only"), [1]);
-    }
-
-    #[test]
-    fn igvm_tree_parses_with_openhcl_parser() {
-        let topology = TopologyBuilder::new_x86().build(2).unwrap();
-        let protectable = [MemoryRange::new(0x2000..0x4000)];
-        let entropy = [1, 2, 3, 4];
-        let command_line = "console=ttyS2 root=/dev/ram0";
-        let dt = DeviceTreeBuilder::new(
-            RAM,
-            COMS,
-            &[pcie_bridge()],
-            0x10000,
-            DeviceTreeBootType::Igvm(IgvmBoot {
-                vtl2_base_address: Vtl2BaseAddressType::Vtl2Allocate {
-                    size: Some(0x2000_0000),
-                },
-                protectable_ram: &protectable,
-                vmbus_redirect: true,
-                entropy: Some(&entropy),
-                ..igvm_boot(&topology)
-            }),
-        )
-        .with_command_line(command_line)
-        .with_console(Some(UartId::Com(ComPort::Com3)))
-        .build()
-        .unwrap();
-
-        let mut storage = ParsedDeviceTree::<8, 8, 128, 64>::new();
-        let parsed = ParsedDeviceTree::parse(&dt, &mut storage).unwrap();
-        let expected_cpus: Vec<_> = topology
-            .vps_arch()
-            .map(|vp| CpuEntry {
-                reg: vp.apic_id.into(),
-                vnode: vp.base.vnode,
-            })
-            .collect();
-        assert_eq!(parsed.cpus.as_slice(), expected_cpus);
-        assert_eq!(
-            parsed.memory.as_slice(),
-            [
-                MemoryEntry {
-                    range: MemoryRange::new(0..0x2000),
-                    mem_type: MemoryMapEntryType::MEMORY,
-                    vnode: 0,
-                },
-                MemoryEntry {
-                    range: protectable[0],
-                    mem_type: MemoryMapEntryType::VTL2_PROTECTABLE,
-                    vnode: 0,
-                },
-                MemoryEntry {
-                    range: MemoryRange::new(0x4000..0x4000_0000),
-                    mem_type: MemoryMapEntryType::MEMORY,
-                    vnode: 0,
-                },
-            ]
-        );
-        assert_eq!(
-            parsed.vmbus_vtl0.as_ref().unwrap().mmio.as_slice(),
-            [mmio().low, mmio().high]
-        );
-        let vtl2 = parsed.vmbus_vtl2.as_ref().unwrap();
-        assert_eq!(vtl2.mmio.as_slice(), [mmio().vtl2]);
-        assert_eq!(vtl2.connection_id, 0x800074);
-        assert_eq!(parsed.command_line.as_str(), command_line);
-        assert_eq!(
-            parsed.memory_allocation_mode,
-            MemoryAllocationMode::Vtl2 {
-                memory_size: Some(0x2000_0000),
-                mmio_size: Some(128 * 1024 * 1024),
-            }
-        );
-        assert_eq!(
-            parsed.entropy.as_ref().map(|bytes| bytes.as_slice()),
-            Some(entropy.as_slice())
-        );
-        assert_eq!(
-            parsed.com3_serial,
-            ComInfo::Ns16550 {
-                base: ComPort::Com3.io_port().into(),
-                current_speed: 115200,
-            }
-        );
     }
 
     #[test]

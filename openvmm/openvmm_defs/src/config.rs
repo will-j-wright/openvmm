@@ -3,11 +3,11 @@
 
 //! Configuration for the VM worker.
 
+pub use serial_uart_resources::UartId;
+pub use serial_uart_resources::UartInventory;
 pub use smbios_defs::SmbiosBiosOverrides;
 pub use smbios_defs::SmbiosConfig;
 pub use smbios_defs::SmbiosSystemOverrides;
-pub use vmm_core_defs::uart::UartId;
-pub use vmm_core_defs::uart::UartInventory;
 
 use guid::Guid;
 use input_core::InputData;

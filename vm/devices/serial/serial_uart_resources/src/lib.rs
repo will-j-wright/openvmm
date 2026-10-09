@@ -3,6 +3,8 @@
 
 //! UART identities to describe in the device tree.
 
+#![forbid(unsafe_code)]
+
 use mesh::payload::Protobuf;
 use serial_16550_resources::ComPort;
 

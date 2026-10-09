@@ -7,7 +7,6 @@
 #![forbid(unsafe_code)]
 
 pub mod debug_rpc;
-pub mod uart;
 
 use inspect::Inspect;
 use mesh::MeshPayload;
