@@ -587,12 +587,12 @@ pub fn load_linux_arm64(
             .map_err(|e| Error::Dt(e.into()))?
     } else {
         DeviceTreeBuilder::new(
+            processor_topology,
             cfg.mem_layout.ram(),
             dt_uarts,
             pcie_host_bridges,
             0x200000,
             DeviceTreeBootType::LinuxDirect(LinuxDirectBoot {
-                topology: processor_topology,
                 low_mmio: chipset_mmio.low,
                 high_mmio: chipset_mmio.high,
                 initrd: Some((initrd_start, initrd_end)),

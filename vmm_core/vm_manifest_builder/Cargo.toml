@@ -16,7 +16,6 @@ serial_16550_resources.workspace = true
 serial_core.workspace = true
 serial_debugcon_resources.workspace = true
 serial_pl011_resources.workspace = true
-serial_uart_resources.workspace = true
 vm_resource.workspace = true
 vmm_core_defs.workspace = true
 vmotherboard.workspace = true

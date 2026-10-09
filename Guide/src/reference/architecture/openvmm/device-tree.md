@@ -6,7 +6,9 @@ OpenVMM builds a flattened device tree (FDT) for two boot paths:
 - **ARM64 Linux direct boot** without ACPI.
 
 Both paths use one writer, in
-`openvmm/openvmm_core/src/worker/vm_loaders/device_tree.rs`. ARM64 Linux
+`openvmm/openvmm_core/src/worker/vm_loaders/device_tree.rs`. The processor
+architecture selects the processor, interrupt, and PCIe interrupt nodes. The
+boot path selects the memory, bus, and boot data nodes. ARM64 Linux
 direct boot with ACPI uses a small stub tree instead. The stub tree has no
 hardware descriptions. It tells the Linux EFI stub where to find the EFI
 system table, and the kernel then finds the hardware through ACPI.
@@ -30,8 +32,9 @@ On x86, the memory nodes tell OpenHCL which RAM is VTL2-protectable.
 
 ## UARTs
 
-The device tree describes only the UARTs in OpenVMM's device-tree UART list.
-This list is separate from device attachment and from console selection.
+The device tree describes only the UARTs that the VM's chipset capabilities
+mark for the device tree. These flags are separate from device attachment and
+from console selection.
 
 On x86, the IGVM device tree describes COM1 and COM2 when any serial backend
 is configured. It describes COM3 and COM4 only when each port has its own

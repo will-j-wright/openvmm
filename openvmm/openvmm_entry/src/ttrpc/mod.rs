@@ -1170,7 +1170,6 @@ impl VmService {
             pci_chipset_devices: chipset.pci_chipset_devices,
             isa_dma_controller: chipset.isa_dma_controller,
             chipset_capabilities: chipset.capabilities,
-            dt_uarts: openvmm_defs::config::UartInventory::Devices(chipset.dt_uarts),
             layout: layout_config,
             rtc_delta_milliseconds: 0,
         };

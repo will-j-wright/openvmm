@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Complete device trees for partition handoff and native Linux boot.
+//! Device trees for guest loaders, such as OpenHCL (IGVM) and Linux direct
+//! boot.
 
 use super::super::memory_layout::ChipsetMmioRanges;
 use fdt::builder::Builder;
@@ -13,6 +14,7 @@ use serial_uart_resources::UartId;
 use thiserror::Error;
 use vm_topology::memory::MemoryRangeWithNode;
 use vm_topology::pcie::PcieHostBridge;
+use vm_topology::processor::ArchTopology;
 use vm_topology::processor::ProcessorTopology;
 use vm_topology::processor::aarch64::Aarch64Topology;
 use vm_topology::processor::aarch64::GicMsiController;
@@ -64,8 +66,12 @@ pub enum DeviceTreeError {
     Processors,
 }
 
-/// Builds a device tree for an x86 IGVM parameter or ARM64 Linux direct boot.
-pub(crate) struct DeviceTreeBuilder<'a> {
+/// Builds a device tree for IGVM or Linux direct boot.
+///
+/// `T` selects the architecture-specific content, and [`DeviceTreeBootType`]
+/// selects the boot-specific content.
+pub(crate) struct DeviceTreeBuilder<'a, T: DeviceTreeArch> {
+    topology: &'a ProcessorTopology<T>,
     ram: &'a [MemoryRangeWithNode],
     dt_uarts: &'a [UartId],
     pcie: &'a [PcieHostBridge],
@@ -81,9 +87,8 @@ pub(crate) enum DeviceTreeBootType<'a> {
     LinuxDirect(LinuxDirectBoot<'a>),
 }
 
-/// Settings for the device tree that an x86 IGVM launch uses.
+/// Settings for the device tree that an IGVM launch uses.
 pub(crate) struct IgvmBoot<'a> {
-    pub topology: &'a ProcessorTopology<X86Topology>,
     pub chipset_mmio: ChipsetMmioRanges,
     pub vtl2_base_address: Vtl2BaseAddressType,
     pub protectable_ram: &'a [MemoryRange],
@@ -91,17 +96,17 @@ pub(crate) struct IgvmBoot<'a> {
     pub entropy: Option<&'a [u8]>,
 }
 
-/// Settings for the device tree that an ARM64 Linux kernel receives.
+/// Settings for the device tree that a Linux kernel receives.
 pub(crate) struct LinuxDirectBoot<'a> {
-    pub topology: &'a ProcessorTopology<Aarch64Topology>,
     pub low_mmio: MemoryRange,
     pub high_mmio: MemoryRange,
     pub initrd: Option<(u64, u64)>,
     pub smmus: &'a [AcpiSmmuConfig],
 }
 
-impl<'a> DeviceTreeBuilder<'a> {
+impl<'a, T: DeviceTreeArch> DeviceTreeBuilder<'a, T> {
     pub(crate) fn new(
+        topology: &'a ProcessorTopology<T>,
         ram: &'a [MemoryRangeWithNode],
         dt_uarts: &'a [UartId],
         pcie: &'a [PcieHostBridge],
@@ -109,6 +114,7 @@ impl<'a> DeviceTreeBuilder<'a> {
         boot: DeviceTreeBootType<'a>,
     ) -> Self {
         Self {
+            topology,
             ram,
             dt_uarts,
             pcie,
@@ -138,10 +144,7 @@ impl<'a> DeviceTreeBuilder<'a> {
             return Err(DeviceTreeError::Capacity);
         }
 
-        let processor_count = match &self.boot {
-            DeviceTreeBootType::Igvm(igvm) => igvm.topology.vps().len(),
-            DeviceTreeBootType::LinuxDirect(linux) => linux.topology.vps().len(),
-        };
+        let processor_count = self.topology.vps().len();
         if processor_count == 0 || processor_count > u32::MAX as usize {
             return Err(DeviceTreeError::Processors);
         }
@@ -156,12 +159,11 @@ impl<'a> DeviceTreeBuilder<'a> {
         {
             return Err(DeviceTreeError::ConsoleNotInDeviceTree);
         }
-        let mmio_uarts = matches!(self.boot, DeviceTreeBootType::LinuxDirect(_));
         for (index, uart) in self.dt_uarts.iter().enumerate() {
             if self.dt_uarts[..index].contains(uart) {
                 return Err(DeviceTreeError::DuplicateUart);
             }
-            if uart_is_mmio(*uart) != mmio_uarts {
+            if uart_is_mmio(*uart) != T::MMIO_UARTS {
                 return Err(DeviceTreeError::UartArchitecture);
             }
         }
@@ -170,9 +172,15 @@ impl<'a> DeviceTreeBuilder<'a> {
             if linux.initrd.is_some_and(|(start, end)| start > end) {
                 return Err(DeviceTreeError::InitrdRange);
             }
-            validate_arm(linux.topology, linux.smmus, self.pcie)?;
         }
-        Ok(())
+        T::validate(self.topology, self.smmus(), self.pcie)
+    }
+
+    fn smmus(&self) -> &'a [AcpiSmmuConfig] {
+        match &self.boot {
+            DeviceTreeBootType::Igvm(_) => &[],
+            DeviceTreeBootType::LinuxDirect(linux) => linux.smmus,
+        }
     }
 
     pub(crate) fn build(self) -> Result<Vec<u8>, DeviceTreeError> {
@@ -193,11 +201,16 @@ impl<'a> DeviceTreeBuilder<'a> {
             DeviceTreeBootType::Igvm(_) => root.add_str(p.model, "microsoft,hyperv")?,
             DeviceTreeBootType::LinuxDirect(_) => root
                 .add_str(p.model, "microsoft,openvmm")?
-                .add_str(p.compatible, "microsoft,openvmm")?
-                .add_u32(p.interrupt_parent, PHANDLE_GIC)?,
+                .add_str(p.compatible, "microsoft,openvmm")?,
         };
+        root = T::emit_root_properties(root, &p)?;
 
-        root = emit_cpus(root, &p, &self.boot)?;
+        let mut cpus = root
+            .start_node("cpus")?
+            .add_u32(p.address_cells, 1)?
+            .add_u32(p.size_cells, 0)?;
+        cpus = T::emit_cpus(self.topology, cpus, &p)?;
+        root = cpus.end_node()?;
 
         let igvm_memory = match &self.boot {
             DeviceTreeBootType::Igvm(igvm) => {
@@ -206,12 +219,25 @@ impl<'a> DeviceTreeBuilder<'a> {
             DeviceTreeBootType::LinuxDirect(_) => None,
         };
         match &self.boot {
-            DeviceTreeBootType::Igvm(igvm) => {
+            DeviceTreeBootType::Igvm(_) => {
                 // Keep reverse order to exercise sorting in the partition consumer.
                 for (range, vnode, kind) in igvm_memory.into_iter().flatten().rev() {
                     root = emit_memory(root, &p, range, Some((vnode, kind)))?;
                 }
-                root = emit_pcie(root, &p, self.pcie, None, &[])?;
+            }
+            DeviceTreeBootType::LinuxDirect(_) => {
+                for entry in self.ram {
+                    root = emit_memory(root, &p, entry.range, None)?;
+                }
+            }
+        }
+
+        let smmus = self.smmus();
+        root = T::emit_platform(self.topology, root, &p, smmus)?;
+        root = emit_pcie(root, &p, self.topology, self.pcie, smmus)?;
+
+        match &self.boot {
+            DeviceTreeBootType::Igvm(igvm) => {
                 root = emit_igvm_buses(
                     root,
                     &p,
@@ -223,21 +249,12 @@ impl<'a> DeviceTreeBuilder<'a> {
                 root = emit_openhcl(root, &p, igvm.vtl2_base_address, igvm.entropy)?;
             }
             DeviceTreeBootType::LinuxDirect(linux) => {
-                for entry in self.ram {
-                    root = emit_memory(root, &p, entry.range, None)?;
-                }
-                root = emit_arm_platform(root, &p, linux.topology, linux.smmus)?;
-                root = emit_pcie(root, &p, self.pcie, Some(linux.topology), linux.smmus)?;
                 root = emit_linux_bus(root, &p, linux.low_mmio, linux.high_mmio, self.dt_uarts)?;
                 root = emit_chosen(root, &p, self.command_line, self.console, linux.initrd)?;
             }
         }
 
-        let boot_cpu = match &self.boot {
-            DeviceTreeBootType::Igvm(igvm) => igvm.topology.vp_arch(virt::VpIndex::BSP).apic_id,
-            DeviceTreeBootType::LinuxDirect(_) => 0,
-        };
-        let used = root.end_node()?.build(boot_cpu)?;
+        let used = root.end_node()?.build(T::boot_cpu(self.topology))?;
         buffer.truncate(used);
         Ok(buffer)
     }
@@ -245,7 +262,7 @@ impl<'a> DeviceTreeBuilder<'a> {
 
 macro_rules! properties {
     ($($field:ident: $name:expr),* $(,)?) => {
-        struct Properties {
+        pub(crate) struct Properties {
             $($field: StringId,)*
         }
 
@@ -308,45 +325,192 @@ properties! {
     device_types: "device-types",
 }
 
-fn emit_cpus<'a>(
-    root: Builder<'a, Nest<()>>,
-    p: &Properties,
-    boot: &DeviceTreeBootType<'_>,
-) -> Result<Builder<'a, Nest<()>>, fdt::builder::Error> {
-    let mut cpus = root
-        .start_node("cpus")?
-        .add_u32(p.address_cells, 1)?
-        .add_u32(p.size_cells, 0)?;
-    match boot {
-        DeviceTreeBootType::Igvm(igvm) => {
-            for proc in igvm.topology.vps_arch() {
-                cpus = cpus
-                    .start_node(&format!("cpu@{:x}", proc.base.vp_index.index() + 1))?
-                    .add_str(p.device_type, "cpu")?
-                    .add_u32(p.reg, proc.apic_id)?
-                    .add_u32(p.numa_node_id, proc.base.vnode)?
-                    .add_str(p.status, "okay")?
-                    .end_node()?;
-            }
+/// Architecture-specific device-tree content.
+pub(crate) trait DeviceTreeArch: ArchTopology + inspect::Inspect {
+    /// Whether this architecture's UARTs are MMIO devices.
+    const MMIO_UARTS: bool;
+
+    /// Validates the architecture-specific configuration.
+    fn validate(
+        topology: &ProcessorTopology<Self>,
+        smmus: &[AcpiSmmuConfig],
+        pcie: &[PcieHostBridge],
+    ) -> Result<(), DeviceTreeError>;
+
+    /// Adds architecture-specific properties to the root node.
+    fn emit_root_properties<'a>(
+        root: Builder<'a, Nest<()>>,
+        p: &Properties,
+    ) -> Result<Builder<'a, Nest<()>>, fdt::builder::Error>;
+
+    /// Adds properties and CPU nodes to the `cpus` node.
+    fn emit_cpus<'a>(
+        topology: &ProcessorTopology<Self>,
+        cpus: Builder<'a, Nest<Nest<()>>>,
+        p: &Properties,
+    ) -> Result<Builder<'a, Nest<Nest<()>>>, fdt::builder::Error>;
+
+    /// Adds architecture-specific platform nodes, such as interrupt
+    /// controllers and timers.
+    fn emit_platform<'a, N>(
+        topology: &ProcessorTopology<Self>,
+        root: Builder<'a, N>,
+        p: &Properties,
+        smmus: &[AcpiSmmuConfig],
+    ) -> Result<Builder<'a, N>, fdt::builder::Error>;
+
+    /// Adds architecture-specific interrupt and NUMA properties to a PCIe host
+    /// bridge node.
+    fn emit_pcie_properties<'a, N>(
+        topology: &ProcessorTopology<Self>,
+        node: Builder<'a, Nest<N>>,
+        p: &Properties,
+        bridge: &PcieHostBridge,
+        smmus: &[AcpiSmmuConfig],
+    ) -> Result<Builder<'a, Nest<N>>, fdt::builder::Error>;
+
+    /// Returns the `boot_cpuid_phys` value for the FDT header.
+    fn boot_cpu(topology: &ProcessorTopology<Self>) -> u32;
+}
+
+impl DeviceTreeArch for X86Topology {
+    const MMIO_UARTS: bool = false;
+
+    fn validate(
+        _topology: &ProcessorTopology<Self>,
+        smmus: &[AcpiSmmuConfig],
+        _pcie: &[PcieHostBridge],
+    ) -> Result<(), DeviceTreeError> {
+        if !smmus.is_empty() {
+            return Err(DeviceTreeError::Smmu);
         }
-        DeviceTreeBootType::LinuxDirect(linux) => {
-            let topology = linux.topology;
-            cpus = cpus.add_str(p.compatible, "arm,armv8")?;
-            for index in 0..topology.vps().len() {
-                // Native direct boot uses the VP index, not the MPIDR.
-                let mut cpu = cpus
-                    .start_node(&format!("cpu@{index}"))?
-                    .add_u32(p.reg, index as u32)?
-                    .add_str(p.device_type, "cpu")?
-                    .add_str(p.status, if index == 0 { "okay" } else { "disabled" })?;
-                if topology.vps().len() > 1 {
-                    cpu = cpu.add_str(p.enable_method, "psci")?;
-                }
-                cpus = cpu.end_node()?;
-            }
-        }
+        Ok(())
     }
-    cpus.end_node()
+
+    fn emit_root_properties<'a>(
+        root: Builder<'a, Nest<()>>,
+        _p: &Properties,
+    ) -> Result<Builder<'a, Nest<()>>, fdt::builder::Error> {
+        Ok(root)
+    }
+
+    fn emit_cpus<'a>(
+        topology: &ProcessorTopology<Self>,
+        mut cpus: Builder<'a, Nest<Nest<()>>>,
+        p: &Properties,
+    ) -> Result<Builder<'a, Nest<Nest<()>>>, fdt::builder::Error> {
+        for proc in topology.vps_arch() {
+            cpus = cpus
+                .start_node(&format!("cpu@{:x}", proc.base.vp_index.index() + 1))?
+                .add_str(p.device_type, "cpu")?
+                .add_u32(p.reg, proc.apic_id)?
+                .add_u32(p.numa_node_id, proc.base.vnode)?
+                .add_str(p.status, "okay")?
+                .end_node()?;
+        }
+        Ok(cpus)
+    }
+
+    fn emit_platform<'a, N>(
+        _topology: &ProcessorTopology<Self>,
+        root: Builder<'a, N>,
+        _p: &Properties,
+        _smmus: &[AcpiSmmuConfig],
+    ) -> Result<Builder<'a, N>, fdt::builder::Error> {
+        Ok(root)
+    }
+
+    fn emit_pcie_properties<'a, N>(
+        _topology: &ProcessorTopology<Self>,
+        node: Builder<'a, Nest<N>>,
+        p: &Properties,
+        bridge: &PcieHostBridge,
+        _smmus: &[AcpiSmmuConfig],
+    ) -> Result<Builder<'a, Nest<N>>, fdt::builder::Error> {
+        node.add_u32(p.numa_node_id, bridge.vnode.unwrap_or(0))
+    }
+
+    fn boot_cpu(topology: &ProcessorTopology<Self>) -> u32 {
+        topology.vp_arch(virt::VpIndex::BSP).apic_id
+    }
+}
+
+impl DeviceTreeArch for Aarch64Topology {
+    const MMIO_UARTS: bool = true;
+
+    fn validate(
+        topology: &ProcessorTopology<Self>,
+        smmus: &[AcpiSmmuConfig],
+        pcie: &[PcieHostBridge],
+    ) -> Result<(), DeviceTreeError> {
+        validate_arm(topology, smmus, pcie)
+    }
+
+    fn emit_root_properties<'a>(
+        root: Builder<'a, Nest<()>>,
+        p: &Properties,
+    ) -> Result<Builder<'a, Nest<()>>, fdt::builder::Error> {
+        root.add_u32(p.interrupt_parent, PHANDLE_GIC)
+    }
+
+    fn emit_cpus<'a>(
+        topology: &ProcessorTopology<Self>,
+        mut cpus: Builder<'a, Nest<Nest<()>>>,
+        p: &Properties,
+    ) -> Result<Builder<'a, Nest<Nest<()>>>, fdt::builder::Error> {
+        cpus = cpus.add_str(p.compatible, "arm,armv8")?;
+        for index in 0..topology.vps().len() {
+            // Native direct boot uses the VP index, not the MPIDR.
+            let mut cpu = cpus
+                .start_node(&format!("cpu@{index}"))?
+                .add_u32(p.reg, index as u32)?
+                .add_str(p.device_type, "cpu")?
+                .add_str(p.status, if index == 0 { "okay" } else { "disabled" })?;
+            if topology.vps().len() > 1 {
+                cpu = cpu.add_str(p.enable_method, "psci")?;
+            }
+            cpus = cpu.end_node()?;
+        }
+        Ok(cpus)
+    }
+
+    fn emit_platform<'a, N>(
+        topology: &ProcessorTopology<Self>,
+        root: Builder<'a, N>,
+        p: &Properties,
+        smmus: &[AcpiSmmuConfig],
+    ) -> Result<Builder<'a, N>, fdt::builder::Error> {
+        emit_arm_platform(root, p, topology, smmus)
+    }
+
+    fn emit_pcie_properties<'a, N>(
+        topology: &ProcessorTopology<Self>,
+        mut node: Builder<'a, Nest<N>>,
+        p: &Properties,
+        bridge: &PcieHostBridge,
+        smmus: &[AcpiSmmuConfig],
+    ) -> Result<Builder<'a, Nest<N>>, fdt::builder::Error> {
+        node = node.add_u32(p.interrupt_parent, PHANDLE_GIC)?;
+        match topology.gic_msi() {
+            GicMsiController::Its(_) => node = node.add_u32(p.msi_parent, PHANDLE_ITS)?,
+            GicMsiController::V2m(_) => node = node.add_u32(p.msi_parent, PHANDLE_V2M)?,
+            GicMsiController::None => {}
+        }
+        if let Some(index) = smmus.iter().position(|smmu| smmu.rc_index == bridge.index) {
+            node = node.add_u32_array(
+                p.iommu_map,
+                &[0, PHANDLE_SMMU_BASE + index as u32, 0, 0x10000],
+            )?;
+        }
+        if bridge.preserve_boot_config {
+            node = node.add_u32(p.linux_pci_probe_only, 1)?;
+        }
+        Ok(node)
+    }
+
+    fn boot_cpu(_topology: &ProcessorTopology<Self>) -> u32 {
+        0
+    }
 }
 
 fn partition_memory(
@@ -411,11 +575,11 @@ fn emit_memory<'a, N>(
     memory.end_node()
 }
 
-fn emit_pcie<'a, N>(
+fn emit_pcie<'a, N, T: DeviceTreeArch>(
     mut root: Builder<'a, N>,
     p: &Properties,
+    topology: &ProcessorTopology<T>,
     bridges: &[PcieHostBridge],
-    arm: Option<&ProcessorTopology<Aarch64Topology>>,
     smmus: &[AcpiSmmuConfig],
 ) -> Result<Builder<'a, N>, fdt::builder::Error> {
     for bridge in bridges {
@@ -432,25 +596,7 @@ fn emit_pcie<'a, N>(
             .add_u32(p.address_cells, 3)?
             .add_u32(p.size_cells, 2)?
             .add_u32_array(p.ranges, &pcie_ranges(bridge))?;
-        if let Some(topology) = arm {
-            node = node.add_u32(p.interrupt_parent, PHANDLE_GIC)?;
-            match topology.gic_msi() {
-                GicMsiController::Its(_) => node = node.add_u32(p.msi_parent, PHANDLE_ITS)?,
-                GicMsiController::V2m(_) => node = node.add_u32(p.msi_parent, PHANDLE_V2M)?,
-                GicMsiController::None => {}
-            }
-            if let Some(index) = smmus.iter().position(|smmu| smmu.rc_index == bridge.index) {
-                node = node.add_u32_array(
-                    p.iommu_map,
-                    &[0, PHANDLE_SMMU_BASE + index as u32, 0, 0x10000],
-                )?;
-            }
-            if bridge.preserve_boot_config {
-                node = node.add_u32(p.linux_pci_probe_only, 1)?;
-            }
-        } else {
-            node = node.add_u32(p.numa_node_id, bridge.vnode.unwrap_or(0))?;
-        }
+        node = T::emit_pcie_properties(topology, node, p, bridge, smmus)?;
         root = node.end_node()?;
     }
     Ok(root)
@@ -931,9 +1077,8 @@ mod tests {
         }
     }
 
-    fn igvm_boot(topology: &ProcessorTopology<X86Topology>) -> IgvmBoot<'_> {
+    fn igvm_boot() -> IgvmBoot<'static> {
         IgvmBoot {
-            topology,
             chipset_mmio: mmio(),
             vtl2_base_address: Vtl2BaseAddressType::File,
             protectable_ram: &[],
@@ -942,9 +1087,8 @@ mod tests {
         }
     }
 
-    fn linux_boot(topology: &ProcessorTopology<Aarch64Topology>) -> LinuxDirectBoot<'_> {
+    fn linux_boot() -> LinuxDirectBoot<'static> {
         LinuxDirectBoot {
-            topology,
             low_mmio: mmio().low,
             high_mmio: mmio().high,
             initrd: None,
@@ -952,13 +1096,17 @@ mod tests {
         }
     }
 
-    fn igvm(topology: &ProcessorTopology<X86Topology>, capacity: usize) -> DeviceTreeBuilder<'_> {
+    fn igvm(
+        topology: &ProcessorTopology<X86Topology>,
+        capacity: usize,
+    ) -> DeviceTreeBuilder<'_, X86Topology> {
         DeviceTreeBuilder::new(
+            topology,
             RAM,
             COMS,
             &[],
             capacity,
-            DeviceTreeBootType::Igvm(igvm_boot(topology)),
+            DeviceTreeBootType::Igvm(igvm_boot()),
         )
     }
 
@@ -966,15 +1114,16 @@ mod tests {
         topology: &'a ProcessorTopology<Aarch64Topology>,
         bridges: &'a [PcieHostBridge],
         smmus: &'a [AcpiSmmuConfig],
-    ) -> DeviceTreeBuilder<'a> {
+    ) -> DeviceTreeBuilder<'a, Aarch64Topology> {
         DeviceTreeBuilder::new(
+            topology,
             RAM,
             PL011S,
             bridges,
             0x10000,
             DeviceTreeBootType::LinuxDirect(LinuxDirectBoot {
                 smmus,
-                ..linux_boot(topology)
+                ..linux_boot()
             }),
         )
     }
@@ -1051,11 +1200,12 @@ mod tests {
 
         assert!(matches!(
             DeviceTreeBuilder::new(
+                &x86,
                 RAM,
                 &COMS[..2],
                 &[],
                 0x10000,
-                DeviceTreeBootType::Igvm(igvm_boot(&x86)),
+                DeviceTreeBootType::Igvm(igvm_boot()),
             )
             .with_console(Some(UartId::Com(ComPort::Com3)))
             .build(),

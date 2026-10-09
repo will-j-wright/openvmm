@@ -84,7 +84,6 @@ use openvmm_defs::config::PcieSwitchConfig;
 use openvmm_defs::config::ProcessorTopologyConfig;
 use openvmm_defs::config::RootComplexCxlConfig;
 use openvmm_defs::config::UartId;
-use openvmm_defs::config::UartInventory;
 use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
@@ -1340,7 +1339,6 @@ async fn vm_config_from_command_line(
         pci_chipset_devices,
         isa_dma_controller,
         capabilities,
-        dt_uarts,
     } = chipset
         .build()
         .context("failed to build chipset configuration")?;
@@ -2210,7 +2208,6 @@ async fn vm_config_from_command_line(
         pci_chipset_devices,
         isa_dma_controller,
         chipset_capabilities: capabilities,
-        dt_uarts: UartInventory::Devices(dt_uarts),
         layout: layout_config,
         #[cfg(windows)]
         vpci_resources,
