@@ -77,7 +77,6 @@ use openvmm_defs::config::PcieSwitchConfig;
 use openvmm_defs::config::PmuGsivConfig;
 use openvmm_defs::config::ProcessorTopologyConfig;
 use openvmm_defs::config::UartId;
-use openvmm_defs::config::UartInventory;
 use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpciDeviceConfig;
@@ -240,7 +239,6 @@ impl Manifest {
             pci_chipset_devices: config.pci_chipset_devices,
             isa_dma_controller: config.isa_dma_controller,
             chipset_capabilities: config.chipset_capabilities,
-            dt_uarts: config.dt_uarts,
             layout: config.layout,
             rtc_delta_milliseconds: config.rtc_delta_milliseconds,
         }
@@ -285,7 +283,6 @@ pub struct Manifest {
     pci_chipset_devices: Vec<LegacyPciChipsetDeviceHandle>,
     isa_dma_controller: Option<Resource<vm_resource::kind::IsaDmaControllerHandleKind>>,
     chipset_capabilities: VmChipsetCapabilities,
-    dt_uarts: UartInventory,
     layout: vmm_core_defs::LayoutConfig,
     rtc_delta_milliseconds: i64,
 }
@@ -3183,7 +3180,7 @@ impl InitializedVm {
         ))
         .await?;
 
-        let UartInventory::Devices(dt_uarts) = cfg.dt_uarts;
+        let dt_uarts = dt_uarts(&cfg.chipset_capabilities);
         let mut this = LoadedVm {
             state_units,
             running: false,
@@ -4366,7 +4363,6 @@ impl LoadedVm {
             pci_chipset_devices: vec![], // TODO
             isa_dma_controller: None,    // TODO
             chipset_capabilities: self.inner.chipset_capabilities,
-            dt_uarts: UartInventory::Devices(self.inner.dt_uarts),
             layout: vmm_core_defs::LayoutConfig {
                 chipset_low_mmio_size: 0,
                 chipset_high_mmio_size: 0,
@@ -4520,6 +4516,18 @@ fn add_devices_to_dsdt_arm64(
     }
 }
 
+/// Returns the UARTs that the device tree describes.
+fn dt_uarts(capabilities: &VmChipsetCapabilities) -> Vec<UartId> {
+    let ports = [ComPort::Com1, ComPort::Com2, ComPort::Com3, ComPort::Com4];
+    let mut uarts = std::iter::zip(ports, capabilities.dt_com_ports)
+        .filter_map(|(port, described)| described.then_some(UartId::Com(port)))
+        .collect::<Vec<_>>();
+    if capabilities.dt_pl011_uarts {
+        uarts.extend([UartId::Pl0110, UartId::Pl0111]);
+    }
+    uarts
+}
+
 #[cfg(any(guest_arch = "aarch64", test))]
 fn linux_arm64_console(dt_uarts: &[UartId], enable_serial: bool) -> Option<UartId> {
     (enable_serial && dt_uarts.contains(&UartId::Pl0110)).then_some(UartId::Pl0110)
@@ -4541,6 +4549,32 @@ mod uart_tests {
     fn native_arm_console_requires_first_uart() {
         assert_eq!(linux_arm64_console(&[], true), None);
         assert_eq!(linux_arm64_console(&[UartId::Pl0111], true), None);
+    }
+
+    #[test]
+    fn dt_uarts_follow_capabilities() {
+        let mut capabilities = VmChipsetCapabilities {
+            with_ioapic: false,
+            with_pic: false,
+            with_pit: false,
+            with_generic_isa_dma: false,
+            with_psp: false,
+            with_guest_watchdog: false,
+            with_i440bx_host_pci_bridge: false,
+            dt_com_ports: [true, true, false, true],
+            dt_pl011_uarts: false,
+        };
+        assert_eq!(
+            dt_uarts(&capabilities),
+            [
+                UartId::Com(ComPort::Com1),
+                UartId::Com(ComPort::Com2),
+                UartId::Com(ComPort::Com4),
+            ]
+        );
+        capabilities.dt_com_ports = [false; 4];
+        capabilities.dt_pl011_uarts = true;
+        assert_eq!(dt_uarts(&capabilities), [UartId::Pl0110, UartId::Pl0111]);
     }
 }
 

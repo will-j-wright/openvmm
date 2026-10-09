@@ -917,12 +917,12 @@ fn load_igvm_x86(
                 };
                 let capacity = device_tree_capacity(max_size, info.byte_offset)?;
                 let dt = DeviceTreeBuilder::new(
+                    processor_topology,
                     &all_ram,
                     dt_uarts,
                     pcie_host_bridges,
                     capacity,
                     DeviceTreeBootType::Igvm(IgvmBoot {
-                        topology: processor_topology,
                         chipset_mmio,
                         vtl2_base_address,
                         protectable_ram: &vtl2_protectable_ram,

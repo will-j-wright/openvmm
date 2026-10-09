@@ -50,7 +50,6 @@ use firmware_uefi_resources::UefiDeviceHandle;
 use firmware_uefi_resources::UefiVarsDeltaJson;
 use input_core::MultiplexedInputHandle;
 use missing_dev_resources::MissingDevHandle;
-use serial_16550_resources::ComPort;
 use serial_16550_resources::Serial16550DeviceHandle;
 use serial_core::resources::DisconnectedSerialBackendHandle;
 use serial_debugcon_resources::SerialDebugconDeviceHandle;
@@ -59,7 +58,6 @@ use serial_pl011_resources::PL011_SERIAL0_SPI;
 use serial_pl011_resources::PL011_SERIAL1_BASE;
 use serial_pl011_resources::PL011_SERIAL1_SPI;
 use serial_pl011_resources::SerialPl011DeviceHandle;
-use serial_uart_resources::UartId;
 use std::iter::zip;
 use thiserror::Error;
 use vm_resource::IntoResource;
@@ -203,9 +201,6 @@ pub struct VmChipsetResult {
     pub isa_dma_controller: Option<Resource<IsaDmaControllerHandleKind>>,
     /// Derived chipset capabilities needed by firmware and table generation.
     pub capabilities: VmChipsetCapabilities,
-    /// UART identities to describe in the hardware device tree.
-    /// This does not select a console or change device attachment.
-    pub dt_uarts: Vec<UartId>,
 }
 
 /// Error type for building a VM manifest.
@@ -463,8 +458,9 @@ impl VmManifestBuilder {
                 with_psp: false,
                 with_guest_watchdog: false,
                 with_i440bx_host_pci_bridge: false,
+                dt_com_ports: [false; 4],
+                dt_pl011_uarts: false,
             },
-            dt_uarts: Vec::new(),
         };
         let is_x86 = matches!(self.arch, MachineArch::X86_64);
 
@@ -944,16 +940,14 @@ impl VmChipsetResult {
     ) -> &mut Self {
         // Describe COM1/COM2 as a pair when any COM backend is configured.
         // Device attachment does not depend on this device-tree rule.
+        let dt_com_ports = &mut self.capabilities.dt_com_ports;
         if backends.iter().any(Option::is_some) {
-            self.dt_uarts
-                .extend([UartId::Com(ComPort::Com1), UartId::Com(ComPort::Com2)]);
+            dt_com_ports[..2].fill(true);
         }
         // Additional ports require their own backend. In particular, OpenHCL
         // selects COM3 as its console whenever the device tree describes it.
-        for (port, backend) in zip([ComPort::Com3, ComPort::Com4], &backends[2..]) {
-            if backend.is_some() {
-                self.dt_uarts.push(UartId::Com(port));
-            }
+        for (described, backend) in zip(&mut dt_com_ports[2..], &backends[2..]) {
+            *described = backend.is_some();
         }
         let devices = serial_16550_devices(wait_for_rts, debugger_mode, backends);
 
@@ -986,7 +980,7 @@ impl VmChipsetResult {
                 resource: serial1.into_resource(),
             },
         ]);
-        self.dt_uarts.extend([UartId::Pl0110, UartId::Pl0111]);
+        self.capabilities.dt_pl011_uarts = true;
         Ok(self)
     }
 
@@ -1109,13 +1103,20 @@ mod tests {
             .count()
     }
 
+    fn dt_uarts(result: &VmChipsetResult) -> ([bool; 4], bool) {
+        (
+            result.capabilities.dt_com_ports,
+            result.capabilities.dt_pl011_uarts,
+        )
+    }
+
     #[test]
-    fn no_serial_has_no_uart_inventory() {
+    fn no_serial_has_no_dt_uarts() {
         for arch in [MachineArch::X86_64, MachineArch::Aarch64] {
             let result = VmManifestBuilder::new(BaseChipsetType::HclHost, arch)
                 .build()
                 .unwrap();
-            assert!(result.dt_uarts.is_empty());
+            assert_eq!(dt_uarts(&result), ([false; 4], false));
             assert_eq!(uart_handle_count(&result), 0);
         }
     }
@@ -1130,17 +1131,12 @@ mod tests {
                 .with_serial(backends)
                 .build()
                 .unwrap();
-            let mut expected = Vec::new();
-            if mask != 0 {
-                expected.extend([UartId::Com(ComPort::Com1), UartId::Com(ComPort::Com2)]);
-            }
-            if mask & 4 != 0 {
-                expected.push(UartId::Com(ComPort::Com3));
-            }
-            if mask & 8 != 0 {
-                expected.push(UartId::Com(ComPort::Com4));
-            }
-            assert_eq!(result.dt_uarts, expected, "backend mask {mask:#x}");
+            let expected = [mask != 0, mask != 0, mask & 4 != 0, mask & 8 != 0];
+            assert_eq!(
+                dt_uarts(&result),
+                (expected, false),
+                "backend mask {mask:#x}"
+            );
             assert_eq!(uart_handle_count(&result), 4);
         }
     }
@@ -1150,7 +1146,7 @@ mod tests {
         let result = VmManifestBuilder::new(BaseChipsetType::HypervGen1, MachineArch::X86_64)
             .build()
             .unwrap();
-        assert!(result.dt_uarts.is_empty());
+        assert_eq!(dt_uarts(&result), ([false; 4], false));
         assert_eq!(uart_handle_count(&result), 4);
     }
 
@@ -1163,7 +1159,7 @@ mod tests {
         .with_debugcon(DisconnectedSerialBackendHandle.into_resource(), 0xe9)
         .build()
         .unwrap();
-        assert!(result.dt_uarts.is_empty());
+        assert_eq!(dt_uarts(&result), ([false; 4], false));
         assert_eq!(uart_handle_count(&result), 0);
         assert!(
             result
@@ -1187,25 +1183,21 @@ mod tests {
             .with_serial(backends)
             .build()
             .unwrap();
-        assert_eq!(result.dt_uarts, [UartId::Pl0110, UartId::Pl0111]);
+        assert_eq!(dt_uarts(&result), ([false; 4], true));
         assert_eq!(uart_handle_count(&result), 2);
     }
 
     #[test]
     fn explicit_disconnected_uarts_are_included() {
         for (arch, expected, count) in [
-            (MachineArch::X86_64, vec![], 4),
-            (
-                MachineArch::Aarch64,
-                vec![UartId::Pl0110, UartId::Pl0111],
-                2,
-            ),
+            (MachineArch::X86_64, false, 4),
+            (MachineArch::Aarch64, true, 2),
         ] {
             let result = VmManifestBuilder::new(BaseChipsetType::HclHost, arch)
                 .with_serial(no_serial_backends())
                 .build()
                 .unwrap();
-            assert_eq!(result.dt_uarts, expected);
+            assert_eq!(dt_uarts(&result), ([false; 4], expected));
             assert_eq!(uart_handle_count(&result), count);
         }
     }

@@ -4,7 +4,6 @@
 //! Configuration for the VM worker.
 
 pub use serial_uart_resources::UartId;
-pub use serial_uart_resources::UartInventory;
 pub use smbios_defs::SmbiosBiosOverrides;
 pub use smbios_defs::SmbiosConfig;
 pub use smbios_defs::SmbiosSystemOverrides;
@@ -63,8 +62,6 @@ pub struct Config {
     pub pci_chipset_devices: Vec<LegacyPciChipsetDeviceHandle>,
     pub isa_dma_controller: Option<Resource<vm_resource::kind::IsaDmaControllerHandleKind>>,
     pub chipset_capabilities: VmChipsetCapabilities,
-    /// UARTs to describe in the device tree. Required even when empty.
-    pub dt_uarts: UartInventory,
     /// Memory layout sizing for the layout engine. Determines chipset MMIO
     /// range sizes; addresses are allocated dynamically by the resolver.
     pub layout: vmm_core_defs::LayoutConfig,

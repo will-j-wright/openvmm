@@ -56,7 +56,6 @@ use openvmm_defs::config::NumaTopology;
 use openvmm_defs::config::PcieDeviceConfig;
 use openvmm_defs::config::ProcessorTopologyConfig;
 use openvmm_defs::config::UartId;
-use openvmm_defs::config::UartInventory;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
@@ -607,7 +606,6 @@ impl PetriVmConfigOpenVmm {
             pci_chipset_devices,
             isa_dma_controller,
             capabilities,
-            dt_uarts,
         } = chipset;
 
         // Add the TPM
@@ -667,7 +665,6 @@ impl PetriVmConfigOpenVmm {
             pci_chipset_devices,
             isa_dma_controller,
             chipset_capabilities: capabilities,
-            dt_uarts: UartInventory::Devices(dt_uarts),
             layout: layout_config,
 
             // Basic virtualization device support
