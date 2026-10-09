@@ -10,8 +10,8 @@ use vm_resource::Resource;
 use vm_resource::ResourceId;
 use vm_resource::kind::ChipsetDeviceHandleKind;
 use vm_resource::kind::SerialBackendHandle;
-pub use x86defs::serial::COM_BASES;
-pub use x86defs::serial::COM_IRQS;
+use x86defs::serial::COM_BASES;
+use x86defs::serial::COM_IRQS;
 pub use x86defs::serial::COM_REGISTER_COUNT;
 
 /// A handle to a 16550A serial device.

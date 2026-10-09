@@ -12,6 +12,7 @@ use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
 use memory_range::MemoryRange;
+use serial_uart_resources::UartId;
 use std::ffi::CString;
 use std::io::Seek;
 use thiserror::Error;
@@ -21,7 +22,6 @@ use vm_topology::memory::MemoryLayout;
 use vm_topology::pcie::PcieHostBridge;
 use vm_topology::processor::ProcessorTopology;
 use vm_topology::processor::aarch64::Aarch64Topology;
-use vmm_core_defs::uart::UartId;
 use zerocopy::IntoBytes;
 
 #[derive(Debug, Error)]

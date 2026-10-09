@@ -5907,7 +5907,6 @@ dependencies = [
  "getrandom 0.4.2",
  "guestmem",
  "guid",
- "host_fdt_parser",
  "hvdef",
  "hyperv_dump",
  "hypervisor_resources",
@@ -5940,6 +5939,7 @@ dependencies = [
  "scsidisk",
  "serial_16550_resources",
  "serial_pl011_resources",
+ "serial_uart_resources",
  "smmu",
  "sparse_mmap",
  "state_unit",
@@ -5991,6 +5991,7 @@ dependencies = [
  "mesh_worker",
  "net_backend_resources",
  "openvmm_pcat_locator",
+ "serial_uart_resources",
  "smbios_defs",
  "thiserror 2.0.16",
  "tpm_resources",
@@ -7792,6 +7793,15 @@ dependencies = [
  "tracing",
  "unix_socket",
  "vm_resource",
+]
+
+[[package]]
+name = "serial_uart_resources"
+version = "0.0.0"
+dependencies = [
+ "mesh",
+ "serial_16550_resources",
+ "test_with_tracing",
 ]
 
 [[package]]
@@ -10306,6 +10316,7 @@ dependencies = [
  "serial_core",
  "serial_debugcon_resources",
  "serial_pl011_resources",
+ "serial_uart_resources",
  "test_with_tracing",
  "thiserror 2.0.16",
  "vm_resource",
@@ -10892,8 +10903,6 @@ version = "0.0.0"
 dependencies = [
  "inspect",
  "mesh",
- "serial_16550_resources",
- "test_with_tracing",
  "virt",
 ]
 
