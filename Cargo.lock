@@ -6682,6 +6682,7 @@ dependencies = [
  "pal",
  "pal_async",
  "parking_lot",
+ "petri_artifact_resolver_openvmm_known_paths",
  "petri_artifacts_common",
  "petri_artifacts_core",
  "petri_artifacts_vmm_test",
@@ -6698,6 +6699,7 @@ dependencies = [
  "smbios_defs",
  "sparse_mmap",
  "storvsp_resources",
+ "target-lexicon",
  "tempfile",
  "thiserror 2.0.16",
  "tpm_resources",
@@ -6760,8 +6762,10 @@ name = "petri_artifacts_core"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "linkme",
  "paste",
  "serde",
+ "serde_json",
  "target-lexicon",
 ]
 
