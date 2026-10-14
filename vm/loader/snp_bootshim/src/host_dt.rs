@@ -111,8 +111,11 @@ fn read_bridge<'a>(node: &Node<'a>, ram_end: u64, c_bit_mask: u64) -> Result<Bri
     if start_bus > end_bus {
         return Err(Error::Property("bus-range"));
     }
-    let reg = property(node, "reg")?;
-    let ecam = window(reg.read_u64(0)?, reg.read_u64(1)?, ram_end, c_bit_mask)?;
+    // MCFG gives Linux the ECAM space of every bus in `bus-range`, so check
+    // that span and ignore the size in `reg`.
+    let bus_count = u64::from(end_bus - start_bus) + 1;
+    let ecam_base = property(node, "reg")?.read_u64(0)?;
+    let ecam = window(ecam_base, bus_count * BUS_SIZE, ram_end, c_bit_mask)?;
     // MCFG describes the ECAM base of bus 0.
     if ecam.start() < u64::from(start_bus) * BUS_SIZE {
         return Err(Error::Window);
@@ -350,6 +353,31 @@ pub(crate) mod tests {
         for (ram_end, c_bit) in [(0x4000_1000, C_BIT), (RAM_END, 1 << 32)] {
             assert!(matches!(read(&dt, ram_end, c_bit), Err(Error::Window)));
         }
+    }
+
+    #[test]
+    fn ecam_window_covers_every_bus() {
+        // `reg` gives one bus of ECAM space, but `bus-range` has 16 buses
+        // that reach the C-bit.
+        let mut properties = bridge(0);
+        let base = C_BIT - BUS_SIZE;
+        replace(
+            &mut properties,
+            "reg",
+            [base, BUS_SIZE]
+                .into_iter()
+                .flat_map(u64::to_be_bytes)
+                .collect(),
+        );
+        let dt = device_tree([false; 4], &[properties.clone()]);
+        assert!(matches!(read(&dt, RAM_END, C_BIT), Err(Error::Window)));
+
+        // An empty `reg` size still gives a 16-bus ECAM window.
+        replace(&mut properties, "reg", cells(&[0, 0x4000_0000, 0, 0]));
+        let dt = device_tree([false; 4], &[properties]);
+        let devices = read(&dt, RAM_END, C_BIT).unwrap();
+        let ecam = devices.bridges[0].unwrap().ecam;
+        assert_eq!(ecam, MemoryRange::new(0x4000_0000..0x4100_0000));
     }
 
     #[test]
