@@ -1544,25 +1544,11 @@ mod test {
                 acpi_irq: chipset_resources::pm::DEFAULT_ACPI_IRQ,
                 iommu: None,
             };
-            let cpus: Vec<_> = (0..count)
-                .map(|apic_id| acpi::snp::Cpu {
-                    apic_id,
-                    numa_node: 0,
-                    enabled: true,
-                })
-                .collect();
-            let tables = acpi::snp::Topology::new(
-                count,
-                0,
-                &cpus,
-                acpi::snp::Ram {
-                    start: 0,
-                    length: 160 * MB,
-                    numa_node: 0,
-                },
-                &[],
-            )
-            .unwrap()
+            let tables = acpi::snp::Topology {
+                cpu_count: count as u8,
+                ram_end: 160 * MB,
+                com_ports: [false; 4],
+            }
             .build(&OEM_INFO);
             assert_eq!(tables.madt, hosted.build_madt(), "{count} CPUs");
             assert_eq!(tables.srat, hosted.build_srat(), "{count} CPUs");
@@ -1572,7 +1558,7 @@ mod test {
                 dsdt.add_rtc();
             });
             assert_eq!(&all.tables[..tables.dsdt.len()], &tables.dsdt);
-            let fadt = tables.fadt(0xe1000, &OEM_INFO).unwrap();
+            let fadt = tables.fadt(0xe1000, &OEM_INFO);
             let offset = tables.dsdt.len().next_multiple_of(8);
             assert_eq!(&all.tables[offset..offset + fadt.len()], &fadt);
         }
