@@ -1522,16 +1522,25 @@ mod test {
 
     #[test]
     fn minimal_tables_match_hosted_fixed_chipset() {
-        let memory = MemoryLayout::new(160 * MB, &[], &[], &[], None).unwrap();
+        let memory = MemoryLayout::new_with_numa(
+            &[2 * GB, 4 * GB],
+            &[MemoryRange::new(3 * GB..4 * GB)],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
         let bridges = vec![];
-        for count in [1, 255] {
+        // Use APIC IDs above 254, which need x2APIC entries, and two NUMA
+        // nodes.
+        for (count, apic_id_offset) in [(1, 0), (255, 0), (4, 300)] {
             let topology = TopologyBuilder::new_x86()
                 .build_with_vp_info((0..count).map(|id| X86VpInfo {
                     base: VpInfo {
                         vp_index: VpIndex::new(id),
-                        vnode: 0,
+                        vnode: id % 2,
                     },
-                    apic_id: id,
+                    apic_id: id + apic_id_offset,
                 }))
                 .unwrap();
             let mut hosted = new_builder(&memory, &topology, &bridges);
@@ -1544,9 +1553,24 @@ mod test {
                 acpi_irq: chipset_resources::pm::DEFAULT_ACPI_IRQ,
                 iommu: None,
             };
+            let cpus = topology
+                .vps_arch()
+                .map(|vp| acpi::minimal::Cpu {
+                    id: vp.apic_id,
+                    vnode: vp.base.vnode,
+                })
+                .collect::<Vec<_>>();
+            let ram = memory
+                .ram()
+                .iter()
+                .map(|r| acpi::minimal::Ram {
+                    range: r.range,
+                    vnode: r.vnode,
+                })
+                .collect::<Vec<_>>();
             let tables = acpi::minimal::Platform {
-                cpu_count: count as u8,
-                ram: MemoryRange::new(0..160 * MB),
+                cpus: &cpus,
+                ram: &ram,
                 arch: acpi::minimal::Arch::X86(acpi::minimal::X86 {
                     com_ports: [false; 4],
                 }),

@@ -3,8 +3,8 @@
 
 //! Builds the complete ACPI table set that the shim gives to Linux.
 //!
-//! The CPU count and RAM size come from the measured platform page. The PCIe
-//! host bridges and COM ports come from the host device tree.
+//! The CPUs, RAM, PCIe host bridges, and COM ports come from the host device
+//! tree.
 
 use crate::host_dt::BUS_SIZE;
 use crate::host_dt::HostDevices;
@@ -19,7 +19,6 @@ use acpi::ssdt::Ssdt;
 use acpi_spec::mcfg::McfgHeader;
 use acpi_spec::mcfg::McfgSegmentBusRange;
 use alloc::vec::Vec;
-use memory_range::MemoryRange;
 use zerocopy::IntoBytes;
 
 const OEM: OemInfo = OemInfo {
@@ -34,15 +33,10 @@ const OEM: OemInfo = OemInfo {
 ///
 /// Every pointer in the tables and the RSDP refers to `output_gpa`, where the
 /// caller must copy the table bytes.
-pub(crate) fn build(
-    devices: &HostDevices,
-    cpu_count: u8,
-    ram_end: u64,
-    output_gpa: u64,
-) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn build(devices: &HostDevices, output_gpa: u64) -> (Vec<u8>, Vec<u8>) {
     let base = Platform {
-        cpu_count,
-        ram: MemoryRange::new(0..ram_end),
+        cpus: &devices.cpus,
+        ram: &devices.ram,
         arch: Arch::X86(X86 {
             com_ports: devices.com_ports,
         }),
@@ -54,10 +48,10 @@ pub(crate) fn build(
     builder.append_raw(&base.madt);
     builder.append_raw(&base.srat);
 
-    if devices.bridges.iter().any(Option::is_some) {
+    if !devices.bridges.is_empty() {
         let mut ssdt = Ssdt::new();
         let mut segments = Vec::new();
-        for (index, bridge) in devices.bridges.iter().flatten().enumerate() {
+        for (index, bridge) in devices.bridges.iter().enumerate() {
             ssdt.add_pcie(PcieHostBridgeEntry {
                 index: index as u32,
                 segment: bridge.segment,
@@ -99,8 +93,10 @@ mod tests {
     use crate::host_dt::tests::cells;
     use crate::host_dt::tests::device_tree;
     use crate::host_dt::tests::replace;
+    use acpi::minimal::Cpu;
     use loader_defs::linux::SNP_BOOT_SHIM_ACPI_SIZE;
     use loader_defs::linux::SNP_BOOT_SHIM_HEAP_SIZE;
+    use loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS;
     use loader_defs::linux::SNP_BOOT_SHIM_MAX_PCIE_BRIDGES;
     use test_with_tracing::test;
     use zerocopy::FromBytes;
@@ -131,9 +127,9 @@ mod tests {
             .collect()
     }
 
-    fn build_from(dt: &[u8], cpu_count: u8) -> (Vec<u8>, Vec<u8>) {
+    fn build_from(dt: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let devices = crate::host_dt::read(dt, RAM_END, C_BIT).unwrap();
-        build(&devices, cpu_count, RAM_END, OUTPUT)
+        build(&devices, OUTPUT)
     }
 
     fn has(bytes: &[u8], expected: &[u8]) -> bool {
@@ -144,7 +140,7 @@ mod tests {
 
     #[test]
     fn no_bridges_build_base_tables_only() {
-        let (rsdp, tables) = build_from(&device_tree([false; 4], &[]), 1);
+        let (rsdp, tables) = build_from(&device_tree([false; 4], &[]));
         let entries = xsdt_entries(&rsdp, &tables);
         let signatures = entries.iter().map(|e| e.0).collect::<Vec<_>>();
         assert_eq!(signatures, [b"FACP", b"APIC", b"SRAT"]);
@@ -156,7 +152,7 @@ mod tests {
     fn bridges_build_mcfg_and_ssdt() {
         for count in [1, SNP_BOOT_SHIM_MAX_PCIE_BRIDGES as u32] {
             let bridges = (0..count).map(bridge).collect::<Vec<_>>();
-            let (rsdp, tables) = build_from(&device_tree([false; 4], &bridges), 1);
+            let (rsdp, tables) = build_from(&device_tree([false; 4], &bridges));
             let entries = xsdt_entries(&rsdp, &tables);
             assert_eq!(entries[3].0, b"MCFG");
             assert_eq!(entries[4].0, b"SSDT");
@@ -194,7 +190,7 @@ mod tests {
         let mut properties = bridge(0);
         replace(&mut properties, "bus-range", cells(&[32, 47]));
         replace(&mut properties, "linux,pci-domain", cells(&[65535]));
-        let (rsdp, tables) = build_from(&device_tree([false; 4], &[properties]), 1);
+        let (rsdp, tables) = build_from(&device_tree([false; 4], &[properties]));
         let entries = xsdt_entries(&rsdp, &tables);
         acpi_spec::mcfg::parse_mcfg(table(&tables, entries[3].1), |segment| {
             assert_eq!(segment.ecam_base.get(), 0x3e00_0000);
@@ -211,9 +207,20 @@ mod tests {
             .map(bridge)
             .collect::<Vec<_>>();
         let dt = device_tree([true; 4], &bridges);
-        let devices = crate::host_dt::read(&dt, RAM_END, C_BIT).unwrap();
+        let mut devices = crate::host_dt::read(&dt, RAM_END, C_BIT).unwrap();
+        // Use x2APIC IDs and many RAM ranges, which make the largest entries.
+        devices.cpus.clear();
+        for id in 0..SNP_BOOT_SHIM_MAX_CPUS as u32 {
+            devices.cpus.push(Cpu {
+                id: id + 0x100,
+                vnode: id % 4,
+            });
+        }
+        while !devices.ram.is_full() {
+            devices.ram.push(devices.ram[0]);
+        }
         let ((rsdp, tables), allocated) =
-            crate::allocation_measure::measure(|| build(&devices, u8::MAX, RAM_END, OUTPUT));
+            crate::allocation_measure::measure(|| build(&devices, OUTPUT));
         assert!(tables.len() <= SNP_BOOT_SHIM_ACPI_SIZE as usize);
         assert!(allocated <= SNP_BOOT_SHIM_HEAP_SIZE as usize);
         assert_eq!(xsdt_entries(&rsdp, &tables).len(), 5);

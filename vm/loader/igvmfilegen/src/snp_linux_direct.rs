@@ -50,9 +50,8 @@ const KVM_VMSA_GPA: u64 = 0xffff_ffff_f000;
 pub struct BuildParams<'a> {
     /// The Linux payload configuration.
     pub linux: &'a LinuxImage,
-    /// The measured CPU count that the host topology must match.
-    pub processor_count: u32,
-    /// The number of configured 4-KiB RAM pages.
+    /// The number of 4-KiB RAM pages that the image measures. The guest can
+    /// have more RAM, which the host device tree describes.
     pub memory_page_count: u64,
     /// The page-table address bit used as the SNP encryption bit.
     pub c_bit_position: u8,
@@ -143,7 +142,6 @@ fn new_loader(
 pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
     let BuildParams {
         linux,
-        processor_count,
         memory_page_count,
         c_bit_position,
         policy,
@@ -164,11 +162,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
         &linux.command_line,
         &layout.memory,
         |gpa| {
-            platform = Some(reserve_acpi_output(
-                gpa,
-                processor_count,
-                1u64 << c_bit_position,
-            ));
+            platform = Some(reserve_acpi_output(gpa, 1u64 << c_bit_position));
             // Import zero-filled permanent storage, not static ACPI. The shim
             // publishes the RSDP only after it validates and builds all tables.
             loader::linux::AcpiTables {
@@ -381,7 +375,6 @@ fn reserve_region(cursor: &mut u64, size: u64, ram_end: u64) -> anyhow::Result<u
 
 fn reserve_acpi_output(
     nominal_rsdp_gpa: u64,
-    cpu_count: u32,
     c_bit_mask: u64,
 ) -> anyhow::Result<SnpBootShimPlatformParams> {
     // Match the Linux loader's table-storage address and pinned RSDP page.
@@ -393,7 +386,6 @@ fn reserve_acpi_output(
     Ok(SnpBootShimPlatformParams {
         magic: SNP_BOOT_SHIM_PLATFORM_MAGIC,
         version: SNP_BOOT_SHIM_PLATFORM_VERSION,
-        cpu_count,
         acpi_output_gpa: gpa,
         acpi_output_size: SNP_BOOT_SHIM_ACPI_SIZE,
         rsdp_gpa: loader::linux::RSDP_BASE,
@@ -893,7 +885,7 @@ mod tests {
             &c"console=ttyS0".to_owned(),
             &layout.memory,
             |gpa| {
-                platform = Some(reserve_acpi_output(gpa, 2, TEST_C_BIT_MASK).unwrap());
+                platform = Some(reserve_acpi_output(gpa, TEST_C_BIT_MASK).unwrap());
                 loader::linux::AcpiTables {
                     rsdp: vec![0; PAGE_SIZE as usize],
                     tables: vec![0; SNP_BOOT_SHIM_ACPI_SIZE as usize],
@@ -959,7 +951,6 @@ mod tests {
         assert_eq!(platform.magic, SNP_BOOT_SHIM_PLATFORM_MAGIC);
         assert_eq!(platform.c_bit_mask, TEST_C_BIT_MASK);
         assert_eq!(platform.version, SNP_BOOT_SHIM_PLATFORM_VERSION);
-        assert_eq!(platform.cpu_count, 2);
         assert_eq!(platform.dt_gpa, LAYOUT_PARAMS_GPA + 2 * PAGE_SIZE);
         assert_eq!(platform.dt_size, SNP_BOOT_SHIM_DT_SIZE);
         assert_eq!(platform.heap_gpa, platform.dt_gpa + platform.dt_size);
@@ -1126,7 +1117,7 @@ mod tests {
     fn rejects_workspace_overflow_and_insufficient_ram() {
         for ram_pages in [0x202, 0x203, 0x204, 0x213, 0x214, 0x313] {
             let mut loader = test_loader(ram_pages);
-            let platform = reserve_acpi_output(0x10000, 2, TEST_C_BIT_MASK).unwrap();
+            let platform = reserve_acpi_output(0x10000, TEST_C_BIT_MASK).unwrap();
             assert!(
                 import_bootshim_handoff(
                     &mut loader,
@@ -1145,14 +1136,13 @@ mod tests {
         }
         let mut cursor = !(PAGE_SIZE - 1);
         assert!(reserve_region(&mut cursor, PAGE_SIZE, u64::MAX).is_err());
-        assert!(reserve_acpi_output(u64::MAX, 2, TEST_C_BIT_MASK).is_err());
+        assert!(reserve_acpi_output(u64::MAX, TEST_C_BIT_MASK).is_err());
     }
 
     #[test]
     fn rejects_acpi_workspace_overlapping_shim() {
         let mut loader = test_loader(LAYOUT_RAM_PAGES);
-        let platform =
-            reserve_acpi_output(LAYOUT_SHIM_GPA - PAGE_SIZE, 2, TEST_C_BIT_MASK).unwrap();
+        let platform = reserve_acpi_output(LAYOUT_SHIM_GPA - PAGE_SIZE, TEST_C_BIT_MASK).unwrap();
         assert!(
             import_bootshim_handoff(
                 &mut loader,

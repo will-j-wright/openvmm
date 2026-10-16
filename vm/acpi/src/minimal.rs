@@ -3,9 +3,8 @@
 
 //! A minimal ACPI builder for `no_std` boot environments.
 //!
-//! [`Platform::build`] returns the DSDT, MADT, and SRAT for a simple platform:
-//! CPUs with contiguous IDs starting at zero, one RAM range, and the fixed
-//! devices of the chosen [`Arch`]. All CPUs and RAM are on NUMA node zero.
+//! [`Platform::build`] returns the DSDT, MADT, and SRAT for a platform with the
+//! given CPUs, RAM ranges, and the fixed devices of the chosen [`Arch`].
 //! After assigning permanent storage to the DSDT, call [`BaseTables::fadt`].
 //! Append these tables and any PCIe tables built with the [`crate::ssdt`] and
 //! `acpi_spec::mcfg` helpers to [`crate::builder::Builder`], which supplies
@@ -21,6 +20,7 @@ use acpi_spec::fadt;
 use acpi_spec::hyperv;
 use acpi_spec::madt;
 use acpi_spec::srat;
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use memory_range::MemoryRange;
@@ -29,20 +29,37 @@ use x86defs::serial::COM_BASES;
 use x86defs::serial::COM_IRQS;
 use zerocopy::IntoBytes;
 
-/// Upper bound for DSDT + FADT + MADT + SRAT, including 8-byte table padding.
-///
-/// This does not include PCIe tables, XSDT/RSDP or temporary heap allocations.
-pub const MAX_BASE_TABLE_BYTES: usize = 32 * 1024;
+/// The largest APIC ID that fits in a legacy MADT or SRAT APIC entry.
+const MAX_LEGACY_APIC_ID: u32 = 0xfe;
 
 /// The platform that the base tables describe.
 #[derive(Clone, Copy, Debug)]
-pub struct Platform {
-    /// The number of CPUs, with IDs 0 through `cpu_count - 1`.
-    pub cpu_count: u8,
-    /// The single RAM range.
-    pub ram: MemoryRange,
+pub struct Platform<'a> {
+    /// The CPUs, in processor-index order. CPU `i` has ACPI processor UID
+    /// `i + 1`.
+    pub cpus: &'a [Cpu],
+    /// The RAM ranges.
+    pub ram: &'a [Ram],
     /// The architecture-specific devices.
     pub arch: Arch,
+}
+
+/// A CPU.
+#[derive(Clone, Copy, Debug)]
+pub struct Cpu {
+    /// The architectural ID of the CPU. On x86, this is the APIC ID.
+    pub id: u32,
+    /// The NUMA node of the CPU.
+    pub vnode: u32,
+}
+
+/// A RAM range.
+#[derive(Clone, Copy, Debug)]
+pub struct Ram {
+    /// The address range.
+    pub range: MemoryRange,
+    /// The NUMA node of the range.
+    pub vnode: u32,
 }
 
 /// The architecture-specific part of a [`Platform`].
@@ -57,18 +74,15 @@ pub enum Arch {
 /// The devices match the hosted x86 table builder: APIC and RTC DSDT
 /// resources, PIC compatibility and PIT IRQ0-to-GSI2 routing in the MADT, a
 /// BSP LINT1 NMI, and the Hyper-V PM block in the FADT. Each present COM port
-/// uses its fixed I/O port and IRQ. The MADT uses legacy APIC entries, so the
-/// APIC IDs must fit in a `u8`.
+/// uses its fixed I/O port and IRQ.
 #[derive(Clone, Copy, Debug)]
 pub struct X86 {
     /// Which of COM1 through COM4 are present.
     pub com_ports: [bool; 4],
 }
 
-impl Platform {
+impl Platform<'_> {
     /// Builds the pointer-free base tables.
-    ///
-    /// The returned base tables fit [`MAX_BASE_TABLE_BYTES`].
     pub fn build(&self, oem: &OemInfo) -> BaseTables {
         let mut dsdt = dsdt::Dsdt::new();
         dsdt.add_object(&dsdt::NamedObject::new(
@@ -82,16 +96,13 @@ impl Platform {
         match self.arch {
             Arch::X86(x86) => x86.add_dsdt_devices(&mut dsdt),
         }
-        for uid in 1..=self.cpu_count {
-            let name = [
-                b'P',
-                b'0' + uid / 100,
-                b'0' + (uid / 10) % 10,
-                b'0' + uid % 10,
-            ];
-            let mut cpu = dsdt::Device::new(&name);
+        for uid in 1..=self.cpus.len() {
+            // Past P999, increment the first character, as the hosted builder
+            // does.
+            let name = format!("{}{:03}", (b'P' + (uid / 1000) as u8) as char, uid % 1000);
+            let mut cpu = dsdt::Device::new(name.as_bytes());
             cpu.add_object(&dsdt::NamedString::new(b"_HID", b"ACPI0007"));
-            cpu.add_object(&dsdt::NamedInteger::new(b"_UID", uid.into()));
+            cpu.add_object(&dsdt::NamedInteger::new(b"_UID", uid as u64));
             let mut sta = dsdt::Method::new(b"_STA");
             sta.add_operation(&dsdt::ReturnOp {
                 result: dsdt::encode_integer(0xf),
@@ -101,14 +112,13 @@ impl Platform {
         }
 
         let (madt, mut srat_entries) = match self.arch {
-            Arch::X86(_) => (
-                X86::madt(self.cpu_count, oem),
-                X86::srat_cpus(self.cpu_count),
-            ),
+            Arch::X86(_) => (X86::madt(self.cpus, oem), X86::srat_cpus(self.cpus)),
         };
-        srat_entries.extend_from_slice(
-            srat::SratMemory::new(self.ram.start(), self.ram.len(), 0).as_bytes(),
-        );
+        for ram in self.ram {
+            srat_entries.extend_from_slice(
+                srat::SratMemory::new(ram.range.start(), ram.range.len(), ram.vnode).as_bytes(),
+            );
+        }
         BaseTables {
             dsdt: dsdt.to_bytes(),
             madt,
@@ -142,13 +152,8 @@ impl X86 {
         dsdt.add_rtc();
     }
 
-    fn madt(cpu_count: u8, oem: &OemInfo) -> Vec<u8> {
-        let mut entries = Vec::with_capacity(
-            size_of::<madt::MadtIoApic>()
-                + 2 * size_of::<madt::MadtInterruptSourceOverride>()
-                + size_of::<madt::MadtLocalNmiSource>()
-                + usize::from(cpu_count) * size_of::<madt::MadtApic>(),
-        );
+    fn madt(cpus: &[Cpu], oem: &OemInfo) -> Vec<u8> {
+        let mut entries = Vec::new();
         entries.extend_from_slice(
             madt::MadtIoApic {
                 io_apic_id: 0,
@@ -169,16 +174,29 @@ impl X86 {
         entries
             .extend_from_slice(madt::MadtInterruptSourceOverride::new(0, 2, None, None).as_bytes());
         entries.extend_from_slice(madt::MadtLocalNmiSource::new().as_bytes());
-        for apic_id in 0..cpu_count {
-            entries.extend_from_slice(
-                madt::MadtApic {
-                    apic_id,
-                    acpi_processor_uid: apic_id + 1,
-                    flags: madt::MADT_APIC_ENABLED,
-                    ..madt::MadtApic::new()
-                }
-                .as_bytes(),
-            );
+        for (index, cpu) in cpus.iter().enumerate() {
+            let uid = index as u32 + 1;
+            if cpu.id <= MAX_LEGACY_APIC_ID && uid <= u8::MAX.into() {
+                entries.extend_from_slice(
+                    madt::MadtApic {
+                        apic_id: cpu.id as u8,
+                        acpi_processor_uid: uid as u8,
+                        flags: madt::MADT_APIC_ENABLED,
+                        ..madt::MadtApic::new()
+                    }
+                    .as_bytes(),
+                );
+            } else {
+                entries.extend_from_slice(
+                    madt::MadtX2Apic {
+                        x2_apic_id: cpu.id,
+                        acpi_processor_uid: uid,
+                        flags: madt::MADT_APIC_ENABLED,
+                        ..madt::MadtX2Apic::new()
+                    }
+                    .as_bytes(),
+                );
+            }
         }
         Table::new_dyn(
             5,
@@ -192,13 +210,14 @@ impl X86 {
         .to_vec(oem)
     }
 
-    /// Returns the SRAT CPU entries, with room for the memory entry.
-    fn srat_cpus(cpu_count: u8) -> Vec<u8> {
-        let mut entries = Vec::with_capacity(
-            usize::from(cpu_count) * size_of::<srat::SratApic>() + size_of::<srat::SratMemory>(),
-        );
-        for apic_id in 0..cpu_count {
-            entries.extend_from_slice(srat::SratApic::new(apic_id, 0).as_bytes());
+    fn srat_cpus(cpus: &[Cpu]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        for cpu in cpus {
+            if cpu.id <= MAX_LEGACY_APIC_ID {
+                entries.extend_from_slice(srat::SratApic::new(cpu.id as u8, cpu.vnode).as_bytes());
+            } else {
+                entries.extend_from_slice(srat::SratX2Apic::new(cpu.id, cpu.vnode).as_bytes());
+            }
         }
         entries
     }
@@ -281,10 +300,13 @@ mod tests {
         creator_revision: 0,
     };
 
-    fn x86(cpu_count: u8, com_ports: [bool; 4]) -> BaseTables {
+    fn x86(cpus: &[Cpu], com_ports: [bool; 4]) -> BaseTables {
         Platform {
-            cpu_count,
-            ram: MemoryRange::new(0..0x8000_0000),
+            cpus,
+            ram: &[Ram {
+                range: MemoryRange::new(0..0x8000_0000),
+                vnode: 0,
+            }],
             arch: Arch::X86(X86 { com_ports }),
         }
         .build(&OEM)
@@ -295,10 +317,10 @@ mod tests {
     }
 
     #[test]
-    fn largest_tables_are_valid_and_fit() {
-        let tables = x86(u8::MAX, [true; 4]);
+    fn tables_are_valid_and_use_x2apic_for_large_ids() {
+        let cpus = [Cpu { id: 0, vnode: 0 }, Cpu { id: 300, vnode: 1 }];
+        let tables = x86(&cpus, [true; 4]);
         let fadt = tables.fadt(0x1_0000_0000, &OEM);
-        let mut size = 0;
         for (bytes, signature) in [
             (&tables.dsdt, b"DSDT"),
             (&tables.madt, b"APIC"),
@@ -309,14 +331,22 @@ mod tests {
             assert_eq!(&header.signature, signature);
             assert_eq!(header.length.get() as usize, bytes.len());
             assert_eq!(bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)), 0);
-            size += bytes.len().next_multiple_of(8);
         }
-        assert!(size <= MAX_BASE_TABLE_BYTES, "{size}");
+        // An x2APIC entry for APIC ID 300 (0x12c) with UID 2, and an SRAT
+        // x2APIC affinity entry on node 1.
+        assert!(contains(
+            &tables.madt,
+            &[9, 16, 0, 0, 0x2c, 1, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]
+        ));
+        assert!(contains(
+            &tables.srat,
+            &[2, 24, 0, 0, 1, 0, 0, 0, 0x2c, 1, 0, 0]
+        ));
     }
 
     #[test]
     fn only_present_com_ports_use_shared_irqs() {
-        let tables = x86(1, [true, false, false, true]);
+        let tables = x86(&[Cpu { id: 0, vnode: 0 }], [true, false, false, true]);
         for (uid, present) in [(1, true), (2, false), (3, false), (4, true)] {
             assert_eq!(
                 contains(&tables.dsdt, format!("UAR{uid}").as_bytes()),

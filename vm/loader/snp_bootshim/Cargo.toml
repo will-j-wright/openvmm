@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 acpi.workspace = true
 acpi_spec.workspace = true
+arrayvec.workspace = true
 fdt.workspace = true
 loader_defs.workspace = true
 memory_range.workspace = true

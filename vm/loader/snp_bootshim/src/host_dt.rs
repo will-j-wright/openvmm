@@ -1,15 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Reads the PCIe host bridges and COM ports from the host device tree.
+//! Reads the CPUs, RAM, PCIe host bridges, and COM ports from the host
+//! device tree.
 //!
-//! The device tree is unmeasured host input. The shim reads only the devices
-//! that it describes in ACPI and ignores all other nodes and properties.
+//! The device tree is unmeasured host input. The shim trusts the RAM that it
+//! describes. The shim reads only what it needs and ignores all other nodes
+//! and properties.
 
+use acpi::minimal::Cpu;
+use acpi::minimal::Ram;
+use arrayvec::ArrayVec;
 use fdt::parser::Node;
 use fdt::parser::Parser;
 use fdt::parser::Property;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS;
 use loader_defs::linux::SNP_BOOT_SHIM_MAX_PCIE_BRIDGES;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_RAM_END;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_RAM_RANGES;
 use memory_range::MemoryRange;
 
 /// The size of one PCIe bus in ECAM space.
@@ -26,8 +34,14 @@ pub(crate) enum Error<'a> {
     Fdt(fdt::parser::Error<'a>),
     #[error("missing or invalid device-tree property {0}")]
     Property(&'static str),
+    #[error("more than {SNP_BOOT_SHIM_MAX_CPUS} CPUs")]
+    TooManyCpus,
+    #[error("more than {SNP_BOOT_SHIM_MAX_RAM_RANGES} RAM ranges")]
+    TooManyRamRanges,
     #[error("more than {SNP_BOOT_SHIM_MAX_PCIE_BRIDGES} PCIe host bridges")]
     TooManyBridges,
+    #[error("a RAM range is unaligned or reaches the C-bit or the shim's mapping limit")]
+    Ram,
     #[error("a PCIe ECAM or MMIO window is invalid, overlaps RAM, or reaches the C-bit")]
     Window,
 }
@@ -49,33 +63,91 @@ pub(crate) struct Bridge {
     pub high_mmio: MemoryRange,
 }
 
-/// The host devices that the shim describes in ACPI.
+/// The host devices that the shim accepts and describes in ACPI.
 #[derive(Debug, Default)]
 pub(crate) struct HostDevices {
-    pub bridges: [Option<Bridge>; SNP_BOOT_SHIM_MAX_PCIE_BRIDGES],
+    /// The CPUs, in processor-index order.
+    pub cpus: ArrayVec<Cpu, SNP_BOOT_SHIM_MAX_CPUS>,
+    pub ram: ArrayVec<Ram, SNP_BOOT_SHIM_MAX_RAM_RANGES>,
+    pub bridges: ArrayVec<Bridge, SNP_BOOT_SHIM_MAX_PCIE_BRIDGES>,
     /// Which of COM1 through COM4 are present.
     pub com_ports: [bool; 4],
 }
 
 /// Reads the host devices from `dt`.
 ///
-/// Every PCIe window must lie between the end of RAM and the C-bit. A window
-/// over private RAM, or one that the C-bit would encrypt, does not fail when
-/// Linux assigns it, but device accesses then reach the wrong memory.
-pub(crate) fn read(dt: &[u8], ram_end: u64, c_bit_mask: u64) -> Result<HostDevices, Error<'_>> {
+/// `measured_ram_end` is the end of the RAM that the image measures. RAM must
+/// lie below the C-bit and the shim's mapping limit, which the shim needs to
+/// accept it.
+///
+/// Every PCIe window must lie outside RAM and below the C-bit. A window over
+/// private RAM, or one that the C-bit would encrypt, does not fail when Linux
+/// assigns it, but device accesses then reach the wrong memory.
+pub(crate) fn read(
+    dt: &[u8],
+    measured_ram_end: u64,
+    c_bit_mask: u64,
+) -> Result<HostDevices, Error<'_>> {
     let parser = Parser::new(dt)?;
     let mut devices = HostDevices::default();
-    let mut bridges = devices.bridges.iter_mut();
     for node in parser.root()?.children() {
         let node = node?;
-        if node.name == "pio-bus" {
+        if node.name == "cpus" {
+            for cpu in node.children() {
+                let cpu = cpu?;
+                devices
+                    .cpus
+                    .try_push(Cpu {
+                        id: property(&cpu, "reg")?.read_u32(0)?,
+                        vnode: vnode(&cpu)?,
+                    })
+                    .map_err(|_| Error::TooManyCpus)?;
+            }
+        } else if node.name.starts_with("memory@") {
+            let reg = property(&node, "reg")?;
+            let (start, size) = (reg.read_u64(0)?, reg.read_u64(1)?);
+            let range = start
+                .checked_add(size)
+                .and_then(|end| MemoryRange::try_new(start..end).ok())
+                .filter(|r| r.end() <= SNP_BOOT_SHIM_MAX_RAM_END.min(c_bit_mask))
+                .ok_or(Error::Ram)?;
+            devices
+                .ram
+                .try_push(Ram {
+                    range,
+                    vnode: vnode(&node)?,
+                })
+                .map_err(|_| Error::TooManyRamRanges)?;
+        } else if node.name == "pio-bus" {
             read_com_ports(&node, &mut devices.com_ports)?;
         } else if is_pcie_bridge(&node)? {
-            let bridge = read_bridge(&node, ram_end, c_bit_mask)?;
-            *bridges.next().ok_or(Error::TooManyBridges)? = Some(bridge);
+            let bridge = read_bridge(&node, c_bit_mask)?;
+            devices
+                .bridges
+                .try_push(bridge)
+                .map_err(|_| Error::TooManyBridges)?;
         }
     }
+    let measured_ram = MemoryRange::new(0..measured_ram_end);
+    let overlaps_ram = |window: &MemoryRange| {
+        window.overlaps(&measured_ram) || devices.ram.iter().any(|r| window.overlaps(&r.range))
+    };
+    if devices
+        .bridges
+        .iter()
+        .flat_map(|b| [b.ecam, b.low_mmio, b.high_mmio])
+        .any(|w| overlaps_ram(&w))
+    {
+        return Err(Error::Window);
+    }
     Ok(devices)
+}
+
+fn vnode<'a>(node: &Node<'a>) -> Result<u32, Error<'a>> {
+    match node.find_property("numa-node-id")? {
+        Some(p) => Ok(p.read_u32(0)?),
+        None => Ok(0),
+    }
 }
 
 fn property<'a>(node: &Node<'a>, name: &'static str) -> Result<Property<'a>, Error<'a>> {
@@ -101,7 +173,7 @@ fn read_com_ports<'a>(pio_bus: &Node<'a>, com_ports: &mut [bool; 4]) -> Result<(
     Ok(())
 }
 
-fn read_bridge<'a>(node: &Node<'a>, ram_end: u64, c_bit_mask: u64) -> Result<Bridge, Error<'a>> {
+fn read_bridge<'a>(node: &Node<'a>, c_bit_mask: u64) -> Result<Bridge, Error<'a>> {
     let segment = u16::try_from(property(node, "linux,pci-domain")?.read_u32(0)?)
         .map_err(|_| Error::Property("linux,pci-domain"))?;
     let buses = property(node, "bus-range")?;
@@ -114,7 +186,7 @@ fn read_bridge<'a>(node: &Node<'a>, ram_end: u64, c_bit_mask: u64) -> Result<Bri
     // that span and ignore the size in `reg`.
     let bus_count = u64::from(end_bus - start_bus) + 1;
     let ecam_base = property(node, "reg")?.read_u64(0)?;
-    let ecam = window(ecam_base, bus_count * BUS_SIZE, ram_end, c_bit_mask)?;
+    let ecam = window(ecam_base, bus_count * BUS_SIZE, c_bit_mask)?;
     // MCFG describes the ECAM base of bus 0.
     if ecam.start() < u64::from(start_bus) * BUS_SIZE {
         return Err(Error::Window);
@@ -128,7 +200,7 @@ fn read_bridge<'a>(node: &Node<'a>, ram_end: u64, c_bit_mask: u64) -> Result<Bri
             _ => continue,
         };
         // The ACPI tables describe identity windows at the CPU address.
-        *slot = window(be64(&range[12..]), be64(&range[20..]), ram_end, c_bit_mask)?;
+        *slot = window(be64(&range[12..]), be64(&range[20..]), c_bit_mask)?;
     }
     Ok(Bridge {
         segment,
@@ -140,15 +212,10 @@ fn read_bridge<'a>(node: &Node<'a>, ram_end: u64, c_bit_mask: u64) -> Result<Bri
     })
 }
 
-fn window<'a>(
-    base: u64,
-    size: u64,
-    ram_end: u64,
-    c_bit_mask: u64,
-) -> Result<MemoryRange, Error<'a>> {
+fn window<'a>(base: u64, size: u64, c_bit_mask: u64) -> Result<MemoryRange, Error<'a>> {
     let end = base.checked_add(size).ok_or(Error::Window)?;
     let range = MemoryRange::try_new(base..end).map_err(|_| Error::Window)?;
-    if !range.is_empty() && (base < ram_end || end > c_bit_mask) {
+    if end > c_bit_mask {
         return Err(Error::Window);
     }
     Ok(range)
@@ -173,6 +240,8 @@ pub(crate) mod tests {
 
     pub(crate) const RAM_END: u64 = 0x1000_0000;
     pub(crate) const C_BIT: u64 = 1 << 47;
+    /// RAM above the measured RAM, on NUMA node 1, below the PCIe windows.
+    pub(crate) const HIGH_RAM: MemoryRange = MemoryRange::new(0x2000_0000..0x3000_0000);
 
     type Properties = Vec<(&'static str, Vec<u8>)>;
     type TestNode = (String, Properties, Vec<(String, Properties)>);
@@ -238,19 +307,38 @@ pub(crate) mod tests {
                 ("#address-cells", cells(&[1])),
                 ("#size-cells", cells(&[0])),
             ],
-            vec![(
-                "cpu@1".into(),
-                vec![("device_type", b"cpu\0".to_vec()), ("reg", cells(&[0]))],
-            )],
-        )];
-        nodes.push((
-            "memory@0".into(),
             vec![
-                ("device_type", b"memory\0".to_vec()),
-                ("reg", [0u64.to_be_bytes(), RAM_END.to_be_bytes()].concat()),
+                (
+                    "cpu@1".into(),
+                    vec![("device_type", b"cpu\0".to_vec()), ("reg", cells(&[0]))],
+                ),
+                (
+                    "cpu@2".into(),
+                    vec![
+                        ("device_type", b"cpu\0".to_vec()),
+                        ("reg", cells(&[5])),
+                        ("numa-node-id", cells(&[1])),
+                    ],
+                ),
             ],
-            vec![],
-        ));
+        )];
+        for (start, end, vnode) in [(0, RAM_END, 0), (HIGH_RAM.start(), HIGH_RAM.end(), 1)] {
+            nodes.push((
+                alloc::format!("memory@{start:x}"),
+                vec![
+                    ("device_type", b"memory\0".to_vec()),
+                    (
+                        "reg",
+                        [start, end - start]
+                            .into_iter()
+                            .flat_map(u64::to_be_bytes)
+                            .collect(),
+                    ),
+                    ("numa-node-id", cells(&[vnode])),
+                ],
+                vec![],
+            ));
+        }
         let uarts = com_ports
             .iter()
             .zip(x86defs::serial::COM_BASES)
@@ -322,8 +410,20 @@ pub(crate) mod tests {
             crate::allocation_measure::measure(|| read(&dt, RAM_END, C_BIT).unwrap());
         assert_eq!(allocated, 0);
         assert_eq!(devices.com_ports, [true, false, true, false]);
+        let cpus = devices
+            .cpus
+            .iter()
+            .map(|c| (c.id, c.vnode))
+            .collect::<Vec<_>>();
+        assert_eq!(cpus, [(0, 0), (5, 1)]);
+        let ram = devices
+            .ram
+            .iter()
+            .map(|r| (r.range, r.vnode))
+            .collect::<Vec<_>>();
+        assert_eq!(ram, [(MemoryRange::new(0..RAM_END), 0), (HIGH_RAM, 1)]);
+        assert_eq!(devices.bridges.len(), SNP_BOOT_SHIM_MAX_PCIE_BRIDGES);
         for (index, bridge) in devices.bridges.iter().enumerate() {
-            let bridge = bridge.unwrap();
             let offset = index as u64 * 0x0100_0000;
             assert_eq!(bridge.segment, index as u16);
             assert_eq!((bridge.start_bus, bridge.end_bus), (0, 15));
@@ -375,7 +475,7 @@ pub(crate) mod tests {
         replace(&mut properties, "reg", cells(&[0, 0x4000_0000, 0, 0]));
         let dt = device_tree([false; 4], &[properties]);
         let devices = read(&dt, RAM_END, C_BIT).unwrap();
-        let ecam = devices.bridges[0].unwrap().ecam;
+        let ecam = devices.bridges[0].ecam;
         assert_eq!(ecam, MemoryRange::new(0x4000_0000..0x4100_0000));
     }
 
