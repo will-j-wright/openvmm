@@ -25,7 +25,8 @@
 extern crate alloc;
 
 mod acpi_tables;
-mod heap;
+#[cfg(test)]
+mod allocation_measure;
 mod host_dt;
 
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
@@ -158,6 +159,13 @@ fn terminate() -> ! {
     minimal_rt::arch::fault()
 }
 
+/// The heap for building the ACPI tables. Allocations outside
+/// [`install_platform_acpi`] panic.
+#[cfg(minimal_rt)]
+#[global_allocator]
+static ALLOCATOR: minimal_rt::bump_alloc::BumpAllocator =
+    minimal_rt::bump_alloc::BumpAllocator::new();
+
 #[cfg(minimal_rt)]
 fn install_platform_acpi(
     params: &SnpBootShimParams,
@@ -165,15 +173,18 @@ fn install_platform_acpi(
     devices: &host_dt::HostDevices,
     cpu_count: u8,
 ) {
+    let heap = platform
+        .heap_gpa
+        .checked_add(platform.heap_size)
+        .and_then(|end| memory_range::MemoryRange::try_new(platform.heap_gpa..end).ok());
+    let Some(heap) = heap else { terminate() };
     // SAFETY: The measured platform page gives this heap region, which the
-    // shim accepted with the other omitted RAM.
-    let initialized =
-        unsafe { heap::HEAP.init(platform.heap_gpa as usize, platform.heap_size as usize) };
-    if !initialized {
-        terminate();
-    }
-    let (rsdp, tables) =
-        acpi_tables::build(devices, cpu_count, params.ram_end, platform.acpi_output_gpa);
+    // shim accepted with the other omitted RAM. The shim runs with an
+    // identity map.
+    unsafe { ALLOCATOR.init(heap) };
+    let (rsdp, tables) = ALLOCATOR.with_alloc(|| {
+        acpi_tables::build(devices, cpu_count, params.ram_end, platform.acpi_output_gpa)
+    });
     // Do not write past the measured output region.
     if tables.len() as u64 > platform.acpi_output_size {
         terminate();
