@@ -141,11 +141,13 @@ fn check_platform(platform: &SnpBootShimPlatformParams) -> bool {
         && platform.version == SNP_BOOT_SHIM_PLATFORM_VERSION
 }
 
-/// Stop using the architected GHCB MSR termination protocol.
+/// Terminates the guest with the GHCB MSR protocol.
 ///
-/// TODO: add a detailed, allocation-free SNP diagnostic channel. The current
-/// wire notification is a general termination request, never a silent fallback
-/// to stale ACPI. Do not use port I/O here: the shim has no #VC handler.
+/// The shim has no #VC handler, so it cannot report errors through port I/O,
+/// such as a serial port.
+///
+/// TODO: report the reason for the failure. This request tells the host only
+/// that the guest terminated.
 #[cfg(minimal_rt)]
 fn terminate() -> ! {
     // SAFETY: GHCB MSR protocol accesses do not require a shared GHCB page.
