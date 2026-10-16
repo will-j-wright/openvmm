@@ -8040,6 +8040,7 @@ version = "0.0.0"
 dependencies = [
  "acpi",
  "acpi_spec",
+ "arrayvec",
  "fdt",
  "loader_defs",
  "memory_range",

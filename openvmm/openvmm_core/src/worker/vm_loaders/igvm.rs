@@ -30,7 +30,10 @@ use loader::importer::ImageLoad;
 use loader::importer::StartupMemoryType;
 use loader::importer::TableRegister;
 use loader::importer::X86Register;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS;
 use loader_defs::linux::SNP_BOOT_SHIM_MAX_PCIE_BRIDGES;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_RAM_END;
+use loader_defs::linux::SNP_BOOT_SHIM_MAX_RAM_RANGES;
 use memory_range::MemoryRange;
 use memory_range::subtract_ranges;
 use openvmm_defs::config::Vtl2BaseAddressType;
@@ -87,6 +90,8 @@ pub enum Error {
     DeviceTree(#[source] DeviceTreeError),
     #[error("unsupported SNP PCIe device tree configuration")]
     SnpPcieDeviceTree(#[from] SnpPcieDeviceTreeError),
+    #[error("unsupported SNP processor or memory configuration")]
+    SnpTopology(#[from] SnpTopologyError),
     #[error("supplied vtl2 memory {0} is not aligned to 2MB")]
     Vtl2MemoryAligned(u64),
     #[error("supplied vtl2 memory {0} is smaller than igvm file VTL2 range {1}")]
@@ -152,6 +157,40 @@ fn check_snp_pcie(
         if bridge.cxl.is_some() {
             return Err(SnpPcieDeviceTreeError::Cxl(segment));
         }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SnpTopologyError {
+    #[error("at most {SNP_BOOT_SHIM_MAX_CPUS} processors are supported")]
+    TooManyProcessors,
+    #[error("at most {SNP_BOOT_SHIM_MAX_RAM_RANGES} RAM ranges are supported")]
+    TooManyRamRanges,
+    #[error("RAM must end at or below {SNP_BOOT_SHIM_MAX_RAM_END:#x}")]
+    RamTooHigh,
+}
+
+/// Checks that the SNP boot shim can accept the RAM and describe the
+/// processors in the device tree.
+///
+/// The shim stops the guest without a diagnostic if these limits are
+/// exceeded, so this check fails the launch with a clear error instead.
+fn check_snp_topology(
+    processor_count: usize,
+    ram: &[MemoryRangeWithNode],
+) -> Result<(), SnpTopologyError> {
+    if processor_count > SNP_BOOT_SHIM_MAX_CPUS {
+        return Err(SnpTopologyError::TooManyProcessors);
+    }
+    if ram.len() > SNP_BOOT_SHIM_MAX_RAM_RANGES {
+        return Err(SnpTopologyError::TooManyRamRanges);
+    }
+    if ram
+        .iter()
+        .any(|r| r.range.end() > SNP_BOOT_SHIM_MAX_RAM_END)
+    {
+        return Err(SnpTopologyError::RamTooHigh);
     }
     Ok(())
 }
@@ -960,6 +999,7 @@ fn load_igvm_x86(
             IgvmDirectiveHeader::DeviceTree(ref info) => {
                 if is_snp {
                     check_snp_pcie(pcie_host_bridges, pcie_has_iommu)?;
+                    check_snp_topology(processor_topology.vp_count() as usize, &all_ram)?;
                 }
                 let max_size = match parameter_areas.get(&info.parameter_area_index) {
                     Some(ParameterAreaState::Allocated { max_size, .. }) => *max_size,
@@ -1418,6 +1458,27 @@ mod tests {
             preserve_bars: false,
             preserve_boot_config: false,
         }
+    }
+
+    #[test]
+    fn snp_rejects_unsupported_topology() {
+        let ram = |end: u64| MemoryRangeWithNode {
+            range: MemoryRange::new(0..end),
+            vnode: 0,
+        };
+        assert_eq!(check_snp_topology(255, &[ram(1 << 30)]), Ok(()));
+        assert_eq!(
+            check_snp_topology(256, &[ram(1 << 30)]),
+            Err(SnpTopologyError::TooManyProcessors)
+        );
+        assert_eq!(
+            check_snp_topology(1, &vec![ram(1 << 30); SNP_BOOT_SHIM_MAX_RAM_RANGES + 1]),
+            Err(SnpTopologyError::TooManyRamRanges)
+        );
+        assert_eq!(
+            check_snp_topology(1, &[ram(SNP_BOOT_SHIM_MAX_RAM_END + 0x1000)]),
+            Err(SnpTopologyError::RamTooHigh)
+        );
     }
 
     #[test]

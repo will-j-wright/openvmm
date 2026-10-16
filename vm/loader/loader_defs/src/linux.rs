@@ -304,7 +304,7 @@ pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 3;
 /// Magic value for the measured platform extension.
 pub const SNP_BOOT_SHIM_PLATFORM_MAGIC: u64 = u64::from_le_bytes(*b"SNPACPI3");
 /// Version of the platform extension.
-pub const SNP_BOOT_SHIM_PLATFORM_VERSION: u32 = 1;
+pub const SNP_BOOT_SHIM_PLATFORM_VERSION: u32 = 2;
 /// Maximum host device-tree size accepted by the fixed SNP profile.
 pub const SNP_BOOT_SHIM_DT_SIZE: u64 = 64 * 1024;
 /// Reserved capacity for the complete generated ACPI table set.
@@ -313,6 +313,12 @@ pub const SNP_BOOT_SHIM_ACPI_SIZE: u64 = 64 * 1024;
 pub const SNP_BOOT_SHIM_HEAP_SIZE: u64 = 1024 * 1024;
 /// Maximum number of PCIe host bridges supported by the SNP bootshim.
 pub const SNP_BOOT_SHIM_MAX_PCIE_BRIDGES: usize = 8;
+/// Maximum number of CPUs in the host device tree.
+pub const SNP_BOOT_SHIM_MAX_CPUS: usize = 255;
+/// Maximum number of RAM ranges in the host device tree.
+pub const SNP_BOOT_SHIM_MAX_RAM_RANGES: usize = 64;
+/// Exclusive upper bound of the RAM that the shim can accept.
+pub const SNP_BOOT_SHIM_MAX_RAM_END: u64 = 512 << 30;
 const SNP_BOOT_SHIM_PARAMS_HEADER_SIZE: usize = 48;
 /// Maximum number of RAM ranges that fit in one [`SnpBootShimParams`] page.
 pub const SNP_BOOT_SHIM_MAX_RANGES: usize = (hvdef::HV_PAGE_SIZE as usize
@@ -347,7 +353,8 @@ pub struct SnpBootShimParams {
     pub linux_entry: u64,
     /// Guest physical address of the Linux zero page passed in RSI.
     pub linux_zero_page: u64,
-    /// Exclusive end of the configured, contiguous guest RAM.
+    /// Exclusive end of the RAM that the image measures. The host device tree
+    /// describes this RAM and any RAM above it.
     pub ram_end: u64,
     /// Page-aligned GPA of the mandatory [`SnpBootShimPlatformParams`].
     pub platform_gpa: u64,
@@ -364,8 +371,7 @@ pub struct SnpBootShimParams {
 pub struct SnpBootShimPlatformParams {
     pub magic: u64,
     pub version: u32,
-    /// Number of CPUs to describe in the generated ACPI tables.
-    pub cpu_count: u32,
+    pub reserved: u32,
     pub dt_gpa: u64,
     pub dt_size: u64,
     pub heap_gpa: u64,

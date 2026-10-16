@@ -114,22 +114,20 @@ kernel, the initrd, the boot metadata, and a small measured bootshim,
 
 The image does not contain ACPI tables. At launch, OpenVMM writes its
 [device tree](../../architecture/openvmm/device-tree.md) into an unmeasured
-IGVM parameter area. The bootshim reads the PCIe host bridges and COM ports
-from that tree, accepts the guest RAM, and then builds the DSDT, FADT, MADT,
-SRAT, XSDT, and RSDP. It adds an MCFG and a PCIe SSDT when the device tree
-describes host bridges. The CPU and memory tables use the CPU count and RAM
-size that the image measures, not values from the device tree.
+IGVM parameter area. The bootshim reads the CPUs, RAM, PCIe host bridges, and
+COM ports from that tree, accepts the guest RAM, and then builds the DSDT,
+FADT, MADT, SRAT, XSDT, and RSDP. It adds an MCFG and a PCIe SSDT when the
+device tree describes host bridges.
 
 ### Launch Requirements
 
-The launch must match the CPU count and RAM size that the image measures:
+One image boots with any supported CPU count, RAM size, and NUMA layout:
 
-- Set `--memory` to the RAM size of the image. Do not use a multi-node
-  `--numa` configuration, because the profiles put all CPUs and RAM in NUMA
-  node 0.
-- Set `--processors N --vps-per-socket N` to the VP count of the image, and
-  keep the APIC ID offset at 0. SMT can stay `auto`.
-- Regenerate the image after you change either value or update the bootshim.
+- Give the guest at least the RAM that the image measures, which is
+  `memory_page_count` pages in the manifest. The shim trusts and accepts any
+  RAM that the device tree describes above that.
+- Use up to 255 processors and 64 RAM ranges, with all RAM below 512 GiB.
+  OpenVMM rejects larger configurations.
 
 ### PCIe
 
