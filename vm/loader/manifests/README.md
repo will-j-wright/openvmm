@@ -154,8 +154,7 @@ For its two-VP, 160-MiB configuration:
 
 ```bash
 openvmm --hypervisor mshv --isolation snp --hv --no-vmbus \
-  --igvm path/to/snp-linux-direct-pcie.bin \
-  --igvm-personality linux-direct \
+  --igvm firmware=path/to/snp-linux-direct-pcie.bin,personality=linux-direct \
   --memory 160MB --processors 2 --vps-per-socket 2 \
   --com1 file=path/to/serial.log \
   --pcie-root-complex rc0,segment=0,start_bus=0,end_bus=31,low_mmio=64M,high_mmio=1G,node=0 \
