@@ -1521,7 +1521,7 @@ mod test {
     }
 
     #[test]
-    fn snp_tables_match_hosted_fixed_chipset() {
+    fn minimal_tables_match_hosted_fixed_chipset() {
         let memory = MemoryLayout::new(160 * MB, &[], &[], &[], None).unwrap();
         let bridges = vec![];
         for count in [1, 255] {
@@ -1544,10 +1544,12 @@ mod test {
                 acpi_irq: chipset_resources::pm::DEFAULT_ACPI_IRQ,
                 iommu: None,
             };
-            let tables = acpi::snp::Topology {
+            let tables = acpi::minimal::Platform {
                 cpu_count: count as u8,
-                ram_end: 160 * MB,
-                com_ports: [false; 4],
+                ram: MemoryRange::new(0..160 * MB),
+                arch: acpi::minimal::Arch::X86(acpi::minimal::X86 {
+                    com_ports: [false; 4],
+                }),
             }
             .build(&OEM_INFO);
             assert_eq!(tables.madt, hosted.build_madt(), "{count} CPUs");

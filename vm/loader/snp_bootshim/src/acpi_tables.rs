@@ -11,12 +11,15 @@ use crate::host_dt::HostDevices;
 use acpi::builder::Builder;
 use acpi::builder::OemInfo;
 use acpi::builder::Table;
-use acpi::snp::Topology;
+use acpi::minimal::Arch;
+use acpi::minimal::Platform;
+use acpi::minimal::X86;
 use acpi::ssdt::PcieHostBridgeEntry;
 use acpi::ssdt::Ssdt;
 use acpi_spec::mcfg::McfgHeader;
 use acpi_spec::mcfg::McfgSegmentBusRange;
 use alloc::vec::Vec;
+use memory_range::MemoryRange;
 use zerocopy::IntoBytes;
 
 const OEM: OemInfo = OemInfo {
@@ -37,10 +40,12 @@ pub(crate) fn build(
     ram_end: u64,
     output_gpa: u64,
 ) -> (Vec<u8>, Vec<u8>) {
-    let base = Topology {
+    let base = Platform {
         cpu_count,
-        ram_end,
-        com_ports: devices.com_ports,
+        ram: MemoryRange::new(0..ram_end),
+        arch: Arch::X86(X86 {
+            com_ports: devices.com_ports,
+        }),
     }
     .build(&OEM);
     let mut builder = Builder::new(output_gpa, OEM);
