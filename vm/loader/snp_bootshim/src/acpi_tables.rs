@@ -208,7 +208,7 @@ mod tests {
         let dt = device_tree([true; 4], &bridges);
         let devices = crate::host_dt::read(&dt, RAM_END, C_BIT).unwrap();
         let ((rsdp, tables), allocated) =
-            crate::heap::allocation_measure::measure(|| build(&devices, u8::MAX, RAM_END, OUTPUT));
+            crate::allocation_measure::measure(|| build(&devices, u8::MAX, RAM_END, OUTPUT));
         assert!(tables.len() <= SNP_BOOT_SHIM_ACPI_SIZE as usize);
         assert!(allocated <= SNP_BOOT_SHIM_HEAP_SIZE as usize);
         assert_eq!(xsdt_entries(&rsdp, &tables).len(), 5);

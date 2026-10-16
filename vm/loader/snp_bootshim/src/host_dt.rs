@@ -319,7 +319,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let dt = device_tree([true, false, true, false], &bridges);
         let (devices, allocated) =
-            crate::heap::allocation_measure::measure(|| read(&dt, RAM_END, C_BIT).unwrap());
+            crate::allocation_measure::measure(|| read(&dt, RAM_END, C_BIT).unwrap());
         assert_eq!(allocated, 0);
         assert_eq!(devices.com_ports, [true, false, true, false]);
         for (index, bridge) in devices.bridges.iter().enumerate() {

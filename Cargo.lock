@@ -4862,6 +4862,7 @@ dependencies = [
  "arrayvec",
  "cfg-if",
  "hvdef",
+ "memory_range",
  "minimal_rt_build",
  "minimal_rt_reloc",
  "zerocopy",
