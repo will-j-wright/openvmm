@@ -1401,6 +1401,7 @@ impl PageDataBuffer {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+    #[cfg(guest_arch = "x86_64")]
     use vm_topology::processor::TopologyBuilder;
 
     fn snp_bridge(segment: u16) -> PcieHostBridge {
@@ -1450,6 +1451,7 @@ mod tests {
         );
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn snp_pcie_checks_require_device_tree_request() {
         for request_device_tree in [false, true] {

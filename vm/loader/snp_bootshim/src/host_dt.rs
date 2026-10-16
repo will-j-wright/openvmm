@@ -5,7 +5,6 @@
 //!
 //! The device tree is unmeasured host input. The shim reads only the devices
 //! that it describes in ACPI and ignores all other nodes and properties.
-//! Reading does not allocate, so it runs before the shim accepts its heap.
 
 use fdt::parser::Node;
 use fdt::parser::Parser;
