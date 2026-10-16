@@ -12,7 +12,8 @@ use minimal_rt::bump_alloc::BumpAllocator;
 // it will override the global allocator in unit tests which is not what we
 // want.
 #[cfg_attr(minimal_rt, global_allocator)]
-pub static ALLOCATOR: BumpAllocator = BumpAllocator::new();
+// SAFETY: The boot loader runs on one thread only.
+pub static ALLOCATOR: BumpAllocator = unsafe { BumpAllocator::new() };
 
 /// Run the provided closure with enabling the global bump allocator. This is
 /// only intended to be used for mesh_protobuf decode.
