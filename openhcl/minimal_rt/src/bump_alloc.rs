@@ -36,12 +36,15 @@ struct Inner {
 /// Declare it as the `#[global_allocator]` of the boot loader, call
 /// [`init`](Self::init) once, and then allocate inside
 /// [`with_alloc`](Self::with_alloc).
+///
+/// The allocator is `Sync` so that it can be a global allocator, but it uses no
+/// locks. [`new`](Self::new) is therefore unsafe.
 pub struct BumpAllocator {
     inner: RefCell<Inner>,
 }
 
-// SAFETY: Boot loaders that use this allocator run on one thread only, so no
-// other thread can access the `RefCell`.
+// SAFETY: The caller of `new` guarantees that only one thread uses the
+// allocator, so no other thread can access the `RefCell`.
 unsafe impl Sync for BumpAllocator {}
 
 /// Usage statistics for a [`BumpAllocator`].
@@ -57,7 +60,11 @@ pub struct Stats {
 
 impl BumpAllocator {
     /// Creates an allocator with no memory.
-    pub const fn new() -> Self {
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that only one thread ever uses the allocator.
+    pub const unsafe fn new() -> Self {
         BumpAllocator {
             inner: RefCell::new(Inner {
                 start: core::ptr::null_mut(),
@@ -140,12 +147,6 @@ impl BumpAllocator {
     }
 }
 
-impl Default for BumpAllocator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // SAFETY: The allocator points to a valid identity VA range via the
 // construction at init.
 unsafe impl GlobalAlloc for BumpAllocator {
@@ -209,7 +210,8 @@ mod tests {
         }
 
         fn allocator(&self) -> BumpAllocator {
-            let allocator = BumpAllocator::new();
+            // SAFETY: Only this test's thread uses the allocator.
+            let allocator = unsafe { BumpAllocator::new() };
             let start = self.0 as u64;
             // SAFETY: The buffer is valid and unused, and it outlives the
             // allocator in each test.

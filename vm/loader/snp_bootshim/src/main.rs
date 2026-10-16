@@ -163,8 +163,9 @@ fn terminate() -> ! {
 /// [`install_platform_acpi`] panic.
 #[cfg(minimal_rt)]
 #[global_allocator]
+// SAFETY: The shim runs only on the BSP.
 static ALLOCATOR: minimal_rt::bump_alloc::BumpAllocator =
-    minimal_rt::bump_alloc::BumpAllocator::new();
+    unsafe { minimal_rt::bump_alloc::BumpAllocator::new() };
 
 #[cfg(minimal_rt)]
 fn install_platform_acpi(
