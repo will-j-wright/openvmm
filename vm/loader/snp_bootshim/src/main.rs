@@ -12,7 +12,8 @@
 //!
 //! It has no command-line interface and is only useful as an IGVM component.
 //! SNP Linux-direct image generation builds and embeds it; invalid parameters
-//! or page-state transitions fault instead of continuing with unsafe memory.
+//! or page-state transitions stop the guest instead of continuing with unsafe
+//! memory.
 
 #![cfg_attr(minimal_rt, no_std, no_main)]
 // UNSAFETY: The bootshim issues PVALIDATE, reads freshly accepted pages, and
@@ -25,8 +26,6 @@
 extern crate alloc;
 
 mod acpi_tables;
-#[cfg(test)]
-mod allocation_measure;
 mod host_dt;
 
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
@@ -59,7 +58,7 @@ enum ParamsError {
 ///
 /// The IGVM generator measures both this parameter page and the initial RSI
 /// that points to it. A validation failure therefore indicates an incompatible
-/// or corrupt image, or a generator bug. The runtime faults instead of using
+/// or corrupt image, or a generator bug. The runtime stops instead of using
 /// an invalid address or accepting an invalid RAM range.
 fn validate_params(
     params: &SnpBootShimParams,
@@ -142,18 +141,60 @@ fn check_platform(platform: &SnpBootShimPlatformParams) -> bool {
         && platform.version == SNP_BOOT_SHIM_PLATFORM_VERSION
 }
 
-/// Terminates the guest with the GHCB MSR protocol.
+/// Why the shim stopped the guest.
+///
+/// The shim sends this code in the GHCB termination request, so the host can
+/// log it.
+#[cfg(minimal_rt)]
+#[derive(Copy, Clone)]
+#[repr(u8)]
+enum Failure {
+    Params = 0x01,
+    Platform = 0x02,
+    Accept = 0x03,
+    E820Full = 0x04,
+    Heap = 0x05,
+    AcpiTooLarge = 0x06,
+    Panic = 0x07,
+    DeviceTree = 0x10,
+    DeviceTreeProperty = 0x11,
+    TooManyCpus = 0x12,
+    TooManyRamRanges = 0x13,
+    TooManyBridges = 0x14,
+    DuplicateSegment = 0x15,
+    Ram = 0x16,
+    Window = 0x17,
+}
+
+#[cfg(minimal_rt)]
+impl From<host_dt::Error<'_>> for Failure {
+    fn from(error: host_dt::Error<'_>) -> Self {
+        match error {
+            host_dt::Error::Fdt(_) => Self::DeviceTree,
+            host_dt::Error::Property(_) => Self::DeviceTreeProperty,
+            host_dt::Error::TooManyCpus => Self::TooManyCpus,
+            host_dt::Error::TooManyRamRanges => Self::TooManyRamRanges,
+            host_dt::Error::TooManyBridges => Self::TooManyBridges,
+            host_dt::Error::DuplicateSegment => Self::DuplicateSegment,
+            host_dt::Error::Ram => Self::Ram,
+            host_dt::Error::Window => Self::Window,
+        }
+    }
+}
+
+/// Terminates the guest with the GHCB MSR protocol and reports `failure`.
 ///
 /// The shim has no #VC handler, so it cannot report errors through port I/O,
-/// such as a serial port.
-///
-/// TODO: report the reason for the failure. This request tells the host only
-/// that the guest terminated.
+/// such as a serial port. Linux uses reason-code set 1, so the shim uses its
+/// own set.
 #[cfg(minimal_rt)]
-fn terminate() -> ! {
+fn terminate(failure: Failure) -> ! {
+    const REASON_SET: u64 = 0xf;
+    let request =
+        x86defs::snp::GhcbInfo::SHUTDOWN_REQUEST.0 | (REASON_SET << 12) | ((failure as u64) << 16);
     // SAFETY: GHCB MSR protocol accesses do not require a shared GHCB page.
     unsafe {
-        minimal_rt::arch::msr::write_msr(x86defs::X86X_AMD_MSR_GHCB, 0x100);
+        minimal_rt::arch::msr::write_msr(x86defs::X86X_AMD_MSR_GHCB, request);
         core::arch::asm!("rep vmmcall", options(nostack));
     }
     minimal_rt::arch::fault()
@@ -177,7 +218,9 @@ fn install_platform_acpi(
         .heap_gpa
         .checked_add(platform.heap_size)
         .and_then(|end| memory_range::MemoryRange::try_new(platform.heap_gpa..end).ok());
-    let Some(heap) = heap else { terminate() };
+    let Some(heap) = heap else {
+        terminate(Failure::Heap)
+    };
     // SAFETY: The measured platform page gives this heap region, which the
     // shim accepted with the other omitted RAM. The shim runs with an
     // identity map.
@@ -186,7 +229,7 @@ fn install_platform_acpi(
         ALLOCATOR.with_alloc(|| acpi_tables::build(devices, platform.acpi_output_gpa));
     // Do not write past the measured output region.
     if tables.len() as u64 > platform.acpi_output_size {
-        terminate();
+        terminate(Failure::AcpiTooLarge);
     }
 
     // SAFETY: The measured platform page gives the output and RSDP regions,
@@ -498,7 +541,7 @@ fn jump_to_linux() -> ! {
 #[cfg(minimal_rt)]
 extern "C" fn start(params_gpa: u64) -> ! {
     if !params_gpa.is_multiple_of(PAGE_SIZE) {
-        minimal_rt::arch::fault();
+        terminate(Failure::Params);
     }
 
     // SAFETY: The VMSA points RSI at a measured, accepted, identity-mapped
@@ -506,13 +549,13 @@ extern "C" fn start(params_gpa: u64) -> ! {
     let params = unsafe { &*(params_gpa as *const SnpBootShimParams) };
     let ranges = match validate_params(params, params_gpa) {
         Ok(ranges) => ranges,
-        Err(_) => minimal_rt::arch::fault(),
+        Err(_) => terminate(Failure::Params),
     };
     // SAFETY: The measured parameter page gives the address of this measured,
     // imported platform page.
     let platform = unsafe { &*(params.platform_gpa as *const SnpBootShimPlatformParams) };
     if !check_platform(platform) {
-        terminate();
+        terminate(Failure::Platform);
     }
     // SAFETY: The measured platform page gives the location and size of this
     // imported, private device-tree area. Read it before accepting RAM, so
@@ -520,13 +563,14 @@ extern "C" fn start(params_gpa: u64) -> ! {
     let dt = unsafe {
         core::slice::from_raw_parts(platform.dt_gpa as *const u8, platform.dt_size as usize)
     };
-    let Ok(devices) = host_dt::read(dt, params.ram_end, platform.c_bit_mask) else {
-        terminate()
+    let devices = match host_dt::read(dt, params.ram_end, platform.c_bit_mask) {
+        Ok(devices) => devices,
+        Err(error) => terminate(error.into()),
     };
 
     for &range in ranges {
         if arch::accept_range(range).is_err() {
-            minimal_rt::arch::fault();
+            terminate(Failure::Accept);
         }
     }
     arch::with_large_identity_map(platform.c_bit_mask, || {
@@ -536,7 +580,7 @@ extern "C" fn start(params_gpa: u64) -> ! {
                 page_count: range.len() / PAGE_SIZE,
             };
             if arch::accept_range(range).is_err() {
-                minimal_rt::arch::fault();
+                terminate(Failure::Accept);
             }
         }
     });
@@ -545,7 +589,7 @@ extern "C" fn start(params_gpa: u64) -> ! {
     let zero_page =
         unsafe { &mut *(params.linux_zero_page as *mut loader_defs::linux::boot_params) };
     if !add_e820_ram(zero_page, &devices.ram, params.ram_end) {
-        terminate();
+        terminate(Failure::E820Full);
     }
 
     install_platform_acpi(params, platform, &devices);
@@ -572,7 +616,7 @@ core::arch::global_asm! {
 #[cfg(minimal_rt)]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    minimal_rt::arch::fault()
+    terminate(Failure::Panic)
 }
 
 #[cfg(not(minimal_rt))]

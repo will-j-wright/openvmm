@@ -186,6 +186,24 @@ unsafe impl GlobalAlloc for BumpAllocator {
     // being realloced was the last one aka the tail.
 }
 
+#[cfg(nightly)]
+// SAFETY: The allocator points to a valid identity VA range via the
+// construction at init, the same as for `GlobalAlloc`.
+unsafe impl core::alloc::Allocator for &BumpAllocator {
+    fn allocate(
+        &self,
+        layout: Layout,
+    ) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+        // SAFETY: The caller meets the `GlobalAlloc::alloc` contract.
+        let ptr = unsafe { self.alloc(layout) };
+        core::ptr::NonNull::new(ptr)
+            .map(|ptr| core::ptr::NonNull::slice_from_raw_parts(ptr, layout.size()))
+            .ok_or(core::alloc::AllocError)
+    }
+
+    unsafe fn deallocate(&self, _ptr: core::ptr::NonNull<u8>, _layout: Layout) {}
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -249,6 +267,23 @@ mod tests {
         assert_eq!(stats.count, 3);
         assert_eq!(stats.allocated + stats.free, SIZE);
         assert!(stats.allocated >= 600);
+    }
+
+    // NOTE: run this test with miri via
+    // `RUSTFLAGS="--cfg nightly" cargo +nightly miri test -p minimal_rt`
+    #[cfg(nightly)]
+    #[test]
+    fn vec_grows_in_the_allocator() {
+        let buffer = Buffer::new();
+        let allocator = buffer.allocator();
+        allocator.with_alloc(|| {
+            let mut vec: std::vec::Vec<u8, &BumpAllocator> = std::vec::Vec::new_in(&allocator);
+            // Push 4096 bytes, which forces the vec to reallocate.
+            for i in 0..4096 {
+                vec.push(i as u8);
+            }
+            vec.resize(10000, 0);
+        });
     }
 
     #[test]

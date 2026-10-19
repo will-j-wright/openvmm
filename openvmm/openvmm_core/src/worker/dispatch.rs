@@ -3589,6 +3589,7 @@ impl LoadedVmInner {
                 ref cmdline,
                 vtl2_base_address,
                 com_serial,
+                personality,
             } => {
                 let madt = acpi_builder.build_madt();
                 let srat = acpi_builder.build_srat();
@@ -3624,7 +3625,7 @@ impl LoadedVmInner {
                     entropy: Some(&entropy),
                     chipset_mmio: self.chipset_mmio,
                     pcie_host_bridges: &self.pcie_host_bridges,
-                    pcie_has_iommu: !matches!(self.iommu_devices, IommuDevices::None),
+                    personality,
                 };
                 super::vm_loaders::igvm::load_igvm(params)?
             }

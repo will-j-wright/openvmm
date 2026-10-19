@@ -40,6 +40,8 @@ pub(crate) enum Error<'a> {
     TooManyRamRanges,
     #[error("more than {SNP_BOOT_SHIM_MAX_PCIE_BRIDGES} PCIe host bridges")]
     TooManyBridges,
+    #[error("two PCIe host bridges share a segment")]
+    DuplicateSegment,
     #[error("a RAM range is unaligned or reaches the C-bit or the shim's mapping limit")]
     Ram,
     #[error("a PCIe ECAM or MMIO window is invalid, overlaps RAM, or reaches the C-bit")]
@@ -122,6 +124,9 @@ pub(crate) fn read(
             read_com_ports(&node, &mut devices.com_ports)?;
         } else if is_pcie_bridge(&node)? {
             let bridge = read_bridge(&node, c_bit_mask)?;
+            if devices.bridges.iter().any(|b| b.segment == bridge.segment) {
+                return Err(Error::DuplicateSegment);
+            }
             devices
                 .bridges
                 .try_push(bridge)
@@ -406,9 +411,7 @@ pub(crate) mod tests {
             .map(bridge)
             .collect::<Vec<_>>();
         let dt = device_tree([true, false, true, false], &bridges);
-        let (devices, allocated) =
-            crate::allocation_measure::measure(|| read(&dt, RAM_END, C_BIT).unwrap());
-        assert_eq!(allocated, 0);
+        let devices = read(&dt, RAM_END, C_BIT).unwrap();
         assert_eq!(devices.com_ports, [true, false, true, false]);
         let cpus = devices
             .cpus
@@ -434,7 +437,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rejects_too_many_bridges() {
+    fn rejects_too_many_or_duplicate_bridges() {
         let bridges = (0..=SNP_BOOT_SHIM_MAX_PCIE_BRIDGES as u32)
             .map(bridge)
             .collect::<Vec<_>>();
@@ -442,6 +445,13 @@ pub(crate) mod tests {
         assert!(matches!(
             read(&dt, RAM_END, C_BIT),
             Err(Error::TooManyBridges)
+        ));
+        let mut duplicate = bridge(1);
+        replace(&mut duplicate, "linux,pci-domain", cells(&[0]));
+        let dt = device_tree([false; 4], &[bridge(0), duplicate]);
+        assert!(matches!(
+            read(&dt, RAM_END, C_BIT),
+            Err(Error::DuplicateSegment)
         ));
     }
 

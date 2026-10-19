@@ -5938,7 +5938,6 @@ dependencies = [
  "intel_vtd",
  "iommu_common",
  "loader",
- "loader_defs",
  "membacking",
  "memory_range",
  "mesh",

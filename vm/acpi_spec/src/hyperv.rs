@@ -3,6 +3,9 @@
 
 //! Fixed register contract for the Hyper-V-compatible x86 chipset.
 //!
+//! These values are not architectural. They are Hyper-V-specific choices
+//! that OpenVMM's chipset matches, not part of the ACPI specification.
+//!
 //! Kept here so both the device models and freestanding ACPI builders can
 //! use the same values without a hosted device dependency.
 

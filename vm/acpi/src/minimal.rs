@@ -137,14 +137,13 @@ impl Platform<'_> {
 impl X86 {
     fn add_dsdt_devices(&self, dsdt: &mut dsdt::Dsdt) {
         dsdt.add_apic();
+        const NAMES: [&[u8]; 4] = [b"\\_SB.UAR1", b"\\_SB.UAR2", b"\\_SB.UAR3", b"\\_SB.UAR4"];
+        const DDNS: [&[u8]; 4] = [b"COM1", b"COM2", b"COM3", b"COM4"];
         for (index, _) in self.com_ports.iter().enumerate().filter(|(_, p)| **p) {
-            let uid = index as u8 + 1;
-            let name = [b'\\', b'_', b'S', b'B', b'.', b'U', b'A', b'R', b'0' + uid];
-            let ddn = [b'C', b'O', b'M', b'0' + uid];
             dsdt.add_uart_shared(
-                &name,
-                &ddn,
-                uid.into(),
+                NAMES[index],
+                DDNS[index],
+                index as u64 + 1,
                 COM_BASES[index],
                 COM_IRQS[index].into(),
             );

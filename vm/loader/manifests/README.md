@@ -155,8 +155,9 @@ This implementation supports at most 255 CPUs, 64 RAM ranges that end at or
 below 512 GiB, the four fixed COM ports, and eight generic ECAM bridges in
 distinct segments. The tables put every bridge on node 0, with native x86
 MSI/MSI-X and identity low and high MMIO windows; either window may be
-omitted. OpenVMM rejects an SNP launch that exceeds these limits or that
-configures an IOMMU, CXL, or two bridges in one segment.
+omitted. The bootshim stops the guest when the device tree exceeds these
+limits or puts two bridges in one segment. The x86 device tree does not
+describe an IOMMU or CXL, so the guest does not see them.
 
 The image reserves 64 KiB for the device tree, 64 KiB for generated ACPI,
 a temporary 1-MiB heap, and a 32-KiB bootshim stack. The heap is omitted from
@@ -170,10 +171,11 @@ all tables to permanent storage before it publishes the RSDP and Linux
 zero-page pointer. It never enters Linux with partial ACPI.
 
 The shim ignores all other device-tree nodes and properties, including the
-`/chosen`, `/openhcl`, and VMBus nodes.
+`/chosen` and VMBus nodes. OpenVMM adds the `/openhcl` node only for
+`personality=openhcl`.
 
 Host-selected topology is unmeasured. Attestation policy for those values is
 deferred for bring-up; the shim does not bind them into the launch identity.
-Detailed bootshim failure reporting is also pending: runtime failures use the
-standard GHCB general-termination notification rather than continuing with
-stale tables.
+When the shim stops the guest, it sends a GHCB termination request with
+reason-code set 0xF and a reason code from `Failure` in
+`vm/loader/snp_bootshim/src/main.rs`.

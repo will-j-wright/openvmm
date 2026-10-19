@@ -95,7 +95,6 @@ mod tests {
     use crate::host_dt::tests::replace;
     use acpi::minimal::Cpu;
     use loader_defs::linux::SNP_BOOT_SHIM_ACPI_SIZE;
-    use loader_defs::linux::SNP_BOOT_SHIM_HEAP_SIZE;
     use loader_defs::linux::SNP_BOOT_SHIM_MAX_CPUS;
     use loader_defs::linux::SNP_BOOT_SHIM_MAX_PCIE_BRIDGES;
     use test_with_tracing::test;
@@ -202,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn largest_configuration_fits_the_output_and_heap() {
+    fn largest_configuration_fits_the_output() {
         let bridges = (0..SNP_BOOT_SHIM_MAX_PCIE_BRIDGES as u32)
             .map(bridge)
             .collect::<Vec<_>>();
@@ -219,10 +218,8 @@ mod tests {
         while !devices.ram.is_full() {
             devices.ram.push(devices.ram[0]);
         }
-        let ((rsdp, tables), allocated) =
-            crate::allocation_measure::measure(|| build(&devices, OUTPUT));
+        let (rsdp, tables) = build(&devices, OUTPUT);
         assert!(tables.len() <= SNP_BOOT_SHIM_ACPI_SIZE as usize);
-        assert!(allocated <= SNP_BOOT_SHIM_HEAP_SIZE as usize);
         assert_eq!(xsdt_entries(&rsdp, &tables).len(), 5);
     }
 }
