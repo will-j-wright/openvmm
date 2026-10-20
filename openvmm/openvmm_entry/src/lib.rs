@@ -70,6 +70,7 @@ use openvmm_defs::config::Config;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
+use openvmm_defs::config::IgvmPersonality;
 use openvmm_defs::config::LateMapVtl0MemoryPolicy;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
@@ -1381,6 +1382,11 @@ async fn vm_config_from_command_line(
                 Vtl2BaseAddressType::File
             },
             com_serial: has_com3.then_some(UartId::Com(ComPort::Com3)),
+            personality: match igvm.personality {
+                IgvmPersonalityCli::Openhcl => IgvmPersonality::Openhcl,
+                IgvmPersonalityCli::Uefi => IgvmPersonality::Uefi,
+                IgvmPersonalityCli::LinuxDirect => IgvmPersonality::LinuxDirect,
+            },
         };
 
         // An IGVM launch carries no SMBIOS field of its own; the identity is
