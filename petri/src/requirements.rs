@@ -267,7 +267,15 @@ impl TestRequirement {
                         IsolationType::Tdx => vm_host_info.tdx_status,
                     }
                 } else {
-                    false
+                    // Without VM host info, assume that an AMD host where
+                    // OpenVMM selects MSHV supports SNP.
+                    match isolation_type {
+                        IsolationType::Snp => {
+                            context.vendor == Vendor::Amd
+                                && context.openvmm_hypervisor == Some(OpenVmmHypervisor::Mshv)
+                        }
+                        IsolationType::Vbs | IsolationType::Tdx => false,
+                    }
                 }
             }
             TestRequirement::RequiresCapability { name, vmm } => {
@@ -404,5 +412,18 @@ mod tests {
         let mut without_hypervisor = host_context(OpenVmmHypervisor::Mshv);
         without_hypervisor.openvmm_hypervisor = None;
         assert!(!requirement.is_satisfied(&without_hypervisor));
+    }
+
+    #[test]
+    fn snp_isolation_without_host_info_requires_amd_mshv() {
+        let requirement = TestRequirement::Isolation(IsolationType::Snp);
+        let mut amd_mshv = host_context(OpenVmmHypervisor::Mshv);
+        amd_mshv.vendor = Vendor::Amd;
+        assert!(requirement.is_satisfied(&amd_mshv));
+        assert!(!requirement.is_satisfied(&host_context(OpenVmmHypervisor::Mshv)));
+        let mut amd_kvm = host_context(OpenVmmHypervisor::Kvm);
+        amd_kvm.vendor = Vendor::Amd;
+        assert!(!requirement.is_satisfied(&amd_kvm));
+        assert!(!TestRequirement::Isolation(IsolationType::Tdx).is_satisfied(&amd_mshv));
     }
 }

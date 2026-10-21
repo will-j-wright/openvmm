@@ -75,7 +75,7 @@ pub fn resolve_artifact(handle: ErasedArtifactHandle) -> anyhow::Result<PathBuf>
             return Ok(path);
         }
         anyhow::bail!(
-            "SNP Linux-direct IGVM not found at {}; build with cargo xflowey vmm-tests-run --filter 'test(snp_linux_direct)'",
+            "SNP Linux-direct IGVM not found at {}; build with cargo xflowey vmm-tests-run --filter 'test(linux_x64_snp)'",
             path.display()
         );
     }
