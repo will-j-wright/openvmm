@@ -230,7 +230,11 @@ pub fn is_available() -> Result<bool, Error> {
 
 /// Returns whether MSHV can create SEV-SNP partitions on this machine.
 /// This function currently probes SNP availability by attempting to create
-/// and initialize a temporary SNP partition.
+/// a temporary SNP partition.
+///
+/// The probe does not initialize the partition. The mshv_root driver cannot
+/// tear down an initialized SNP partition that never imported its memory, so
+/// that partition would permanently use one of the host's SNP partition slots.
 ///
 /// TODO: Replace this probe with a proper usermode query once the MSHV
 /// driver exposes SNP status.
@@ -238,8 +242,8 @@ pub fn is_available() -> Result<bool, Error> {
 pub fn is_snp_available() -> bool {
     let probe = || -> Result<(), MshvError> {
         let mshv = Mshv::new()?;
-        let vm = mshv.create_vm_with_type(mshv_ioctls::VmType::Snp)?;
-        vm.initialize()
+        mshv.create_vm_with_type(mshv_ioctls::VmType::Snp)?;
+        Ok(())
     };
     match probe() {
         Ok(()) => true,
