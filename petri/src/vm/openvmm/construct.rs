@@ -1059,22 +1059,19 @@ impl PetriVmConfigSetupCore<'_> {
 
                 append_cmdline(&mut cmdline, "panic=-1 reboot=triple");
 
-                let isolated = match self.firmware {
-                    Firmware::OpenhclLinuxDirect { .. } => {
-                        // Set UNDERHILL_SERIAL_WAIT_FOR_RTS=1 so that we don't pull serial data
-                        // until the guest is ready. Otherwise, Linux will drop the input serial
-                        // data on the floor during boot.
-                        append_cmdline(
-                            &mut cmdline,
-                            format!(
-                                "UNDERHILL_SERIAL_WAIT_FOR_RTS=1 UNDERHILL_CMDLINE_APPEND=\"rdinit=/bin/sh {vsock_blacklist}\""
-                            ),
-                        );
-                        false
-                    }
-                    Firmware::OpenhclUefi { isolation, .. } if isolation.is_some() => true,
-                    _ => false,
-                };
+                if matches!(self.firmware, Firmware::OpenhclLinuxDirect { .. }) {
+                    // Set UNDERHILL_SERIAL_WAIT_FOR_RTS=1 so that we don't pull serial data
+                    // until the guest is ready. Otherwise, Linux will drop the input serial
+                    // data on the floor during boot.
+                    append_cmdline(
+                        &mut cmdline,
+                        format!(
+                            "UNDERHILL_SERIAL_WAIT_FOR_RTS=1 UNDERHILL_CMDLINE_APPEND=\"rdinit=/bin/sh {vsock_blacklist}\""
+                        ),
+                    );
+                }
+
+                let isolation = self.firmware.isolation();
 
                 // For certain configurations, we need to override the override
                 // in new_underhill_vm.
@@ -1091,7 +1088,7 @@ impl PetriVmConfigSetupCore<'_> {
                     ..
                 } = self.firmware
                 {
-                    if !isolated
+                    if isolation.is_none()
                         && !secure_boot_enabled
                         && self.tpm_config.is_none()
                         && !default_boot_always_attempt
@@ -1118,16 +1115,21 @@ impl PetriVmConfigSetupCore<'_> {
                 }
 
                 let vtl2_base_address = vtl2_base_address_type.unwrap_or_else(|| {
-                    if isolated {
+                    match isolation {
+                        // bump up the memory on release builds for VBS VMs
+                        // (uses petri build flavor as proxy for igvm file)
+                        #[cfg(not(debug_assertions))]
+                        Some(IsolationType::Vbs) => Vtl2BaseAddressType::Vtl2Allocate {
+                            size: Some(128 * 1024 * 1024),
+                        },
                         // Isolated VMs must load at the location specified by
                         // the file, as they do not support relocation.
-                        Vtl2BaseAddressType::File
-                    } else {
+                        Some(_) => Vtl2BaseAddressType::File,
                         // By default, utilize IGVM relocation and tell OpenVMM
                         // to place VTL2 at 512MB. This tests both relocation
                         // support in OpenVMM, and relocation support within
                         // OpenHCL.
-                        Vtl2BaseAddressType::Absolute(512 * SIZE_1_MB)
+                        None => Vtl2BaseAddressType::Absolute(512 * SIZE_1_MB),
                     }
                 });
 
