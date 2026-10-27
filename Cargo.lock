@@ -5068,6 +5068,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mshv_host_boot"
+version = "0.0.0"
+dependencies = [
+ "uefi",
+]
+
+[[package]]
 name = "multimap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6846,6 +6853,7 @@ dependencies = [
  "mesh",
  "mesh_process",
  "mesh_worker",
+ "mshv_host_boot",
  "net_backend_resources",
  "netvsp_resources",
  "nvme_resources",
