@@ -4599,6 +4599,7 @@ dependencies = [
  "static_assertions",
  "tempfile",
  "test_with_tracing",
+ "thiserror 2.0.16",
  "tracing",
  "widestring",
  "windows 0.62.0",
@@ -7089,6 +7090,8 @@ dependencies = [
  "lx",
  "lxutil",
  "parking_lot",
+ "tempfile",
+ "test_with_tracing",
  "tracing",
 ]
 
@@ -10581,6 +10584,7 @@ dependencies = [
  "task_control",
  "tempfile",
  "test_with_tracing",
+ "thiserror 2.0.16",
  "tracing",
  "virtio",
  "virtio_resources",
