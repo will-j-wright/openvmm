@@ -4006,7 +4006,6 @@ dependencies = [
  "range_map_vec",
  "serde",
  "serde_json",
- "signature",
  "test_with_tracing",
  "tracing",
  "tracing-subscriber",
