@@ -4012,7 +4012,6 @@ dependencies = [
  "tracing-subscriber",
  "underhill_confidentiality",
  "vm_topology",
- "x509-cert",
  "x86defs",
  "zerocopy",
 ]
