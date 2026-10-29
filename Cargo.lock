@@ -1144,6 +1144,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "cms",
+ "const-oid",
  "der",
  "getrandom 0.4.2",
  "hex",
@@ -2249,6 +2250,7 @@ dependencies = [
  "chipset_device",
  "chipset_device_resources",
  "chipset_resources",
+ "const-oid",
  "crypto",
  "cvm_tracing",
  "der",
@@ -8736,7 +8738,6 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "crypto",
- "der",
  "get_resources",
  "getrandom 0.4.2",
  "inspect",
@@ -9433,6 +9434,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "base64-serde",
+ "const-oid",
  "constant_time_eq",
  "crypto",
  "cvm_tracing",
@@ -11305,6 +11307,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "build_rs_guest_arch",
+ "der",
  "disk_backend",
  "disk_backend_resources",
  "disk_vhd1",
@@ -11344,7 +11347,6 @@ dependencies = [
  "static_assertions",
  "storvsp_resources",
  "tempfile",
- "test_igvm_agent_lib",
  "tmk_tests",
  "tracing",
  "unix_socket",
@@ -11362,6 +11364,7 @@ dependencies = [
  "vmgs_resources",
  "vmm_test_igvm_agent",
  "vmm_test_macros",
+ "x509-cert",
  "x86defs",
  "zerocopy",
 ]

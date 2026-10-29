@@ -66,7 +66,7 @@ impl X509CertificateInner {
         // On the `symcrypt` backend we can also extract ECDSA keys; the `rust`
         // backend has no ECDSA support, so any non-RSA key is rejected below.
         #[cfg(symcrypt)]
-        if spki.algorithm.oid == der::oid::db::rfc5912::ID_EC_PUBLIC_KEY {
+        if spki.algorithm.oid == const_oid::db::rfc5912::ID_EC_PUBLIC_KEY {
             let key = crate::ecdsa::symcrypt::EcdsaPublicKeyInner::from_public_key_info(
                 &spki.owned_to_ref(),
             )
@@ -184,22 +184,10 @@ impl X509CertificateInner {
     #[cfg(any(test, feature = "test_helpers"))]
     pub fn build_self_signed(
         key: super::X509KeyPair<'_>,
-        country: &str,
-        state: &str,
-        locality: &str,
-        organization: &str,
-        common_name: &str,
+        options: &super::X509SelfSignedOptions<'_>,
     ) -> anyhow::Result<Self> {
         use x509_cert::builder::Builder;
-
-        let (builder, _public_key_der) = super::builder::self_signed_builder(
-            key,
-            country,
-            state,
-            locality,
-            organization,
-            common_name,
-        )?;
+        let (builder, _public_key_der) = super::builder::self_signed_builder(key, options)?;
 
         #[cfg(symcrypt)]
         let cert = builder.build(&super::builder::keypair_signer::KeyPairSigner {
